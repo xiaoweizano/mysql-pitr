@@ -55,8 +55,8 @@
 ### Steps
 
 ```bash
-git clone git@github.com:xiaoweizano/database-flashback.git
-cd database-flashback
+git clone git@github.com:xiaoweizano/database-flashback-two.git
+cd database-flashback-two
 
 # 1. Configure the host MySQL connection (see .env.example)
 cp .env.example .env
