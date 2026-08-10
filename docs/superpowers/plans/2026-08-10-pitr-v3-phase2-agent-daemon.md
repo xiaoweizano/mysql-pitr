@@ -176,7 +176,11 @@ Commit: `feat(scan,binlog): per-scan schema cache; RowCount counts statements`
 
 ```bash
 W=/d/a-shan/.claude/worktrees/pitr-v2-phase1
-cp $W/internal/executor/*.go internal/executor/
+# 注意：executor/types.go 已由 Task 1 随 AsDB 合并提前并入 main（控制器已批准 AsDB() executor.DB 签名）。
+# 复制其余文件（不含 types.go）：
+cp $W/internal/executor/checkpoint.go $W/internal/executor/doc.go \
+   $W/internal/executor/executor.go $W/internal/executor/executor_test.go \
+   $W/internal/executor/checkpoint_test.go $W/internal/executor/types_test.go internal/executor/
 go test ./internal/executor/ -count=1
 ```
 
