@@ -86,16 +86,9 @@ func (t *Transaction) MarkTruncated() {
 	t.Truncated = true
 }
 
-// RowCount 返回已累积的行变更数。
+// RowCount 返回事务包含的行变更条数（语句数）。
 func (t *Transaction) RowCount() int {
-	n := 0
-	for _, rc := range t.Statements {
-		n += len(rc.Before) + len(rc.After) // 粗略；测试用
-	}
-	if n == 0 {
-		n = len(t.Statements)
-	}
-	return n
+	return len(t.Statements)
 }
 
 func randomID(n int) string {

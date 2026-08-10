@@ -61,8 +61,15 @@ func TestTransaction_RowCount(t *testing.T) {
 	tx, _ := NewTransaction("uuid:1-1", 0, time.Now().UTC(), "shop")
 	tx.AppendRow(RowChange{Before: []interface{}{1, 2}, After: []interface{}{3}})
 	tx.AppendRow(RowChange{After: []interface{}{"a", "b"}})
-	// Before+After 总数：(2+1) + (0+2) = 5
-	assert.Equal(t, 5, tx.RowCount())
+	// RowCount 按语句数计：2 条
+	assert.Equal(t, 2, tx.RowCount())
+}
+
+func TestRowCount_CountsStatements(t *testing.T) {
+	tx, _ := NewTransaction("uuid:1", 0, time.Now(), "shop")
+	tx.AppendRow(RowChange{Schema: "shop", Table: "t", Action: ActionUpdate, Before: []interface{}{1}, After: []interface{}{2}})
+	tx.AppendRow(RowChange{Schema: "shop", Table: "t", Action: ActionInsert, After: []interface{}{3}})
+	require.Equal(t, 2, tx.RowCount()) // 两条语句，不是 2×2=4
 }
 
 func TestTransaction_RowCountFallback(t *testing.T) {

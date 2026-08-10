@@ -68,6 +68,31 @@ func TestStream_ModeMetaOnly(t *testing.T) {
 	}
 }
 
+// countingFetcher 包装 StaticSchemaFetcher 并统计每个 (schema,table) 的拉取次数，
+// 用于断言同一扫描内 schema 只拉一次。
+type countingFetcher struct {
+	binlog.StaticSchemaFetcher
+	calls map[string]int
+}
+
+func (c *countingFetcher) FetchSchema(ctx context.Context, schema, table string) (binlog.TableSchema, error) {
+	key := schema + "." + table
+	c.calls[key]++
+	return c.StaticSchemaFetcher.FetchSchema(ctx, schema, table)
+}
+
+func TestStream_SchemaFetchedOncePerTable(t *testing.T) {
+	cf := &countingFetcher{StaticSchemaFetcher: fixtureSchema, calls: map[string]int{}}
+	_, err := collect(t, scan.Config{
+		ArchiveDir:    fixtureDir(t),
+		Filter:        binlog.Filter{},
+		Mode:          scan.ModeWithSQL,
+		SchemaFetcher: cf,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, cf.calls["shop.orders"], "同一扫描中每个表只拉一次 schema")
+}
+
 func TestStream_ModeWithSQL_ProducesReverseStatements(t *testing.T) {
 	out, err := collect(t, scan.Config{
 		ArchiveDir:    fixtureDir(t),

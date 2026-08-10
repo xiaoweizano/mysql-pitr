@@ -78,6 +78,9 @@ func Stream(ctx context.Context, cfg Config) (<-chan Result, <-chan error) {
 		}
 
 		sent := 0 // 已发送结果数（不能看 len(out)：channel 有缓冲，消费者可能滞后）
+		// schemaCache 提升到 Stream 循环：一次扫描内每个 (schema,table) 只拉一次
+		// schema，避免 MySQLSchemaFetcher 落地后对真库打爆查询。
+		schemaCache := make(map[string]binlog.TableSchema)
 		for {
 			tx, err := s.Next()
 			if err == io.EOF {
@@ -104,7 +107,7 @@ func Stream(ctx context.Context, cfg Config) (<-chan Result, <-chan error) {
 			}
 			r := Result{Meta: meta}
 			if cfg.Mode != ModeMetaOnly {
-				r.SQL = generateSQL(cfg.SchemaFetcher, tx)
+				r.SQL = generateSQL(ctx, cfg.SchemaFetcher, schemaCache, tx)
 			}
 			select {
 			case out <- r:
@@ -133,27 +136,27 @@ func containsRef(tables []binlog.TableRef, ref binlog.TableRef) bool {
 
 // generateSQL 把一个事务翻成逆向 SQL 列表；Truncated 或生成失败时返回
 // warning-only 语句（SQL==""）。
-func generateSQL(sf binlog.SchemaFetcher, tx *binlog.Transaction) []reverse.Statement {
+// cache 在 Stream 循环内跨事务共享：命中直接复用，缺失才 FetchSchema 并回填
+// （仅成功才回填；失败的表下次事务仍会重试，由 reverse.Generate 输出 warning）。
+func generateSQL(ctx context.Context, sf binlog.SchemaFetcher, cache map[string]binlog.TableSchema, tx *binlog.Transaction) []reverse.Statement {
 	if tx.Truncated {
 		return []reverse.Statement{{
 			SQL: "", TxID: tx.TxID,
 			Warnings: []string{"transaction truncated, cannot generate full reverse SQL"},
 		}}
 	}
-	ctx := context.Background()
-	schema := map[string]binlog.TableSchema{}
 	for _, rc := range tx.Statements {
 		key := rc.Schema + "." + rc.Table
-		if _, ok := schema[key]; ok {
+		if _, ok := cache[key]; ok {
 			continue
 		}
 		sch, err := sf.FetchSchema(ctx, rc.Schema, rc.Table)
 		if err != nil {
 			continue // reverse.Generate 对缺表输出 warning
 		}
-		schema[key] = sch
+		cache[key] = sch
 	}
-	stmts, err := reverse.Generate(tx, schema, reverse.Options{})
+	stmts, err := reverse.Generate(tx, cache, reverse.Options{})
 	if err != nil {
 		return []reverse.Statement{{
 			SQL: "", TxID: tx.TxID,
