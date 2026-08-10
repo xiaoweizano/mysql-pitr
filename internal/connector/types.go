@@ -1,6 +1,9 @@
 package connector
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // ConnConfig holds database connection configuration for the MySQL PITR system.
 type ConnConfig struct {
@@ -82,9 +85,9 @@ type ParseRequest struct {
 
 // ParseResult holds all row events recovered from binlog parsing.
 type ParseResult struct {
-	Events   []RowEvent `json:"events"`
-	TotalRows int64     `json:"totalRows"`
-	Errors   []string   `json:"errors,omitempty"`
+	Events    []RowEvent `json:"events"`
+	TotalRows int64      `json:"totalRows"`
+	Errors    []string   `json:"errors,omitempty"`
 }
 
 // RowEvent describes a single row mutation recorded in the binary log.
@@ -115,16 +118,25 @@ type ExecOptions struct {
 
 // ExecResult summarises the outcome of a rollback execution.
 type ExecResult struct {
-	RowsAffected    int64    `json:"rowsAffected"`
-	BatchesCompleted int     `json:"batchesCompleted"`
-	Errors          []string `json:"errors,omitempty"`
+	RowsAffected     int64    `json:"rowsAffected"`
+	BatchesCompleted int      `json:"batchesCompleted"`
+	Errors           []string `json:"errors,omitempty"`
 }
 
 // PreflightResult captures the outcome of pre-flight readiness checks.
 type PreflightResult struct {
-	Status  PreflightStatus `json:"status"`
-	Version string          `json:"version"`
+	Status  PreflightStatus  `json:"status"`
+	Version string           `json:"version"`
 	Checks  []PreflightCheck `json:"checks"`
+}
+
+// EnsureOK returns an error when the preflight result is FAIL, so callers can
+// abort a flashback operation before touching any data. WARN does not block.
+func (r PreflightResult) EnsureOK() error {
+	if r.Status == PreflightFail {
+		return fmt.Errorf("preflight FAILED")
+	}
+	return nil
 }
 
 // PreflightStatus indicates the overall preflight health.

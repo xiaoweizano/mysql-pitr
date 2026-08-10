@@ -1,6 +1,11 @@
 package connector
 
-import "context"
+import (
+	"context"
+
+	"github.com/a-shan/mysql-pitr/internal/binlog"
+	"github.com/a-shan/mysql-pitr/internal/executor"
+)
 
 // Connector defines the database connectivity interface for the MySQL PITR
 // (Point-In-Time Recovery) flashback system.
@@ -34,6 +39,15 @@ type Connector interface {
 	// a consolidated result. Checks include MySQL version, binlog format, user
 	// privileges, disk space, column metadata, and foreign-key dependencies.
 	Preflight(ctx context.Context) (*PreflightResult, error)
+
+	// FetchSchema returns the column metadata for the given table, used by the
+	// binlog scanner to attach column names to row events when the binlog itself
+	// doesn't carry them.
+	FetchSchema(ctx context.Context, schema, table string) (binlog.TableSchema, error)
+
+	// AsDB exposes the connector's live database connection as an executor.DB
+	// so it can drive batched flashback SQL execution (Task 15).
+	AsDB() executor.DB
 
 	// Close closes the underlying database connection and releases resources.
 	Close() error

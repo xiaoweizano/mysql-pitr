@@ -9,10 +9,14 @@ import (
 	"time"
 
 	"github.com/go-sql-driver/mysql"
+
+	"github.com/a-shan/mysql-pitr/internal/binlog"
+	"github.com/a-shan/mysql-pitr/internal/executor"
 )
 
-// compile-time check that MySQLConnector satisfies Connector.
+// compile-time checks that MySQLConnector satisfies Connector and executor.DB.
 var _ Connector = (*MySQLConnector)(nil)
+var _ executor.DB = (*MySQLConnector)(nil)
 
 // MySQLConnector implements the Connector interface for MySQL 8.0+ databases.
 type MySQLConnector struct {
@@ -184,6 +188,89 @@ func (m *MySQLConnector) GetBinlogDir(ctx context.Context) (string, error) {
 }
 
 // ---------------------------------------------------------------------------
+// FetchSchema
+// ---------------------------------------------------------------------------
+
+// FetchSchema queries information_schema.COLUMNS for the table's column
+// metadata (name, type, nullability, auto-increment flag) and
+// information_schema.KEY_COLUMN_USAGE for the primary key column order. The
+// binlog scanner uses it to attach column names to RowChange events when the
+// binlog itself doesn't carry them.
+func (m *MySQLConnector) FetchSchema(ctx context.Context, schema, table string) (binlog.TableSchema, error) {
+	if m.db == nil {
+		return binlog.TableSchema{}, fmt.Errorf("connector: not connected")
+	}
+
+	rows, err := m.db.QueryContext(ctx, `
+		SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE = 'YES', EXTRA LIKE '%auto_increment%'
+		FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+		ORDER BY ORDINAL_POSITION
+	`, schema, table)
+	if err != nil {
+		return binlog.TableSchema{}, fmt.Errorf("connector: query schema: %w", err)
+	}
+	defer rows.Close()
+
+	var cols []binlog.ColumnDef
+	for rows.Next() {
+		var col binlog.ColumnDef
+		// IS_NULLABLE = 'YES' and EXTRA LIKE '%auto_increment%' are integer
+		// expressions; go-sql-driver/mysql's prepared-statement binary protocol
+		// returns them as int64 (0/1), so scan into int64 rather than bool.
+		var nullable, autoInc int64
+		if err := rows.Scan(&col.Name, &col.Type, &nullable, &autoInc); err != nil {
+			return binlog.TableSchema{}, fmt.Errorf("connector: scan column: %w", err)
+		}
+		col.Nullable = nullable != 0
+		col.IsAutoInc = autoInc != 0
+		cols = append(cols, col)
+	}
+	if err := rows.Err(); err != nil {
+		return binlog.TableSchema{}, fmt.Errorf("connector: rows iteration: %w", err)
+	}
+	if len(cols) == 0 {
+		return binlog.TableSchema{}, fmt.Errorf("connector: table %s.%s not found", schema, table)
+	}
+
+	schemaOut := binlog.TableSchema{Schema: schema, Table: table, Columns: cols}
+	schemaOut.PrimaryKey, err = m.fetchPrimaryKey(ctx, schema, table)
+	if err != nil {
+		return binlog.TableSchema{}, err
+	}
+	return schemaOut, nil
+}
+
+// fetchPrimaryKey queries information_schema.KEY_COLUMN_USAGE for the table's
+// primary key column names in key-definition order. A table without a primary
+// key yields an empty (nil) slice.
+func (m *MySQLConnector) fetchPrimaryKey(ctx context.Context, schema, table string) ([]string, error) {
+	rows, err := m.db.QueryContext(ctx, `
+		SELECT COLUMN_NAME
+		FROM information_schema.KEY_COLUMN_USAGE
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY'
+		ORDER BY ORDINAL_POSITION
+	`, schema, table)
+	if err != nil {
+		return nil, fmt.Errorf("connector: query primary key: %w", err)
+	}
+	defer rows.Close()
+
+	var pk []string
+	for rows.Next() {
+		var col string
+		if err := rows.Scan(&col); err != nil {
+			return nil, fmt.Errorf("connector: scan primary key: %w", err)
+		}
+		pk = append(pk, col)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("connector: rows iteration: %w", err)
+	}
+	return pk, nil
+}
+
+// ---------------------------------------------------------------------------
 // GetBasedir
 // ---------------------------------------------------------------------------
 
@@ -200,6 +287,7 @@ func (m *MySQLConnector) GetBasedir(ctx context.Context) (string, error) {
 	}
 	return basedir, nil
 }
+
 // ---------------------------------------------------------------------------
 // ParseBinlog verifies that the requested binlog files exist and returns any
 // parse errors. Actual event-level parsing is delegated to the parser package
@@ -598,6 +686,61 @@ func (m *MySQLConnector) checkForeignKeys(ctx context.Context) PreflightCheck {
 	}
 	return c
 }
+
+// ---------------------------------------------------------------------------
+// executor.DB adapter
+// ---------------------------------------------------------------------------
+
+// AsDB exposes the connector's underlying *sql.DB as an executor.DB so the
+// flashback CLI can drive batched SQL execution over the same live connection
+// used for schema fetching and binlog listing. MySQLConnector implements
+// executor.DB directly via Exec/Begin plus its existing Close.
+func (m *MySQLConnector) AsDB() executor.DB { return m }
+
+// Exec runs a single SQL statement and wraps the resulting sql.Result for the
+// executor package.
+func (m *MySQLConnector) Exec(query string, args ...interface{}) (executor.Result, error) {
+	if m.db == nil {
+		return nil, fmt.Errorf("connector: not connected")
+	}
+	res, err := m.db.Exec(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return &sqlResultAdapter{res: res}, nil
+}
+
+// Begin starts a transaction and wraps it for the executor package.
+func (m *MySQLConnector) Begin() (executor.Tx, error) {
+	if m.db == nil {
+		return nil, fmt.Errorf("connector: not connected")
+	}
+	tx, err := m.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	return &sqlTxAdapter{tx: tx}, nil
+}
+
+// sqlResultAdapter adapts sql.Result to executor.Result.
+type sqlResultAdapter struct{ res sql.Result }
+
+func (a *sqlResultAdapter) LastInsertId() (int64, error) { return a.res.LastInsertId() }
+func (a *sqlResultAdapter) RowsAffected() (int64, error) { return a.res.RowsAffected() }
+
+// sqlTxAdapter adapts sql.Tx to executor.Tx.
+type sqlTxAdapter struct{ tx *sql.Tx }
+
+func (a *sqlTxAdapter) Exec(query string, args ...interface{}) (executor.Result, error) {
+	res, err := a.tx.Exec(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return &sqlResultAdapter{res: res}, nil
+}
+
+func (a *sqlTxAdapter) Commit() error   { return a.tx.Commit() }
+func (a *sqlTxAdapter) Rollback() error { return a.tx.Rollback() }
 
 // ---------------------------------------------------------------------------
 // Close

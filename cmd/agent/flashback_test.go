@@ -14,8 +14,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/a-shan/mysql-pitr/internal/binlog"
 	"github.com/a-shan/mysql-pitr/internal/config"
 	"github.com/a-shan/mysql-pitr/internal/connector"
+	"github.com/a-shan/mysql-pitr/internal/executor"
 )
 
 // ---------------------------------------------------------------------------
@@ -59,6 +61,12 @@ func (m *mockConnector) Preflight(ctx context.Context) (*connector.PreflightResu
 	return m.preflightResult, m.preflightErr
 }
 
+func (m *mockConnector) FetchSchema(ctx context.Context, schema, table string) (binlog.TableSchema, error) {
+	return binlog.TableSchema{Schema: schema, Table: table}, nil
+}
+
+func (m *mockConnector) AsDB() executor.DB { return nil }
+
 func (m *mockConnector) Close() error {
 	m.closeCalled = true
 	return nil
@@ -77,7 +85,8 @@ func withFakeParse(t *testing.T, result *connector.ParseResult, parseErr error) 
 }
 
 // defaultMock creates a mock connector configured for a successful flashback.
-func defaultMock() *mockConnector {	return &mockConnector{
+func defaultMock() *mockConnector {
+	return &mockConnector{
 		preflightResult: &connector.PreflightResult{
 			Status:  connector.PreflightPass,
 			Version: "8.0.32",
@@ -125,7 +134,7 @@ func defaultMock() *mockConnector {	return &mockConnector{
 			},
 		},
 		execResult: &connector.ExecResult{
-			RowsAffected:    2,
+			RowsAffected:     2,
 			BatchesCompleted: 1,
 		},
 	}
