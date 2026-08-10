@@ -180,7 +180,16 @@ func formatValue(v interface{}) string {
 	case decimal.Decimal:
 		return x.String()
 	case time.Time:
-		return "'" + x.UTC().Format("2006-01-02 15:04:05") + "'"
+		// 保留亚秒精度：SetParseTime(true) 下 go-mysql 对 DATETIME(6)/TIMESTAMP(6)
+		// 产生纳秒精度 time.Time。若只渲染到秒，逆向 WHERE 字面量 '...:45' 匹配不到
+		// 存储值 '...:45.123456'（MySQL 把字面量按列类型转换后变成 .000000），
+		// DELETE/UPDATE 会静默影响 0 行。亚秒为 0 时省略；非零时输出并去除尾零
+		// （.120000 → .12）。Format 的 .000000 将纳秒截断到 6 位微秒（与 MySQL
+		// 列精度一致，毫秒/微秒/纳秒粒度均正确保留）。
+		s := x.UTC().Format("2006-01-02 15:04:05.000000")
+		s = strings.TrimRight(s, "0")
+		s = strings.TrimRight(s, ".")
+		return "'" + s + "'"
 	case []byte:
 		// 用 X'hex' 而非 _binary 'hex'：后者是字符字面量，会把 "6162" 当字符串，
 		// 无法还原 0x61 0x62 原始字节（评审发现，baseline 带入）

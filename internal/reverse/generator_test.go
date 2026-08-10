@@ -273,6 +273,44 @@ func TestFormatValue_MoreTypes(t *testing.T) {
 	assert.Equal(t, "'{1}'", formatValue(struct{ x int }{1}))
 }
 
+func TestFormatValue_TimeFractionalSeconds(t *testing.T) {
+	// 亚秒精度：SetParseTime(true) 下 go-mysql 对 DATETIME(6)/TIMESTAMP(6) 产生
+	// 纳秒精度 time.Time。WHERE 字面量必须保留亚秒位（去除尾零），否则 MySQL 把
+	// 字面量按列类型转换后变成 .000000，匹配不到 .123456 存储值，DELETE/UPDATE
+	// 静默影响 0 行。
+	tests := []struct {
+		name string
+		in   time.Time
+		want string
+	}{
+		{
+			name: "subsecond 123456",
+			in:   time.Date(2026, 8, 10, 12, 30, 45, 123456000, time.UTC),
+			want: "'2026-08-10 12:30:45.123456'",
+		},
+		{
+			name: "subsecond zero omitted",
+			in:   time.Date(2026, 8, 10, 12, 30, 45, 0, time.UTC),
+			want: "'2026-08-10 12:30:45'",
+		},
+		{
+			name: "subsecond trailing zeros trimmed",
+			in:   time.Date(2026, 8, 10, 12, 30, 45, 120000000, time.UTC),
+			want: "'2026-08-10 12:30:45.12'",
+		},
+		{
+			name: "subsecond nanosecond truncated to microsecond",
+			in:   time.Date(2026, 8, 10, 12, 30, 45, 123456789, time.UTC),
+			want: "'2026-08-10 12:30:45.123456'",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, formatValue(tt.in))
+		})
+	}
+}
+
 func TestFormatValue_TimeAndDecimal(t *testing.T) {
 	loc := time.UTC
 	ts := time.Date(2026, 8, 10, 12, 30, 45, 0, loc)
