@@ -13,9 +13,10 @@ import (
 )
 
 type fakeStreamer struct {
-	evs []binlogtest.Event
-	cur int
-	err error
+	evs    []binlogtest.Event
+	cur    int
+	err    error
+	closes int
 }
 
 func (f *fakeStreamer) GetEvent(ctx context.Context) (*replication.BinlogEvent, error) {
@@ -32,7 +33,10 @@ func (f *fakeStreamer) GetEvent(ctx context.Context) (*replication.BinlogEvent, 
 		Header:  &replication.EventHeader{EventType: e.Type, Timestamp: 1754294400},
 	}, nil
 }
-func (f *fakeStreamer) Close() error { return nil }
+func (f *fakeStreamer) Close() error {
+	f.closes++
+	return nil
+}
 
 func TestStreamSource_YieldsEvents(t *testing.T) {
 	evs := []binlogtest.Event{
@@ -50,4 +54,15 @@ func TestStreamSource_YieldsEvents(t *testing.T) {
 	require.Equal(t, replication.XID_EVENT, ev.Header.EventType)
 	_, err = src.Next(context.Background())
 	require.Equal(t, io.EOF, err)
+}
+
+// TestStreamSource_CloseIdempotent: Close 必须幂等——多次调用只触发一次底层 streamer 关闭
+// （source 用 sync.Once 保护；真实 BinlogSyncer 路径同理，只 close 一次连接）。
+func TestStreamSource_CloseIdempotent(t *testing.T) {
+	f := &fakeStreamer{}
+	src := stream.NewSourceWithStreamer(f)
+	require.NoError(t, src.Close())
+	require.NoError(t, src.Close())
+	require.NoError(t, src.Close())
+	require.Equal(t, 1, f.closes)
 }
