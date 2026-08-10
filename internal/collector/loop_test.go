@@ -316,6 +316,69 @@ func TestLoop_SyncErrorBackoffRetries(t *testing.T) {
 	require.Equal(t, "mysql-bin.000003", st.LastFile)
 }
 
+// TestLoop_SealTransientFailureDoesNotDoubleAppend：append 封口瞬时失败
+// （IO 错误，如磁盘满/只读——区别于永久 CRC 篡改）→ syncOnce 失败返回前必须
+// 清理 .partial；重试从同一位置重新拉取尾部、追加到干净 partial，最终文件尾部
+// 只出现一次（无 tail+tail）。
+//
+// 模拟方式：首次 syncOnce 前把最终文件 chmod 0444（只读）。SealAppendVerified
+// 的组合验证只读最终文件（仍通过），但最后一步 O_APPEND 打开写入失败（权限
+// 错误）——恰好命中「Seal 验证通过但追加落盘瞬时失败」的路径，partial 被保留。
+// 恢复可写后以同一位置重跑第二段（syncLoop 错误重试即同位置重拉），
+// SealAppendVerified 透传成功。
+//
+// 取舍：未用包装 Writer（会要求 Loop.w 改为接口，扩大生产 diff 到一行之外），
+// 而是用真实 SealAppendVerified 制造真实的瞬时 IO 失败，完整覆盖其 verify →
+// 追加 → 失败路径与 syncOnce 的 cleanup 路径。依赖 OS 权限语义（POSIX root
+// 会绕过；本机 Windows 与常规 CI 非 root 均生效）。
+func TestLoop_SealTransientFailureDoesNotDoubleAppend(t *testing.T) {
+	binlogDir := t.TempDir()
+	archiveDir := t.TempDir()
+
+	// 已回填的 000002 前缀（magic+FDE+XID20）；续拉尾部 XID(21) 后轮转到 000003
+	events2 := []binlogtest.Event{fde(), xid(20), xid(21)}
+	P := offsetOf([]binlogtest.Event{fde(), xid(20)})
+	writeBinlog(t, archiveDir, "mysql-bin.000002", []binlogtest.Event{fde(), xid(20)})
+	writeBinlog(t, binlogDir, "mysql-bin.000002", events2)
+
+	rec := &positionRecorder{}
+	factory := factoryFor(rec, map[string][]binlogtest.Event{
+		"mysql-bin.000002": {fde(), xid(21), rotate("mysql-bin.000003")},
+	}, 0)
+
+	l := newLoop(&stubMySQL{
+		files: []archive.ManifestFile{{Name: "mysql-bin.000002"}},
+		pos:   mysql.Position{Name: "mysql-bin.000002", Pos: P},
+	}, binlogDir, archiveDir, factory)
+
+	pos := mysql.Position{Name: "mysql-bin.000002", Pos: P}
+	final := filepath.Join(archiveDir, "mysql-bin.000002")
+	partial := final + ".partial"
+
+	// 第一段：只读最终文件 → SealAppendVerified 组合验证通过但追加落盘失败。
+	// 失败点必须落在 "open final"（O_APPEND 打开写入），而非 CRC 验证——证明是
+	// 瞬时 IO 错误而非永久篡改。
+	require.NoError(t, os.Chmod(final, 0o444))
+	err := l.syncOnce(context.Background(), pos)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "open final")
+
+	// 修复点：封口失败返回前必须清理 .partial——重试才不至于 O_APPEND 续写残留
+	require.NoFileExists(t, partial, "seal 失败后残留 partial 会致重试 tail+tail")
+
+	// 恢复可写，同一位置重跑第二段（与 syncLoop 错误重试语义一致）
+	require.NoError(t, os.Chmod(final, 0o644))
+	require.NoError(t, l.syncOnce(context.Background(), pos))
+
+	// 尾部只出现一次：最终文件字节 == 源文件字节（无 tail+tail）
+	require.Equal(t, readFile(t, filepath.Join(binlogDir, "mysql-bin.000002")),
+		readFile(t, filepath.Join(archiveDir, "mysql-bin.000002")))
+	// 状态推进到轮转后的新文件
+	st, err := LoadState(archiveDir)
+	require.NoError(t, err)
+	require.Equal(t, "mysql-bin.000003", st.LastFile)
+}
+
 // TestLoop_ServerIDRequired：ServerID=0 时 Run 立即报错（不落盘）。
 func TestLoop_ServerIDRequired(t *testing.T) {
 	l := NewLoop(Config{

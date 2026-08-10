@@ -291,10 +291,15 @@ func (l *Loop) syncOnce(ctx context.Context, pos mysql.Position) error {
 	}
 	if appending {
 		if err := l.w.SealAppendVerified(pos.Name + ".partial"); err != nil {
+			// 封口瞬时失败（磁盘满/IO 抖动，区别于永久 CRC 篡改）也必须清理
+			// .partial：否则重试会 O_APPEND 续写残留 partial → tail+tail
+			// 重复追加（组合验证仍通过，事件自包含）。与 Consume* 错误路径一致。
+			l.cleanupPartials()
 			return err
 		}
 	} else {
 		if err := l.w.Seal(pos.Name + ".partial"); err != nil {
+			l.cleanupPartials()
 			return err
 		}
 	}
