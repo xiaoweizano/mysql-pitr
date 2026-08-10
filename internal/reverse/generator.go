@@ -2,9 +2,12 @@ package reverse
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/a-shan/mysql-pitr/internal/binlog"
+	"github.com/shopspring/decimal"
 )
 
 // Generate 把一个 Transaction 翻成 0..N 条逆向 SQL。
@@ -165,21 +168,28 @@ func joinQuoted(cols []string, q func(string) string) string {
 }
 
 func formatValue(v interface{}) string {
-	if v == nil {
-		return "NULL"
-	}
 	switch x := v.(type) {
+	case nil:
+		return "NULL"
 	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
 		return fmt.Sprintf("%d", x)
-	case float32, float64:
-		return fmt.Sprintf("%v", x)
-	case string:
-		// 简化：单引号转义
-		escaped := strings.ReplaceAll(x, "'", "''")
-		return "'" + escaped + "'"
+	case float32:
+		return strconv.FormatFloat(float64(x), 'f', -1, 32)
+	case float64:
+		return strconv.FormatFloat(x, 'f', -1, 64)
+	case decimal.Decimal:
+		return x.String()
+	case time.Time:
+		return "'" + x.UTC().Format("2006-01-02 15:04:05") + "'"
 	case []byte:
-		// 二进制：用 _binary 'x'
-		return fmt.Sprintf("_binary '%x'", x)
+		// 用 X'hex' 而非 _binary 'hex'：后者是字符字面量，会把 "6162" 当字符串，
+		// 无法还原 0x61 0x62 原始字节（评审发现，baseline 带入）
+		return fmt.Sprintf("X'%x'", x)
+	case string:
+		// 反斜杠也要转义：MySQL 默认 NO_BACKSLASH_ESCAPES=off，\ 是转义符
+		escaped := strings.ReplaceAll(x, "\\", "\\\\")
+		escaped = strings.ReplaceAll(escaped, "'", "''")
+		return "'" + escaped + "'"
 	case bool:
 		if x {
 			return "1"

@@ -81,6 +81,8 @@ func (s *scanner) Scan(ctx context.Context, f Filter) error {
 
 	s.parser = replication.NewBinlogParser()
 	s.parser.SetVerifyChecksum(true)
+	s.parser.SetParseTime(true)   // TIMESTAMP/DATETIME → time.Time
+	s.parser.SetUseDecimal(true)  // DECIMAL → decimal.Decimal
 	s.txs = make(chan *Transaction, 16)
 	s.errs = make(chan error, 1)
 	s.done = make(chan struct{})

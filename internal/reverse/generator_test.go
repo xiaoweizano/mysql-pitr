@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -268,8 +269,61 @@ func TestFormatValue_Types(t *testing.T) {
 func TestFormatValue_MoreTypes(t *testing.T) {
 	// formatValue 其余类型分支：float / []byte / 默认（未知类型）。
 	assert.Equal(t, "19.99", formatValue(19.99))
-	assert.Equal(t, "_binary '6162'", formatValue([]byte{0x61, 0x62}))
+	assert.Equal(t, "X'6162'", formatValue([]byte{0x61, 0x62}))
 	assert.Equal(t, "'{1}'", formatValue(struct{ x int }{1}))
+}
+
+func TestFormatValue_TimeAndDecimal(t *testing.T) {
+	loc := time.UTC
+	ts := time.Date(2026, 8, 10, 12, 30, 45, 0, loc)
+	// 通过 Generate 验证 time.Time / decimal.Decimal 被正确渲染
+	tx := &binlog.Transaction{
+		TxID: "test-2", CommitTime: ts,
+		Statements: []binlog.RowChange{{
+			Schema: "shop", Table: "orders",
+			Action: binlog.ActionInsert,
+			After: []interface{}{
+				uint64(1), decimal.NewFromFloat(19.99), ts, []byte{0x01, 0xff},
+			},
+		}},
+	}
+	schema := map[string]binlog.TableSchema{
+		"shop.orders": {
+			Schema: "shop", Table: "orders",
+			Columns: []binlog.ColumnDef{
+				{Name: "id"}, {Name: "amount"}, {Name: "created_at"}, {Name: "blob_col"},
+			},
+		},
+	}
+	stmts, err := Generate(tx, schema, Options{})
+	require.NoError(t, err)
+	require.Len(t, stmts, 1)
+	require.Contains(t, stmts[0].SQL, "'2026-08-10 12:30:45'")
+	require.Contains(t, stmts[0].SQL, "19.99")
+	require.Contains(t, stmts[0].SQL, "X'01ff'")
+}
+
+func TestFormatValue_StringEscapingAndBinary(t *testing.T) {
+	// 字符串：单引号与反斜杠都要转义（MySQL 默认 NO_BACKSLASH_ESCAPES=off，
+	// 反斜杠也是转义符，必须写双反斜杠）。
+	// []byte：一律 X'hex' 字面量还原原始字节（评审发现，baseline 带入）。
+	tests := []struct {
+		name  string
+		in    interface{}
+		valid string
+	}{
+		{name: "backslash", in: "a\\b", valid: `'a\\b'`},
+		{name: "quote and backslash", in: `it's\`, valid: `'it''s\\'`},
+		{name: "binary bytes", in: []byte{0x01, 0xff}, valid: "X'01ff'"},
+		{name: "binary text bytes", in: []byte{0x61, 0x62}, valid: "X'6162'"},
+		{name: "binary empty", in: []byte{}, valid: "X''"},
+		{name: "decimal", in: decimal.NewFromFloat(123.45), valid: "123.45"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.valid, formatValue(tt.in))
+		})
+	}
 }
 
 func TestGenerate_CleanRowsNoWarnings(t *testing.T) {

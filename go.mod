@@ -9,6 +9,7 @@ require (
 	github.com/go-sql-driver/mysql v1.8.1
 	github.com/golang-jwt/jwt/v5 v5.2.1
 	github.com/gorilla/websocket v1.5.3
+	github.com/shopspring/decimal v1.4.0
 	github.com/spf13/cobra v1.8.1
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/crypto v0.28.0
@@ -26,7 +27,6 @@ require (
 	github.com/pingcap/log v1.1.1-0.20260227082333-572e590d08f1 // indirect
 	github.com/pingcap/tidb/pkg/parser v0.0.0-20260504140133-511dba1dbe17 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	github.com/shopspring/decimal v1.4.0 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
