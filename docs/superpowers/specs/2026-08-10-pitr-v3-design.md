@@ -80,7 +80,7 @@
 │  internal/collector   统一采集引擎（核心）                             │
 │    FileSource ─ParseFile──► 事务聚合器 ──► ArchiveWriter ─►归档目录    │
 │    StreamSource─binlogsyncer─►(同上管道)   └► ScanStream（PITR 扫描）  │
-│  internal/reverse     （server 端运行，纯逻辑）                        │
+│  internal/reverse     共享纯逻辑包，agent 端就地生成 SQL（行不出 agent）│
 │  internal/executor     检查点化批量执行                                │
 │  internal/connector    本地 MySQL 连接、preflight、FK 处理             │
 │  归档目录: /opt/pitr-archive/mysql-bin.*   （唯一事实源）              │
@@ -89,8 +89,8 @@
 
 ### 模块分层原则
 
-1. `collector → reverse → executor` 单向依赖，低层不依赖高层
-2. `reverse` 纯函数：无 IO，给定输入永远得相同输出
+1. `collector → reverse → executor` 单向依赖（agent 侧链路），低层不依赖高层
+2. `reverse` 纯函数：无 IO，给定输入永远得相同输出；agent/server 同仓库共享该包
 3. `Source` / `CheckpointStore` / `ArchiveStore` 均为接口，单测可注入 mock
 4. agent 只做采集 + 执行，不做 UI 逻辑
 
@@ -152,7 +152,18 @@ type RowChange struct {
 - 边界：GTIDEvent / XIDEvent / COMMIT QueryEvent
 - TableMapEvent 由 go-mysql parser 内部按 table-id 缓存，RowsEvent 自动带出 Schema/Table
 - 大事务（`max_rows_per_tx`，默认 100 万行，**用户可自定义**）截断 + 标记 `Truncated`，防止 OOM
+- `Truncated` 事务不可选用于恢复（UI 禁用 + 警告「事务过大已截断，无法完整回滚」）
 - MariaDB 预留：flavor 检测切换 GTID 解析（`SetFlavor`），本期只做 MySQL
+
+**扫描模式**（决定流式回传内容）：
+
+| 模式 | 回传内容 | 用途 |
+|---|---|---|
+| `META_ONLY` | 事务元数据（GTID/XID/时间/表/行数），轻量 | 模式 B 第一阶段、归档预览 |
+| `WITH_SQL` | 元数据 + 已生成的逆向 SQL（agent 端就地生成） | 模式 A 直接预览 SQL |
+| `SELECTED_SQL` | 对选中的 GTID/XID 集合做定向二次扫描，仅回传这些事务的 SQL | 模式 B 第二阶段 |
+
+内存边界：任一模式都只保留「当前事务」的行镜像（受 `max_rows_per_tx` 约束），不整库驻留；回传的 SQL 受 `max_preview_transactions`（默认 500）约束。
 
 ### 归档写入（ArchiveWriter）——保真 + 自愈
 
@@ -187,7 +198,9 @@ type Filter struct {
 
 ## 恢复/回滚链路
 
-### 逆向 SQL 生成（internal/reverse，server 端纯函数）
+### 逆向 SQL 生成（internal/reverse，共享纯函数库，**agent 端执行**）
+
+行镜像只在 agent 本地，reverse 作为**共享纯逻辑包**由 agent 调用就地生成 SQL，只有生成的 SQL 文本经 WS 回传 server 用于预览/勾选/持久化——行镜像永不出 agent，大文件扫描无传输失控风险。server 不生成 SQL，只做展示与决策。
 
 ```go
 type Options struct {
@@ -221,14 +234,16 @@ func Generate(tx *binlog.Transaction, schema map[string]TableSchema, opts Option
 
 **模式 A：行级 SQL 勾选（误删恢复 / UPDATE 回滚）**
 ```
-选实例+表+时间区间 ──► scan 回传事务元数据 ──► reverse 生成全部 SQL
-    ──► UI 按事务分组展示，逐行勾选 ──► 执行
+选实例+表+时间区间 ──► scan(WITH_SQL) agent 边扫边生成 SQL
+    ──► UI 按事务分组展示已生成 SQL，逐行勾选 ──► 执行
 ```
 
 **模式 B：指定事务恢复（GTID/事务级）**
 ```
-选实例 + 过滤(GTID集/时间/表) ──► 两阶段：先扫出候选事务元数据
-    ──► 用户勾选 N 个事务 ──► 只对选中的调 reverse.Generate ──► 预览 ──► 执行
+选实例 + 过滤(GTID集/时间/表) ──► 两阶段：
+    阶段1 scan(META_ONLY) 回传候选事务元数据 ──► 用户勾选 N 个事务
+    阶段2 agent 定向二次扫描（SELECTED_SQL），仅生成选中事务的 SQL
+    ──► 预览 ──► 执行
 ```
 
 ### 执行引擎（internal/executor，agent 端）
