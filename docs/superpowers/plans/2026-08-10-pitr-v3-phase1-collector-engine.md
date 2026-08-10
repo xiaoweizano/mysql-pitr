@@ -584,7 +584,7 @@ func TestFormatValue_TimeAndDecimal(t *testing.T) {
     require.Len(t, stmts, 1)
     require.Contains(t, stmts[0].SQL, "'2026-08-10 12:30:45'")
     require.Contains(t, stmts[0].SQL, "19.99")
-    require.Contains(t, stmts[0].SQL, "_binary '01ff'")
+    require.Contains(t, stmts[0].SQL, "X'01ff'")
 }
 ```
 
@@ -620,9 +620,14 @@ func formatValue(v interface{}) string {
     case time.Time:
         return "'" + x.UTC().Format("2006-01-02 15:04:05") + "'"
     case []byte:
-        return fmt.Sprintf("_binary '%x'", x)
+        // 用 X'hex' 而非 _binary 'hex'：后者是字符字面量，会把 "6162" 当字符串，
+        // 无法还原 0x61 0x62 原始字节（评审发现，baseline 带入）
+        return fmt.Sprintf("X'%x'", x)
     case string:
-        return "'" + strings.ReplaceAll(x, "'", "''") + "'"
+        // 反斜杠也要转义：MySQL 默认 NO_BACKSLASH_ESCAPES=off，\ 是转义符
+        escaped := strings.ReplaceAll(x, "\\", "\\\\")
+        escaped = strings.ReplaceAll(escaped, "'", "''")
+        return "'" + escaped + "'"
     case bool:
         if x {
             return "1"
