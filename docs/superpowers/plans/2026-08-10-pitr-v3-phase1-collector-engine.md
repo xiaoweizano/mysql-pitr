@@ -1570,10 +1570,11 @@ func TestGolden_SetupSQLReverseStatements(t *testing.T) {
             }
         }
     }
-    // setup.sql：2 个 INSERT + 1 个 UPDATE + 1 个 DELETE
-    require.Equal(t, 1, deletes, "逆向 DELETE（还原被误删行）")
+    // setup.sql：1 个 INSERT 语句插入 2 行（→ 逆向 DELETE×2）、1 个 UPDATE（→ 逆向 UPDATE×1）、
+    // 1 个 DELETE（→ 逆向 INSERT×1）
+    require.Equal(t, 2, deletes, "逆向 DELETE（还原被误删行）")
     require.Equal(t, 1, updates, "逆向 UPDATE")
-    require.Equal(t, 2, inserts, "逆向 INSERT")
+    require.Equal(t, 1, inserts, "逆向 INSERT")
 }
 ```
 
