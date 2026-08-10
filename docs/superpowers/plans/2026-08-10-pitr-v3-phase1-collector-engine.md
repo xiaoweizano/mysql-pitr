@@ -1047,6 +1047,7 @@ package archive_test
 
 import (
     "context"
+    "io"
     "os"
     "path/filepath"
     "testing"
@@ -1059,31 +1060,26 @@ import (
     "github.com/a-shan/mysql-pitr/internal/binlogtest"
 )
 
-// fakeSource 从事件字节序列构造一个 binlog.Source。
-type fakeSource struct {
-    evs  [][]byte
-    cur  int
-    parser *replication.BinlogParser
+// sliceSource 从 binlogtest.Event 切片构造一个 binlog.Source。
+type sliceSource struct {
+    evs []binlogtest.Event
+    cur int
 }
 
-func (f *fakeSource) Next(ctx context.Context) (*replication.BinlogEvent, error) {
-    if f.cur >= len(f.evs) {
+func (s *sliceSource) Next(ctx context.Context) (*replication.BinlogEvent, error) {
+    if s.cur >= len(s.evs) {
         return nil, io.EOF
     }
-    b := f.evs[f.cur]
-    f.cur++
-    // 用 parser 解析单事件（ParseFile 语义在 Seal 时验证）
-    ev, err := f.parser.ParseSingleEvent(bytes.NewReader(b), func(ev *replication.BinlogEvent) error { return nil })
-    _ = ev
-    if err != nil {
-        return nil, err
-    }
-    // 返回带 RawData 的裸事件（事件体无需解码，archive 只关心 RawData 与事件类型）
-    return &replication.BinlogEvent{RawData: b, Header: &replication.EventHeader{EventType: 0}}, nil
+    e := s.evs[s.cur]
+    s.cur++
+    return &replication.BinlogEvent{RawData: e.Raw, Header: &replication.EventHeader{EventType: e.Type, Timestamp: 1754294400}}, nil
 }
-```
+func (s *sliceSource) Close() error { return nil }
 
-（说明：archive 写入只依赖 `RawData` 与事件类型（Rotate 判文件边界）。fakeSource 用 `ParseSingleEvent` 拿不到类型时，改为：让 binlogtest 的 craft 函数同时返回「事件类型 + 字节」。**实现调整**：`binlogtest` 导出 `Event struct{ Type replication.EventType; Raw []byte }` 与 `CraftFile(events []Event) []byte`；fakeSource 直接遍历 `[]binlogtest.Event`。这样测试最干净。）
+type stubManifest []archive.ManifestFile
+
+func (m stubManifest) List(ctx context.Context) ([]archive.ManifestFile, error) { return m, nil }
+```
 
 测试主体：
 
@@ -1135,19 +1131,26 @@ func TestWriter_Gaps(t *testing.T) {
     require.Equal(t, []string{"mysql-bin.000002"}, gaps)
 }
 
-type sliceSource struct {
-    evs []binlogtest.Event
-    cur int
-}
-func (s *sliceSource) Next(ctx context.Context) (*replication.BinlogEvent, error) {
-    if s.cur >= len(s.evs) {
-        return nil, io.EOF
+func TestWriter_ConsumeRotateStartsNewFile(t *testing.T) {
+    dir := t.TempDir()
+    w := archive.NewWriter(dir)
+
+    evs := []binlogtest.Event{
+        binlogtest.MustCraft(binlogtest.CraftFDE()),
+        binlogtest.MustCraft(binlogtest.CraftXID(1)),
+        binlogtest.MustCraft(binlogtest.CraftRotate("mysql-bin.000002")),
+        binlogtest.MustCraft(binlogtest.CraftXID(2)),
     }
-    e := s.evs[s.cur]
-    s.cur++
-    return &replication.BinlogEvent{RawData: e.Raw, Header: &replication.EventHeader{EventType: e.Type, Timestamp: 1754294400}}, nil
+    require.NoError(t, w.Consume(context.Background(), &sliceSource{evs: evs}))
+    require.NoError(t, w.Seal("mysql-bin.000001.partial"))
+    require.NoError(t, w.Seal("mysql-bin.000002.partial"))
+
+    for _, name := range []string{"mysql-bin.000001", "mysql-bin.000002"} {
+        b, err := os.ReadFile(filepath.Join(dir, name))
+        require.NoError(t, err)
+        require.Equal(t, []byte{0xfe, 0x62, 0x69, 0x6e}, b[:4], "每个归档文件必须以 binlog magic 开头")
+    }
 }
-func (s *sliceSource) Close() error { return nil }
 
 type stubManifest []archive.ManifestFile
 func (m stubManifest) List(ctx context.Context) ([]archive.ManifestFile, error) { return m, nil }
@@ -1246,7 +1249,7 @@ func (w *Writer) Consume(ctx context.Context, src binlog.Source) error {
 }
 ```
 
-**实现说明（重要）**：`Consume` 的「当前文件名」由调用方上下文决定，这里简化固定为 `mysql-bin.000001`。Phase 2 的归档循环会改为由调用方传入文件名解析函数 `NameFor(headers ...replication.EventHeader) string` 或直接依赖 RotateEvent 的 `NextLogName`（`RotateEvent{NextLogName []byte}`）。**本 Task 直接采用 RotateEvent.NextLogName**：首个事件前无文件名时用 `mysql-bin.000001`，收到 ROTATE_EVENT 时取 `e.(*replication.RotateEvent).NextLogName` 作为下一个文件名（此行为在 Task 7 的测试中由 `CraftRotate("mysql-bin.000002")` 覆盖）。`CraftRotate` 构造带 NextLogName 的 RotateEvent。
+**实现说明（最终决策）**：归档文件名由 ROTATE_EVENT 驱动——首个事件前默认 `mysql-bin.000001`；收到 `*replication.RotateEvent` 时取其 `NextLogName` 作为下一个文件名（关闭当前文件、为新文件写 magic）。Phase 2 的归档循环只在 Consume 之外负责「初始回填 + 缺口补齐」，命名规则本任务定死。
 
 `Seal`：
 
