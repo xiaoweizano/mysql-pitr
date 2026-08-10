@@ -1,7 +1,7 @@
 # PITR 平台 v3 设计文档（go-mysql 采集引擎 + SvelteKit）
 
 **日期**：2026-08-10
-**状态**：已评审通过
+**状态**：草案，待评审
 **作者**：a-shan 团队
 
 ## 背景
@@ -192,7 +192,7 @@ type Filter struct {
 - 时间过滤：按 `CommitTime`（XID/GTID 事件时间戳）
 - GTID 定位：GTID 事件命中集合才聚合进事务——「指定事务恢复」的定位手段
 - 大 binlog 一次性流式扫描，边扫边经 WS 回传 server → SSE 推给浏览器，不落内存
-- 先回传事务**元数据**（GTID/XID/时间/表/行数），达到 `max_preview_transactions`（默认 500，可配置）即停；用户勾选后再按需生成 SQL
+- 回传内容按扫描模式区分（见上表）：`META_ONLY` 轻量元数据；`WITH_SQL` 边扫边生成 SQL；`SELECTED_SQL` 复用同一扫描路径按选中 GTID 集过滤，代价是额外一次全量遍历
 
 ---
 
