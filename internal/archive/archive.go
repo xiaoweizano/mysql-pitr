@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/replication"
 
@@ -45,14 +46,31 @@ type Writer struct {
 // NewWriter 创建一个写 dir 目录的 Writer。
 func NewWriter(dir string) *Writer { return &Writer{dir: dir} }
 
-// Consume 把事件流写入 dir 下以文件名命名的 .partial 文件。
+// Consume 把事件流写入 dir 下以文件名命名的 .partial 文件（全量重建模式）。
 //
 // 首个事件前写 magic，默认文件名 mysql-bin.000001；收到 ROTATE_EVENT 时
 // 关闭当前文件，并取 RotateEvent.NextLogName 作为下一个文件名（等下一个
 // 事件到达才开新文件、写 magic）。
 func (w *Writer) Consume(ctx context.Context, src binlog.Source) error {
+	return w.consume(ctx, src, "", true)
+}
+
+// ConsumeAppend 把事件流续写到指定文件名的 .partial（append 续写模式）。
+//
+// 与 Consume 的区别：不写 magic（.partial 只含续写尾部的事件字节，Seal 时
+// 追加到已封口文件末尾）；文件名由 fileName 参数给定而非 rotate 事件决定；
+// 收到 ROTATE_EVENT 时只关闭当前文件，不切换新文件。
+func (w *Writer) ConsumeAppend(ctx context.Context, src binlog.Source, fileName string) error {
+	return w.consume(ctx, src, fileName, false)
+}
+
+// consume 是 Consume / ConsumeAppend 的共用实现。
+// writeMagic=true（全量重建）：首个事件前写 magic，ROTATE_EVENT 更新下一个
+// 文件名，事件流从头开始；writeMagic=false（append 续写）：fileName 固定目标
+// 文件名（首事件前不写 magic），ROTATE_EVENT 只关闭当前文件。
+func (w *Writer) consume(ctx context.Context, src binlog.Source, fileName string, writeMagic bool) error {
 	var f *os.File
-	var next string // 最近一次 ROTATE_EVENT 给出的下一个文件名；空 = 默认名
+	next := fileName // 下一个文件名；全量重建模式初始为空 = 默认名
 	defer func() {
 		if f != nil {
 			f.Close()
@@ -78,7 +96,9 @@ func (w *Writer) Consume(ctx context.Context, src binlog.Source) error {
 			if err := validateRotateName(name); err != nil {
 				return err
 			}
-			next = name
+			if writeMagic {
+				next = name
+			}
 			if f != nil {
 				f.Close()
 				f = nil
@@ -91,11 +111,20 @@ func (w *Writer) Consume(ctx context.Context, src binlog.Source) error {
 				name = defaultBinlogName
 			}
 			path := filepath.Join(w.dir, name+".partial")
-			if f, err = os.Create(path); err != nil {
-				return err
-			}
-			if _, err := f.Write(binlogMagic); err != nil {
-				return err
+			if writeMagic {
+				// 全量重建：截断重建，写入 magic
+				if f, err = os.Create(path); err != nil {
+					return err
+				}
+				if _, err := f.Write(binlogMagic); err != nil {
+					return err
+				}
+			} else {
+				// append 续写：只追加（不写 magic）。O_APPEND 让 Seal 失败后
+				// 残留的旧 partial 可以安全续写（重试语义），不重复写入。
+				if f, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644); err != nil {
+					return err
+				}
 			}
 		}
 		if _, err := f.Write(ev.RawData); err != nil {
@@ -146,25 +175,73 @@ func rotateNextLogName(ev *replication.BinlogEvent) (string, error) {
 	return "", fmt.Errorf("archive: rotate event without next log name")
 }
 
-// Seal 用 ParseFile + SetVerifyChecksum(true) 验证 .partial 可完整解析，
-// 通过则去掉 .partial 后缀改名为正式文件；验证失败返回错误，调用方回退
-// 整文件拷贝。
+// Seal 封口 .partial 文件，语义取决于内容（以 binlog magic 开头与否）：
 //
-// 注：go-mysql 的校验和验证以 FDE 解析为门槛——无 FDE 的文件（如旋转产生的
-// 后续文件，只含 magic + XID）会跳过 CRC 校验但仍能解析封口，这是 go-mysql
-// 语义，非本包可控制。
+//   - 全量重建（magic 开头）：目标文件已存在 → 拒绝（防覆盖已封口文件）；
+//     否则用 verifyParseable 验证（含 FDE 时启用校验和验证），通过后 rename。
+//   - append 续写（无 magic）：目标文件必须已存在；magic+tail 拼临时文件验证
+//     可解析后追加到目标文件末尾，删除 .partial。
+//
+// 验证失败返回错误，调用方回退整文件拷贝。
+//
+// 注：go-mysql 的校验和验证以 FDE 解析为门槛——无 FDE 的内容（如 append 尾部、
+// 旋转产生的后续文件，只含 magic + XID）会跳过 CRC 校验但仍能解析封口，这是
+// go-mysql 语义，非本包可控制；尾部的事件结构破坏（长度/截断）仍会被捕获。
 func (w *Writer) Seal(partialName string) error {
 	src := filepath.Join(w.dir, partialName)
+	final := strings.TrimSuffix(src, ".partial")
+
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return fmt.Errorf("archive: read partial %s: %w", partialName, err)
+	}
+	_, statErr := os.Stat(final)
+	finalExists := statErr == nil
+
+	if len(data) >= 4 && string(data[:4]) == string(binlogMagic) {
+		// 全量重建：目标已存在 → 拒绝（防覆盖）
+		if finalExists {
+			return fmt.Errorf("archive: refuse full reconstruction over sealed file %s", filepath.Base(final))
+		}
+		if err := w.verifyParseable(data[4:]); err != nil {
+			return fmt.Errorf("archive: seal verify %s: %w", partialName, err)
+		}
+		return os.Rename(src, final)
+	}
+
+	// append 续写：目标必须已存在；magic+tail 验证后追加
+	if !finalExists {
+		return fmt.Errorf("archive: append seal %s but final %s missing", partialName, filepath.Base(final))
+	}
+	if err := w.verifyParseable(data); err != nil {
+		return fmt.Errorf("archive: append seal verify %s: %w", partialName, err)
+	}
+	f, err := os.OpenFile(final, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("archive: open final %s: %w", partialName, err)
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return fmt.Errorf("archive: append %s: %w", partialName, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("archive: close final: %w", err)
+	}
+	return os.Remove(src)
+}
+
+// verifyParseable 用 magic+data 拼临时文件做 ParseFile + SetVerifyChecksum(true)，
+// 验证 data 可以作为 binlog 文件的开头之后（紧跟 magic）完整解析。
+// 调用方传入的内容必须不含 magic（全量重建分支先剥离已写入的 magic）。
+func (w *Writer) verifyParseable(data []byte) error {
+	tmp := filepath.Join(w.dir, ".verify-"+fmt.Sprint(time.Now().UnixNano()))
+	if err := os.WriteFile(tmp, append(append([]byte{}, binlogMagic...), data...), 0o644); err != nil {
+		return err
+	}
+	defer os.Remove(tmp)
 	parser := replication.NewBinlogParser()
 	parser.SetVerifyChecksum(true)
-	if err := parser.ParseFile(src, 0, func(*replication.BinlogEvent) error { return nil }); err != nil {
-		return fmt.Errorf("archive: seal verify %s: %w", partialName, err)
-	}
-	final := strings.TrimSuffix(src, ".partial")
-	if err := os.Rename(src, final); err != nil {
-		return fmt.Errorf("archive: rename %s: %w", partialName, err)
-	}
-	return nil
+	return parser.ParseFile(tmp, 0, func(*replication.BinlogEvent) error { return nil })
 }
 
 // Gaps 对比 manifest，找出本地归档中完全缺失的文件（Size 不匹配的

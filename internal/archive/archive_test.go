@@ -136,6 +136,73 @@ func TestWriter_ConsumeRejectsPathTraversalName(t *testing.T) {
 	}
 }
 
+// TestWriter_ConsumeAppend_AppendsToSealed 验证 append 续写模式：
+// ConsumeAppend 把尾部事件（不写 magic）写到 .partial，Seal 在已封口文件
+// 末尾追加（无重复 magic）。
+func TestWriter_ConsumeAppend_AppendsToSealed(t *testing.T) {
+	dir := t.TempDir()
+	w := archive.NewWriter(dir)
+	// 先造一个"已回填"的封口文件：全量重建一份 FDE+XID
+	evs := []binlogtest.Event{binlogtest.MustCraft(binlogtest.CraftFDE()), binlogtest.MustCraft(binlogtest.CraftXID(1))}
+	require.NoError(t, w.Consume(context.Background(), &sliceSource{evs: evs}))
+	require.NoError(t, w.Seal("mysql-bin.000001.partial"))
+
+	// append 续写：XID(2) 尾部
+	tail := []binlogtest.Event{binlogtest.MustCraft(binlogtest.CraftXID(2))}
+	require.NoError(t, w.ConsumeAppend(context.Background(), &sliceSource{evs: tail}, "mysql-bin.000001"))
+	require.NoError(t, w.Seal("mysql-bin.000001.partial"))
+
+	// 最终文件 = 原封口内容 + 尾部（无重复 magic）
+	got, _ := os.ReadFile(filepath.Join(dir, "mysql-bin.000001"))
+	want := append(append([]byte{}, binlogtest.CraftFile(evs)...), tail[0].Raw...)
+	require.Equal(t, want, got)
+}
+
+// TestWriter_SealFullReconstructionOverExistingRefuses 验证封口守卫：
+// 全量重建（magic 开头）的 .partial 在目标文件已存在时 Seal 必须拒绝（防覆盖）。
+func TestWriter_SealFullReconstructionOverExistingRefuses(t *testing.T) {
+	dir := t.TempDir()
+	w := archive.NewWriter(dir)
+	evs := []binlogtest.Event{binlogtest.MustCraft(binlogtest.CraftFDE()), binlogtest.MustCraft(binlogtest.CraftXID(1))}
+	require.NoError(t, w.Consume(context.Background(), &sliceSource{evs: evs}))
+	require.NoError(t, w.Seal("mysql-bin.000001.partial"))
+	// 再次全量重建同名文件 → Seal 必须拒绝（防覆盖）
+	require.NoError(t, w.Consume(context.Background(), &sliceSource{evs: evs}))
+	require.Error(t, w.Seal("mysql-bin.000001.partial"))
+}
+
+// TestWriter_ConsumeAppendVerifyTailCorruption 验证 append 尾部的完整性检查：
+// 尾部被篡改（结构破坏）→ Seal 失败，不追加，partial 保留供调用方回退。
+//
+// 注：go-mysql 的校验和验证以 FDE 解析为门槛（Phase 1 Seal 注释已记录），
+// magic+tail（无 FDE）会跳过 CRC 校验，因此这里篡改事件头的 EventSize
+// （31 → 95）做结构性破坏——解析时读超触发 unexpected EOF，保证 ParseFile 失败。
+func TestWriter_ConsumeAppendVerifyTailCorruption(t *testing.T) {
+	dir := t.TempDir()
+	w := archive.NewWriter(dir)
+	evs := []binlogtest.Event{binlogtest.MustCraft(binlogtest.CraftFDE()), binlogtest.MustCraft(binlogtest.CraftXID(1))}
+	require.NoError(t, w.Consume(context.Background(), &sliceSource{evs: evs}))
+	require.NoError(t, w.Seal("mysql-bin.000001.partial"))
+
+	// append 尾部后篡改 EventSize：XID 事件头 [9:13] 是 event size
+	tail := []binlogtest.Event{binlogtest.MustCraft(binlogtest.CraftXID(2))}
+	require.NoError(t, w.ConsumeAppend(context.Background(), &sliceSource{evs: tail}, "mysql-bin.000001"))
+	p := filepath.Join(dir, "mysql-bin.000001.partial")
+	b, err := os.ReadFile(p)
+	require.NoError(t, err)
+	b[9] ^= 0x40 // event size 31 → 95：解析时读超 → 验证失败
+	require.NoError(t, os.WriteFile(p, b, 0o644))
+
+	require.Error(t, w.Seal("mysql-bin.000001.partial"))
+
+	// 不追加：最终文件保持原封口内容，partial 仍在
+	got, err := os.ReadFile(filepath.Join(dir, "mysql-bin.000001"))
+	require.NoError(t, err)
+	require.Equal(t, binlogtest.CraftFile(evs), got)
+	_, err = os.Stat(p)
+	require.NoError(t, err, "Seal 失败后 partial 必须保留，供调用方回退/重试")
+}
+
 // TestWriter_ConsumeRejectsRotateNonBinlogName 补充校验：不符合
 // "<前缀>.<全数字>" binlog 命名的 rotate 名字（如 "evil.txt"、".."）也拒绝。
 func TestWriter_ConsumeRejectsRotateNonBinlogName(t *testing.T) {
