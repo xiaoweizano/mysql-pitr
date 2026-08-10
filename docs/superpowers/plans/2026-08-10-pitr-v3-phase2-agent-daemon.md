@@ -831,6 +831,8 @@ func (d *Daemon) Scan(ctx context.Context, id string, req ws.ScanRequest) error 
 
 `execute.go`：`Execute` 把 `ws.ExecuteRequest` 转 `executor.Plan`（Statements 转换），用 `executor.Executor.Run` 跑在 goroutine，Progress callback 发 `EvProgress`，结束发 `EvOpDone`/`EvOpError`；`CancelScan` 复用 cancel 注册表（execute 也注册 op，cancel 发 `EvOpDone{paused:true}`）；`Resume` 重新发 Plan 后 `Run`（检查点由 FileCheckpointStore 续起——executor.Run 的语义是清检查点重跑，**注意**：executor 的 `Run` 启动时 Clear 检查点；Resume 的正确路径是 Phase 3 server 重发 Plan 后 agent 再 Run——Phase 2 的 `Resume` 先实现为「验证 op 存在 + 重发 Plan 再 Run」，文档注明 Phase 3 完善）。
 
+**安全要求（T3 评审 carry-in，控制器裁决）**：operationID 从 WS 输入（网络侧不可信）——`Execute`/`Resume` 入口必须校验：`operationID != ""` 且 `filepath.Base(operationID) == operationID` 且不含 `..`（拒绝路径注入；防 FileCheckpointStore 写/删出目录）。补测试：`Execute` 收到 `"../evil"` operationID 返回错误。
+
 `wsFilterToBinlog` 转换函数 + 测试。
 
 - [ ] **Step 4: 跑测试 + 提交**
