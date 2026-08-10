@@ -182,6 +182,10 @@ func CraftWriteRowsValues(tableID uint64, values ...int64) ([]byte, error) {
 
 // CraftUpdateRows 构造 UPDATE_ROWS_EVENTv2（单列 LONGLONG），n 对 before/after 行，
 // before 值 1..n、after 值 n+1..2n。
+//
+// 布局按行交错：before(1), after(1), before(2), after(2), ...，与 go-mysql
+// RowsEvent.DecodeData 的逐行两镜像解析（ColumnBitmap1 解 before、ColumnBitmap2
+// 解 after）一致；若先输出全部 before 再输出全部 after，n≥2 时行会被静默错配。
 func CraftUpdateRows(tableID uint64, n int) ([]byte, error) {
 	body := make([]byte, 0, 6+2+2+1+1+1+n*18)
 	id := make([]byte, 8)
@@ -195,8 +199,6 @@ func CraftUpdateRows(tableID uint64, n int) ([]byte, error) {
 	for i := 0; i < n; i++ {
 		body = append(body, 0x00) // before null bitmap
 		body = binary.LittleEndian.AppendUint64(body, uint64(i+1))
-	}
-	for i := 0; i < n; i++ {
 		body = append(body, 0x00) // after null bitmap
 		body = binary.LittleEndian.AppendUint64(body, uint64(n+i+1))
 	}

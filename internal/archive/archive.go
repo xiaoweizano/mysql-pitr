@@ -122,6 +122,10 @@ func rotateNextLogName(ev *replication.BinlogEvent) (string, error) {
 // Seal 用 ParseFile + SetVerifyChecksum(true) 验证 .partial 可完整解析，
 // 通过则去掉 .partial 后缀改名为正式文件；验证失败返回错误，调用方回退
 // 整文件拷贝。
+//
+// 注：go-mysql 的校验和验证以 FDE 解析为门槛——无 FDE 的文件（如旋转产生的
+// 后续文件，只含 magic + XID）会跳过 CRC 校验但仍能解析封口，这是 go-mysql
+// 语义，非本包可控制。
 func (w *Writer) Seal(partialName string) error {
 	src := filepath.Join(w.dir, partialName)
 	parser := replication.NewBinlogParser()
