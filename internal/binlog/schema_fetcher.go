@@ -15,9 +15,10 @@ type ColumnDef struct {
 
 // TableSchema 是 SchemaFetcher 返回的表结构。
 type TableSchema struct {
-	Schema  string
-	Table   string
-	Columns []ColumnDef
+	Schema     string
+	Table      string
+	Columns    []ColumnDef
+	PrimaryKey []string // 主键列名序列（按主键定义顺序）；空表示无主键
 }
 
 // SchemaFetcher 拉取表结构信息。实现包括：
