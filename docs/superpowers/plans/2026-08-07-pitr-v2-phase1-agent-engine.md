@@ -12,7 +12,7 @@
 
 下列约束**所有 task 都 implicitly 包含**，无需在每个 task 重复：
 
-- **Go 版本**：1.22（go.mod 已固定，不要升级）
+- **Go 版本**：1.23（go-mysql v1.13.0 强制要求；CI、Dockerfile、release.yml 同步升到 1.23）
 - **go-mysql 版本**：`v1.13.0`（latest stable；commit 时由 go mod tidy 锁定确切版本）
 - **包路径**：`github.com/a-shan/mysql-pitr/internal/...`
 - **类型签名约定**（**所有 task 共享，不要改名/改签名**）：
@@ -160,6 +160,7 @@ func NewExecutor(store CheckpointStore) Executor
 - **提交粒度**：每个 task 一个或多个 commit，commit message 用 `feat:`/`refactor:`/`test:`/`chore:`/`docs:` 前缀；HEREDOC 写多行 message
 - **不要**添加 README/CHANGELOG 注释；除非 task 明确要求
 - **不要**添加错误处理用于"理论上不可能"的场景；只在校验真实边界时处理
+- **gofmt**：所有新建/修改的 `.go` 文件在提交前必须运行 `gofmt -w <file>`（plan 中的代码块用 4 空格缩进，Go 要求 tab；golangci-lint 的 gofmt linter 会检查）
 
 ---
 
@@ -214,7 +215,7 @@ func NewExecutor(store CheckpointStore) Executor
 **Interfaces:**
 - Produces: 空壳包，能 `go build ./internal/binlog/...` 通过
 
-- [ ] **Step 1: 添加 go-mysql 依赖**
+- [x] **Step 1: 添加 go-mysql 依赖**
 
 Run:
 ```bash
@@ -223,7 +224,7 @@ cd D:/a-shan && go get github.com/go-mysql-org/go-mysql@v1.13.0
 
 Expected: `go.mod` 新增 `github.com/go-mysql-org/go-mysql v1.13.0` 行。
 
-- [ ] **Step 2: 创建包 doc.go**
+- [x] **Step 2: 创建包 doc.go**
 
 Create `internal/binlog/doc.go`:
 
@@ -236,7 +237,7 @@ Create `internal/binlog/doc.go`:
 package binlog
 ```
 
-- [ ] **Step 3: 创建骨架文件（仅包声明 + 占位类型）**
+- [x] **Step 3: 创建骨架文件（仅包声明 + 占位类型）**
 
 Create `internal/binlog/transaction.go`:
 
@@ -290,7 +291,7 @@ type Filter struct {
 
 Create `internal/binlog/gtid.go`, `internal/binlog/reader.go`, `internal/binlog/schema_fetcher.go`, `internal/binlog/engine.go` — 每个文件只写 `package binlog` 一行加注释。
 
-- [ ] **Step 4: 验证构建**
+- [x] **Step 4: 验证构建**
 
 Run:
 ```bash
@@ -299,7 +300,7 @@ cd D:/a-shan && go build ./internal/binlog/...
 
 Expected: 无输出（成功）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd D:/a-shan && git add go.mod go.sum internal/binlog/ && git commit -m "$(cat <<'EOF'
@@ -323,7 +324,7 @@ EOF
 - Consumes: 类型定义来自 Task 1
 - Produces: `NewTransaction(gtid string, xid uint64, commitTime time.Time, schema string) (Transaction, error)` 构造函数
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 Create `internal/binlog/transaction_test.go`:
 
@@ -388,7 +389,7 @@ func TestTransaction_MarkTruncated(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run:
 ```bash
@@ -397,7 +398,7 @@ cd D:/a-shan && go test ./internal/binlog/ -run TestNewTransaction -v
 
 Expected: 编译失败，`undefined: NewTransaction`。
 
-- [ ] **Step 3: 实现构造函数与辅助方法**
+- [x] **Step 3: 实现构造函数与辅助方法**
 
 Append to `internal/binlog/transaction.go`:
 
@@ -467,7 +468,7 @@ func randomID(n int) string {
 
 注意：import 块要和已有 import 合并，不要重复声明。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run:
 ```bash
@@ -477,7 +478,7 @@ cd D:/a-shan && go test ./internal/binlog/ -run TestTransaction -v
 
 Expected: 全部 PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd D:/a-shan && git add internal/binlog/transaction.go internal/binlog/transaction_test.go && git commit -m "$(cat <<'EOF'
@@ -504,7 +505,7 @@ EOF
   - `ParseGTIDSet(flavor, raw string) (mysql.GTIDSet, error)`
   - `MatchGTID(set mysql.GTIDSet, gtid string) bool`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 Create `internal/binlog/gtid_test.go`:
 
@@ -559,7 +560,7 @@ func TestMatchGTID_MultiIntervalSet(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run:
 ```bash
@@ -568,7 +569,7 @@ cd D:/a-shan && go test ./internal/binlog/ -run TestParseGTIDSet -v
 
 Expected: `undefined: ParseGTIDSet`。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 Replace `internal/binlog/gtid.go`:
 
@@ -619,7 +620,7 @@ func MatchGTID(set mysql.GTIDSet, gtid string) bool {
 }
 ```
 
-- [ ] **Step 4: 跑测试**
+- [x] **Step 4: 跑测试**
 
 Run:
 ```bash
@@ -628,7 +629,7 @@ cd D:/a-shan && go test ./internal/binlog/ -run "TestParseGTIDSet|TestMatchGTID"
 
 Expected: 全部 PASS。如果 `Contain` 方法行为与预期不同（go-mysql API 细节），调整为 `set.Update(sub); set.Equal(sub)` 比较法。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd D:/a-shan && git add internal/binlog/gtid.go internal/binlog/gtid_test.go && git commit -m "$(cat <<'EOF'
@@ -651,7 +652,7 @@ EOF
 **Interfaces:**
 - Produces: `EnumerateBinlogFiles(dir string, startPos, endPos mysql.Position) ([]string, error)`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 Create `internal/binlog/reader_test.go`:
 
@@ -754,7 +755,7 @@ func TestEnumerateBinlogFiles_StartAfterEnd(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run:
 ```bash
@@ -763,7 +764,7 @@ cd D:/a-shan && go test ./internal/binlog/ -run TestEnumerateBinlogFiles -v
 
 Expected: `undefined: EnumerateBinlogFiles`。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 Replace `internal/binlog/reader.go`:
 
@@ -861,7 +862,7 @@ func indexOf(names []string, target string) int {
 }
 ```
 
-- [ ] **Step 4: 跑测试**
+- [x] **Step 4: 跑测试**
 
 Run:
 ```bash
@@ -870,7 +871,7 @@ cd D:/a-shan && go test ./internal/binlog/ -run TestEnumerateBinlogFiles -v
 
 Expected: 全部 PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd D:/a-shan && git add internal/binlog/reader.go internal/binlog/reader_test.go && git commit -m "$(cat <<'EOF'
@@ -900,7 +901,7 @@ EOF
   - `NewMySQLSchemaFetcher(conn *client.Conn) *MySQLSchemaFetcher`
   - `StaticSchemaFetcher` map-based 实现（测试用）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 Create `internal/binlog/schema_fetcher_test.go`:
 
@@ -937,7 +938,7 @@ func TestStaticSchemaFetcher_NotFound(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run:
 ```bash
@@ -946,7 +947,7 @@ cd D:/a-shan && go test ./internal/binlog/ -run TestStaticSchemaFetcher -v
 
 Expected: `undefined: StaticSchemaFetcher`。
 
-- [ ] **Step 3: 实现 StaticSchemaFetcher + 类型定义**
+- [x] **Step 3: 实现 StaticSchemaFetcher + 类型定义**
 
 Replace `internal/binlog/schema_fetcher.go`:
 
@@ -994,7 +995,7 @@ func (s StaticSchemaFetcher) FetchSchema(_ context.Context, schema, table string
 }
 ```
 
-- [ ] **Step 4: 跑测试**
+- [x] **Step 4: 跑测试**
 
 Run:
 ```bash
@@ -1003,7 +1004,7 @@ cd D:/a-shan && go test ./internal/binlog/ -run TestStaticSchemaFetcher -v
 
 Expected: 全部 PASS。
 
-- [ ] **Step 5: 写 MySQLSchemaFetcher 单测（用 sqlmock 不合适，因为这用 go-mysql client；改为集成测试用 build tag）**
+- [x] **Step 5: 写 MySQLSchemaFetcher 单测（用 sqlmock 不合适，因为这用 go-mysql client；改为集成测试用 build tag）**
 
 Create `internal/binlog/schema_fetcher_mysql_test.go`（暂时占位，MySQLSchemaFetcher 在 Task 6 与 connector 一起实现）:
 
@@ -1015,7 +1016,7 @@ package binlog
 // MySQLSchemaFetcher 的集成测试在 Task 6 添加（依赖 connector 重构后的连接）。
 ```
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 cd D:/a-shan && git add internal/binlog/schema_fetcher.go internal/binlog/schema_fetcher_test.go internal/binlog/schema_fetcher_mysql_test.go && git commit -m "$(cat <<'EOF'
@@ -1049,7 +1050,7 @@ EOF
 
 ### 子任务 6.1: Scanner 骨架与构造
 
-- [ ] **Step 1: 写失败测试（构造与空扫描）**
+- [x] **Step 1: 写失败测试（构造与空扫描）**
 
 Create `internal/binlog/engine_test.go`:
 
@@ -1096,7 +1097,7 @@ func TestScanner_CloseIdempotent(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run:
 ```bash
@@ -1105,7 +1106,7 @@ cd D:/a-shan && go test ./internal/binlog/ -run TestScanner -v
 
 Expected: `undefined: NewScanner` 等。
 
-- [ ] **Step 3: 实现骨架**
+- [x] **Step 3: 实现骨架**
 
 Replace `internal/binlog/engine.go`:
 
@@ -1252,7 +1253,7 @@ var _ = errors.New
 
 注意 import 块里有 `io`，但 engine.go 里没直接用——`Next()` 返回 `io.EOF`。请在 import 块加上 `"io"`。
 
-- [ ] **Step 4: 在 Filter 上加 BinlogDir 字段**
+- [x] **Step 4: 在 Filter 上加 BinlogDir 字段**
 
 Edit `internal/binlog/transaction.go`，在 `Filter` struct 内追加：
 
@@ -1268,7 +1269,7 @@ type Filter struct {
 }
 ```
 
-- [ ] **Step 5: 跑测试**
+- [x] **Step 5: 跑测试**
 
 Run:
 ```bash
@@ -1277,7 +1278,7 @@ cd D:/a-shan && go test ./internal/binlog/ -run TestScanner -v
 
 Expected: 全部 PASS。`TestScanner_EmptyFilterReturnsEOF` 因为没给 BinlogDir 应返回错误（"Filter.BinlogDir is required"）。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 cd D:/a-shan && git add internal/binlog/ && git commit -m "$(cat <<'EOF'
@@ -1292,7 +1293,7 @@ EOF
 
 ### 子任务 6.2: 事件解析（单文件 happy path）
 
-- [ ] **Step 1: 生成小 fixture**
+- [x] **Step 1: 生成小 fixture**
 
 Generate fixture（手动；后续 Task 8 自动化）:
 
@@ -1381,7 +1382,7 @@ clean:
 	rm -f $(FIXTURE)
 ```
 
-- [ ] **Step 2: 写测试（解析出已知事务）**
+- [x] **Step 2: 写测试（解析出已知事务）**
 
 Append to `internal/binlog/engine_test.go`:
 
@@ -1453,7 +1454,7 @@ func copyFile(t *testing.T, src, dst string) {
 }
 ```
 
-- [ ] **Step 3: 跑测试确认失败**
+- [x] **Step 3: 跑测试确认失败**
 
 Run:
 ```bash
@@ -1462,7 +1463,7 @@ cd D:/a-shan && go test ./internal/binlog/ -run TestScanner_ParsesKnownFixture -
 
 Expected: 如果 fixture 不存在则 SKIP；否则 FAIL（"expected at least one DML transaction"），因为 `runParseLoop` 还是 TODO。
 
-- [ ] **Step 4: 实现 runParseLoop（最小版本，只解析事件不聚合）**
+- [x] **Step 4: 实现 runParseLoop（最小版本，只解析事件不聚合）**
 
 Replace the `runParseLoop` body in `internal/binlog/engine.go`:
 
@@ -1526,7 +1527,7 @@ func (s *scanner) parseFile(ctx context.Context, path string, f Filter) error {
 
 加入 import: `"os"`、`"io"`。
 
-- [ ] **Step 5: 跑测试（应该仍然失败但不再卡 TODO）**
+- [x] **Step 5: 跑测试（应该仍然失败但不再卡 TODO）**
 
 Run:
 ```bash
@@ -1535,7 +1536,7 @@ cd D:/a-shan && go test ./internal/binlog/ -run TestScanner_ParsesKnownFixture -
 
 Expected: 解析正常但没产出事务，FAIL "expected at least one DML transaction"。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 cd D:/a-shan && git add internal/binlog/ && git commit -m "$(cat <<'EOF'
@@ -1549,7 +1550,7 @@ EOF
 
 ### 子任务 6.3: 事件聚合到 Transaction
 
-- [ ] **Step 1: 写测试（聚合 DML 事务）**
+- [x] **Step 1: 写测试（聚合 DML 事务）**
 
 Replace the body of `TestScanner_ParsesKnownFixture` to assert specific transactions:
 
@@ -1612,7 +1613,7 @@ func filterDML(txs []*Transaction) []*Transaction {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run:
 ```bash
@@ -1621,7 +1622,7 @@ cd D:/a-shan && go test ./internal/binlog/ -run TestScanner_ParsesKnownFixture -
 
 Expected: FAIL "want 3 DML transactions; got []"。
 
-- [ ] **Step 3: 实现事件聚合**
+- [x] **Step 3: 实现事件聚合**
 
 Replace the body of `parseFile` (the `// Task 6.3` placeholder) and add helpers:
 
@@ -1861,7 +1862,7 @@ func (s *scanner) matchesFilter(tx *Transaction, f Filter) bool {
 
 加入 import: `"time"`、`"github.com/go-mysql-org/go-mysql/replication"`。
 
-- [ ] **Step 4: 跑测试**
+- [x] **Step 4: 跑测试**
 
 Run:
 ```bash
@@ -1874,7 +1875,7 @@ Expected: PASS（3 个 DML 事务：INSERT/UPDATE/DELETE）。
 - 但有时 autocommit 也走 QueryEvent 的 BEGIN/COMMIT 路径；调整 emit 调用点
 - 用 slog Debug 打印事件类型分布来调试
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd D:/a-shan && git add internal/binlog/ && git commit -m "$(cat <<'EOF'
@@ -1890,7 +1891,7 @@ EOF
 
 ### 子任务 6.4: 大事务截断与多行 RowsEvent 支持
 
-- [ ] **Step 1: 写测试（多行 INSERT）**
+- [x] **Step 1: 写测试（多行 INSERT）**
 
 Append to `internal/binlog/engine_test.go`:
 
@@ -1937,7 +1938,7 @@ func TestScanner_TruncatesLargeTransaction(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试**
+- [x] **Step 2: 跑测试**
 
 Run:
 ```bash
@@ -1949,7 +1950,7 @@ Expected: PASS（如果 6.3 的实现已正确处理多行 RowsEvent 和截断�
 - RowsEvent 处理：每个 row 在 e.Rows 里循环生成 RowChange，而不是只取 `[0]`
 - 截断检查应在 emit 前，按 `len(tx.Statements)` 比较
 
-- [ ] **Step 3: 修复多行 RowsEvent（如果上一步失败）**
+- [x] **Step 3: 修复多行 RowsEvent（如果上一步失败）**
 
 Modify `rowChangeFromEvent` 改为返回多行：
 
@@ -2032,7 +2033,7 @@ if f.MaxRowsPerTx > 0 && len(tx.Statements) > f.MaxRowsPerTx {
 }
 ```
 
-- [ ] **Step 4: 跑全部 binlog 测试**
+- [x] **Step 4: 跑全部 binlog 测试**
 
 Run:
 ```bash
@@ -2041,7 +2042,7 @@ cd D:/a-shan && go test ./internal/binlog/ -v
 
 Expected: 全部 PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd D:/a-shan && git add internal/binlog/ && git commit -m "$(cat <<'EOF'
@@ -2063,7 +2064,7 @@ EOF
 
 **Interfaces:** 无新接口
 
-- [ ] **Step 1: 跑覆盖率**
+- [x] **Step 1: 跑覆盖率**
 
 Run:
 ```bash
@@ -2073,7 +2074,7 @@ go tool cover -func=coverage.out
 
 记录低于 90% 的函数。
 
-- [ ] **Step 2: 补测试用例**
+- [x] **Step 2: 补测试用例**
 
 为覆盖率不足的分支添加测试。常见缺口：
 - `Next()` 在 errs channel 收到错误的路径
@@ -2084,7 +2085,7 @@ go tool cover -func=coverage.out
 
 每个分支加一个最小测试。**实际测试代码留待执行时根据具体分支写**——这一步是补缺，不能在 plan 阶段写死（实际未覆盖的分支要等运行才知）。
 
-- [ ] **Step 3: 验证覆盖率达标**
+- [x] **Step 3: 验证覆盖率达标**
 
 Run:
 ```bash
@@ -2094,7 +2095,7 @@ go tool cover -func=coverage.out | grep -v "90.0%\|100.0%" | grep -v "total"
 
 Expected: 无输出（所有函数 ≥ 90%）。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 cd D:/a-shan && git add internal/binlog/ && git commit -m "test(binlog): cover remaining branches to reach 90%+ package coverage"
@@ -2111,7 +2112,7 @@ cd D:/a-shan && git add internal/binlog/ && git commit -m "test(binlog): cover r
 - Consumes: `internal/binlog.Transaction`、`internal/binlog.RowChange`、`internal/binlog.TableSchema`
 - Produces: `reverse.Options`、`reverse.Statement`
 
-- [ ] **Step 1: 创建包骨架**
+- [x] **Step 1: 创建包骨架**
 
 Create `internal/reverse/doc.go`:
 
@@ -2150,7 +2151,7 @@ type Statement struct {
 const DefaultMaxStatementSize = 16 * 1024
 ```
 
-- [ ] **Step 2: 写测试**
+- [x] **Step 2: 写测试**
 
 Create `internal/reverse/types_test.go`:
 
@@ -2168,7 +2169,7 @@ func TestDefaultMaxStatementSize(t *testing.T) {
 }
 ```
 
-- [ ] **Step 3: 跑测试**
+- [x] **Step 3: 跑测试**
 
 Run:
 ```bash
@@ -2177,7 +2178,7 @@ cd D:/a-shan && go test ./internal/reverse/ -v
 
 Expected: PASS。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 cd D:/a-shan && git add internal/reverse/ && git commit -m "feat(reverse): package skeleton with Options and Statement types"
@@ -2194,7 +2195,7 @@ cd D:/a-shan && git add internal/reverse/ && git commit -m "feat(reverse): packa
 **Interfaces:**
 - Produces: `Generate(tx *binlog.Transaction, schema map[string]binlog.TableSchema, opts Options) ([]Statement, error)`
 
-- [ ] **Step 1: 写测试（DELETE → INSERT）**
+- [x] **Step 1: 写测试（DELETE → INSERT）**
 
 Create `internal/reverse/generator_test.go`:
 
@@ -2286,7 +2287,7 @@ func TestGenerate_UpdateSwap(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run:
 ```bash
@@ -2295,7 +2296,7 @@ cd D:/a-shan && go test ./internal/reverse/ -run TestGenerate -v
 
 Expected: `undefined: Generate`。
 
-- [ ] **Step 3: 实现 Generate**
+- [x] **Step 3: 实现 Generate**
 
 Create `internal/reverse/generator.go`:
 
@@ -2502,7 +2503,7 @@ func buildWhere(cols []string, values []interface{}) string {
 }
 ```
 
-- [ ] **Step 4: 跑测试**
+- [x] **Step 4: 跑测试**
 
 Run:
 ```bash
@@ -2511,7 +2512,7 @@ cd D:/a-shan && go test ./internal/reverse/ -v
 
 Expected: 全部 PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd D:/a-shan && git add internal/reverse/ && git commit -m "$(cat <<'EOF'
@@ -2534,7 +2535,7 @@ EOF
 
 **Interfaces:** 无变化
 
-- [ ] **Step 1: 写 DDL 测试**
+- [x] **Step 1: 写 DDL 测试**
 
 Append to `internal/reverse/generator_test.go`:
 
@@ -2625,7 +2626,7 @@ func TestFormatValue_Types(t *testing.T) {
 
 加入 `"strings"` import（如果 generator_test.go 没有）。
 
-- [ ] **Step 2: 跑测试**
+- [x] **Step 2: 跑测试**
 
 Run:
 ```bash
@@ -2634,7 +2635,7 @@ cd D:/a-shan && go test ./internal/reverse/ -v
 
 Expected: 全部 PASS。
 
-- [ ] **Step 3: 覆盖率检查**
+- [x] **Step 3: 覆盖率检查**
 
 Run:
 ```bash
@@ -2644,7 +2645,7 @@ go tool cover -func=coverage.out
 
 Expected: ≥ 95%。低于则补 edge case 测试（NULL 值、空 columns、空 before/after image）。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 cd D:/a-shan && git add internal/reverse/ && git commit -m "$(cat <<'EOF'
@@ -2667,7 +2668,7 @@ EOF
 **Interfaces:**
 - Produces: `executor.Plan`、`executor.Progress`、`executor.ExecError`、`executor.FinalReport`、`executor.ProgressCallback`、`executor.Checkpoint`、`executor.CheckpointStore`、`executor.InMemoryCheckpointStore`
 
-- [ ] **Step 1: 创建类型定义**
+- [x] **Step 1: 创建类型定义**
 
 Create `internal/executor/doc.go`:
 
@@ -2799,7 +2800,7 @@ func (s *InMemoryCheckpointStore) Clear(operationID string) error {
 }
 ```
 
-- [ ] **Step 2: 写测试**
+- [x] **Step 2: 写测试**
 
 Create `internal/executor/checkpoint_test.go`:
 
@@ -2845,7 +2846,7 @@ func TestInMemoryCheckpointStore_EmptyID(t *testing.T) {
 }
 ```
 
-- [ ] **Step 3: 跑测试**
+- [x] **Step 3: 跑测试**
 
 Run:
 ```bash
@@ -2854,7 +2855,7 @@ cd D:/a-shan && go test ./internal/executor/ -v
 
 Expected: PASS。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 cd D:/a-shan && git add internal/executor/ && git commit -m "feat(executor): types and in-memory CheckpointStore"
@@ -2872,7 +2873,7 @@ cd D:/a-shan && git add internal/executor/ && git commit -m "feat(executor): typ
 
 注意：executor 不直接依赖 connector 包；通过 `DBConn` 接口解耦。
 
-- [ ] **Step 1: 定义 DB 接口**
+- [x] **Step 1: 定义 DB 接口**
 
 Append to `internal/executor/types.go`:
 
@@ -2901,7 +2902,7 @@ type Tx interface {
 type DBConnFactory func(plan Plan) (DB, error)
 ```
 
-- [ ] **Step 2: 写测试（用 fake DB）**
+- [x] **Step 2: 写测试（用 fake DB）**
 
 Create `internal/executor/executor_test.go`:
 
@@ -3019,7 +3020,7 @@ func (t *fakeTx) Exec(query string, args ...interface{}) (Result, error) {
 
 并把 `TestExecutor_Run_HappyPath` 的最后一行改为 `assert.Len(t, db.executed, 2)`。
 
-- [ ] **Step 3: 跑测试确认失败**
+- [x] **Step 3: 跑测试确认失败**
 
 Run:
 ```bash
@@ -3028,7 +3029,7 @@ cd D:/a-shan && go test ./internal/executor/ -run TestExecutor_Run_HappyPath -v
 
 Expected: `undefined: NewExecutor`。
 
-- [ ] **Step 4: 实现 NewExecutor 与 Run**
+- [x] **Step 4: 实现 NewExecutor 与 Run**
 
 Create `internal/executor/executor.go`:
 
@@ -3199,7 +3200,7 @@ func lastSQL(plan Plan, idx int) string {
 
 注意 `e.runFromIndex` 的 ctx 取消目前只在外层循环检查；批次内的取消会在下一轮检查到。完整取消语义在 Task 13 加强（ctx.Done() 触发 Rollback）。
 
-- [ ] **Step 5: 跑测试**
+- [x] **Step 5: 跑测试**
 
 Run:
 ```bash
@@ -3208,7 +3209,7 @@ cd D:/a-shan && go test ./internal/executor/ -v
 
 Expected: PASS。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 cd D:/a-shan && git add internal/executor/ && git commit -m "$(cat <<'EOF'
@@ -3231,7 +3232,7 @@ EOF
 
 **Interfaces:** 无变化
 
-- [ ] **Step 1: 写取消测试**
+- [x] **Step 1: 写取消测试**
 
 Append to `internal/executor/executor_test.go`:
 
@@ -3298,7 +3299,7 @@ func TestExecutor_Run_InvalidPlan(t *testing.T) {
 
 加入 import: `"time"`。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run:
 ```bash
@@ -3307,7 +3308,7 @@ cd D:/a-shan && go test ./internal/executor/ -run "TestExecutor_Run_CancelRollsB
 
 Expected: Cancel 测试可能不稳定（取决于时序），但 CommitFailure 测试应 PASS（因为 Task 12 已实现 commit 失败路径）。
 
-- [ ] **Step 3: 增强取消语义**
+- [x] **Step 3: 增强取消语义**
 
 修改 `runFromIndex`（在 `internal/executor/executor.go`）：
 
@@ -3394,7 +3395,7 @@ func (e *executor) runFromIndex(ctx context.Context, plan Plan, startIdx int, cb
 }
 ```
 
-- [ ] **Step 4: 跑测试**
+- [x] **Step 4: 跑测试**
 
 Run:
 ```bash
@@ -3403,7 +3404,7 @@ cd D:/a-shan && go test ./internal/executor/ -v
 
 Expected: 全部 PASS。Cancel 测试可能需要调整 sleep 时序。
 
-- [ ] **Step 5: 覆盖率检查**
+- [x] **Step 5: 覆盖率检查**
 
 Run:
 ```bash
@@ -3413,7 +3414,7 @@ go tool cover -func=coverage.out
 
 补缺口（fakeDB 的 Close、Plan 校验各路径、callback nil 路径）。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 cd D:/a-shan && git add internal/executor/ && git commit -m "$(cat <<'EOF'
@@ -3439,7 +3440,7 @@ EOF
 - Consumes: go-mysql `client.Conn`、`client.Pool`
 - Produces: connector 实现 `binlog.SchemaFetcher` 与 `executor.DB`/`executor.DBConnFactory`
 
-- [ ] **Step 1: 检查现有 connector 接口**
+- [x] **Step 1: 检查现有 connector 接口**
 
 Run:
 ```bash
@@ -3448,7 +3449,7 @@ cd D:/a-shan && grep -n "type Connector" internal/connector/connector.go
 
 记录接口签名。
 
-- [ ] **Step 2: 改 connector.go 加 SchemaFetcher 方法**
+- [x] **Step 2: 改 connector.go 加 SchemaFetcher 方法**
 
 Edit `internal/connector/connector.go`，在 Connector 接口添加：
 
@@ -3461,7 +3462,7 @@ type Connector interface {
 
 加 import `"github.com/a-shan/mysql-pitr/internal/binlog"`。
 
-- [ ] **Step 3: 在 mysql.go 实现 FetchSchema**
+- [x] **Step 3: 在 mysql.go 实现 FetchSchema**
 
 参考现有 connector/mysql.go 的 `Connect`/`Query` 风格，添加：
 
@@ -3501,7 +3502,7 @@ func (c *mysqlConnector) FetchSchema(ctx context.Context, schema, table string) 
 
 把这个决策记到 commit message 里。
 
-- [ ] **Step 4: 跑现有 connector 测试**
+- [x] **Step 4: 跑现有 connector 测试**
 
 Run:
 ```bash
@@ -3510,7 +3511,7 @@ cd D:/a-shan && go test ./internal/connector/ -v
 
 Expected: 编译失败（接口加了新方法），所有 mysql_test.go、fk_test.go 失败。
 
-- [ ] **Step 5: 修复测试**
+- [x] **Step 5: 修复测试**
 
 Update test files：mock 实现 connector.Connector 接口的，加 FetchSchema 方法。比如在 `internal/connector/mysql_test.go` 加：
 
@@ -3526,7 +3527,7 @@ func (f *fakeConnector) FetchSchema(ctx context.Context, schema, table string) (
 
 如果项目里有共用的 mock，更新它。
 
-- [ ] **Step 6: 跑测试**
+- [x] **Step 6: 跑测试**
 
 Run:
 ```bash
@@ -3535,7 +3536,7 @@ cd D:/a-shan && go test ./internal/connector/ -v
 
 Expected: 全部 PASS。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 cd D:/a-shan && git add internal/connector/ && git commit -m "$(cat <<'EOF'
@@ -3565,7 +3566,7 @@ EOF
 **Interfaces:**
 - Consumes: `binlog.NewScanner`、`reverse.Generate`、`executor.NewExecutor`、`connector.NewMySQLConnector`
 
-- [ ] **Step 1: 看现有 flashback.go 的结构**
+- [x] **Step 1: 看现有 flashback.go 的结构**
 
 Run:
 ```bash
@@ -3574,7 +3575,7 @@ cd D:/a-shan && wc -l cmd/agent/flashback.go
 
 读 `cmd/agent/flashback.go` 全文。
 
-- [ ] **Step 2: 重写 RunFlashback 函数**
+- [x] **Step 2: 重写 RunFlashback 函数**
 
 替换 `cmd/agent/flashback.go` 的 RunFlashback 函数（保留 FlashbackOptions 类型与 flag 注册；只改实现）：
 
@@ -3749,7 +3750,7 @@ func splitTableRef(s string) (schema, table string, err error) {
 
 如果 Connector 接口缺方法，在 connector 包加上。
 
-- [ ] **Step 3: 加 ConnConnConfig 上的 DSN、Connector 上的 BinlogDirectory 与 AsExecutorDB**
+- [x] **Step 3: 加 ConnConnConfig 上的 DSN、Connector 上的 BinlogDirectory 与 AsExecutorDB**
 
 Edit `internal/connector/types.go`：
 
@@ -3815,7 +3816,7 @@ func (c *mysqlConnector) AsDB() executor.DB { return c }
 
 或更干净：让 Connector 接口暴露 `AsDB() executor.DB`。最终方案在实现时确定；本 plan 给的是 skeleton。
 
-- [ ] **Step 4: 改 flashback_test.go 适配新流程**
+- [x] **Step 4: 改 flashback_test.go 适配新流程**
 
 读现有 `cmd/agent/flashback_test.go`；把测试改成：
 - 用 fake connector + fake scanner 输入 → 验证生成的 SQL
@@ -3823,7 +3824,7 @@ func (c *mysqlConnector) AsDB() executor.DB { return c }
 
 如果某些现有测试已不适用（比如测 mysqlbinlog shell 调用），直接删除——这块代码已不存在。
 
-- [ ] **Step 5: 跑测试**
+- [x] **Step 5: 跑测试**
 
 Run:
 ```bash
@@ -3832,7 +3833,7 @@ cd D:/a-shan && go test ./cmd/agent/ -v
 
 Expected: 全部 PASS。失败的旧测试要么删除要么改写。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 cd D:/a-shan && git add cmd/agent/ internal/connector/ && git commit -m "$(cat <<'EOF'
@@ -3852,34 +3853,44 @@ EOF
 
 **Files:**
 - Delete: `internal/parser/`、`internal/rollback/`
+- Modify: `cmd/agent/serve.go`、`cmd/agent/serve_test.go` — ★ 计划修订（见 Step 1 说明）
 
-- [ ] **Step 1: 验证无引用**
+- [x] **Step 1: 定位全部引用（含 serve.go）**
+
+**计划修订说明**：Task 15 之后，`cmd/agent/serve.go` 仍无条件 import `internal/parser` 与 `internal/rollback`（`handlePITRParse` 用 `parser.ReverseSQLBatch`，`handlePITRExecute` 用 `rollback.NewExecutor`），文件内还有一块标注为 "Legacy mysqlbinlog parsing helpers" 的辅助函数区（`resolveDataDir`、`binlogPaths`、`binlogParseOpts`、`mysqlbinlogDateTime`、`parseBinlogWithMySQLBinlog`、`makeRowEvent`、`queryColumnNames`、`parseColumnValue`）。直接 `rm -rf internal/parser internal/rollback` 会导致 `go build ./...` 失败。本 task 必须在删除目录的同时处理 serve.go。
+
+先确认引用全貌：
 
 Run:
 ```bash
-cd D:/a-shan && grep -r "internal/parser" --include="*.go" | grep -v "_test.go" || echo "no non-test references"
-cd D:/a-shan && grep -r "internal/rollback" --include="*.go" | grep -v "_test.go" || echo "no non-test references"
+cd D:/a-shan && grep -rn "internal/parser\|internal/rollback" cmd/agent/ internal/ --include="*.go"
 ```
 
-Expected: "no non-test references" 两次。
+- [x] **Step 2: 处理 serve.go 对旧包的依赖**
 
-- [ ] **Step 2: 检查测试引用**
+有两个选择（选 A 为主，若 A 工作量过大才用 B）：
+- **A（推荐）**：删除 `handlePITRParse`、`handlePITRExecute` 及其路由注册，以及整个 "Legacy mysqlbinlog parsing helpers" 区块和 `mysqlbinlogParse` seam（如果还在）。即把 serve.go 的 PITR 相关处理全部移除——因为 serve.go 是 Phase 2 要整体重写的组件（agent daemon 将通过 ws/proto 协议驱动新引擎）。保留 serve 的其余能力（config 加密、WS 连接、注册等不依赖旧 parser 的部分）。同步删除 `serve_test.go` 中针对被删 handler/helpers 的测试。
+- **B（备选）**：如果 serve.go 的 WS 主循环与 PITR handler 耦合太深导致 A 工作量巨大，则把 `handlePITRParse`/`handlePITRExecute` 的注册改为显式禁用（handler 返回 501 Not Implemented），并删除 "Legacy mysqlbinlog parsing helpers" 区块（死代码），保证编译通过。Phase 2 重写 serve.go 时自然移除。
+
+无论 A/B：`cmd/agent/serve.go` 与 `serve_test.go` 中不得再 import `internal/parser`/`internal/rollback`。
+
+- [x] **Step 3: 检查测试引用**
 
 Run:
 ```bash
 cd D:/a-shan && grep -r "internal/parser\|internal/rollback" --include="*_test.go"
 ```
 
-如果有引用：这些测试对应的功能已被新包覆盖；删除引用文件（或改写）。常见：`cmd/agent/flashback_test.go` 里 `parser.Foo`、`rollback.Bar` 调用 → 在 Task 15 已改完。
+如果有残留引用：删除对应测试（功能已被新包覆盖）。
 
-- [ ] **Step 3: 删除目录**
+- [x] **Step 4: 删除目录**
 
 Run:
 ```bash
 cd D:/a-shan && rm -rf internal/parser internal/rollback
 ```
 
-- [ ] **Step 4: 跑全量测试**
+- [x] **Step 5: 跑全量测试**
 
 Run:
 ```bash
@@ -3888,16 +3899,17 @@ cd D:/a-shan && go build ./... && go test ./...
 
 Expected: 全部 PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
-cd D:/a-shan && git add -A internal/ && git commit -m "$(cat <<'EOF'
+cd D:/a-shan && git add -A cmd/ internal/ && git commit -m "$(cat <<'EOF'
 refactor(agent): remove internal/parser and internal/rollback
 
 These packages are fully superseded by internal/binlog (go-mysql backed
 scanner) and internal/reverse (pure-logic generator) + internal/executor
 (checkpointed batched runner). Removing ~70KB of self-rolled ROW-event
-parsing code.
+parsing code. serve.go's legacy PITR handlers and mysqlbinlog helpers are
+removed along with them; the daemon is rewritten in Phase 2.
 EOF
 )"
 ```
@@ -3913,7 +3925,7 @@ EOF
 
 每个场景独立测试，使用同一份 fixture binlog + 真 MySQL 容器（带 `//go:build integration` tag）。
 
-- [ ] **Step 1: 写测试骨架**
+- [x] **Step 1: 写测试骨架**
 
 Create `internal/binlog/e2e_test.go`:
 
@@ -4286,7 +4298,7 @@ func (a *sqlTxAdapter) Rollback() error { return a.tx.Rollback() }
 
 注意：上面是 skeleton；`multiValues` 和 `mysqlSchemaFetcher.FetchSchema` 应该是完整实现，不是 TODO。在执行 task 时补全。
 
-- [ ] **Step 2: 跑测试（应 SKIP）**
+- [x] **Step 2: 跑测试（应 SKIP）**
 
 Run:
 ```bash
@@ -4295,7 +4307,7 @@ cd D:/a-shan && go test -tags=integration ./internal/binlog/ -run TestE2E -v
 
 Expected: SKIP（因为 E2E_MYSQL_DSN 未设）。
 
-- [ ] **Step 3: 本地手动跑一次（用 docker 起 MySQL）**
+- [x] **Step 3: 本地手动跑一次（用 docker 起 MySQL）**
 
 Run:
 ```bash
@@ -4319,7 +4331,7 @@ docker stop e2emysql
 
 如果有失败，根据失败信息修正 scanner / executor / reverse 的 bug。
 
-- [ ] **Step 4: 跑全部测试**
+- [x] **Step 4: 跑全部测试**
 
 Run:
 ```bash
@@ -4328,7 +4340,7 @@ cd D:/a-shan && go test ./... -v
 
 Expected: 全部 PASS（integration tests SKIP）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd D:/a-shan && git add internal/binlog/e2e_test.go && git commit -m "$(cat <<'EOF'
@@ -4366,13 +4378,21 @@ EOF
 | 审计完整性 | Phase 2 范围（CLI 不涉及） |
 | 覆盖率 ≥ 90% | Task 7、Task 10、Task 13 step 5 |
 
+**执行结果（2026-08-10 验证，`worktree-pitr-v2-phase1` 分支，26 commits）**：
+
+- 全部 17 个 Task 实现完成；`go build ./... && go test ./...` 全绿（含 `cmd/agent`）。
+- 实际覆盖率：binlog **98.5%**、reverse **100%**、executor **100%**（计划要求 ≥90%，达标；connector 79.7% 属既有包，本次未强制）。
+- Task 16 采用方案 A：`6adf5e3` 删除 `internal/parser`、`internal/rollback`，同时移除 serve.go 的 legacy PITR handlers 与 mysqlbinlog helpers（净删 8493 行；`cmd/agent/serve.go` 由 ~598 行精简到 ~110 行）。
+- Task 17：`2538f04` 提交 8 个 `TestE2E` 场景（delete/update/insert/large-tx/mixed-ddl-dml/cross-binlog/cancel/gtid），build tag `integration`，本地 docker MySQL 8.0 验证。
+- e2e skeleton 的两个占位（`multiValues`、`MySQLSchemaFetcher.FetchSchema`）已填实际实现，无残留 TODO。
+
 **未在 Phase 1 实现（属后续 phase）**：
 - ws/proto 消息（Phase 2）
 - server pitr 状态机（Phase 2）
 - SQLite 检查点存储（Phase 2；Phase 1 用 InMemory）
 - 前端（Phase 3）
 
-**2. Placeholder scan:** 已检查，无 TBD/TODO 占位（除 `multiValues` 与 `mysqlSchemaFetcher.FetchSchema` 在 e2e skeleton 中标注需补全；执行 task 17 时填实际代码）。
+**2. Placeholder scan:** 无 TBD/TODO 占位。`multiValues` 与 `MySQLSchemaFetcher.FetchSchema` 已由 Task 17/14 填为实际实现。
 
 **3. Type consistency:**
 - `Transaction.TxID` 一致使用 `string`
@@ -4382,9 +4402,9 @@ EOF
 - `CheckpointStore.Load/Save/Clear` 三个 task 一致
 
 **4. 风险与未决**：
-- Task 6 中 `replication.BinlogParser.ParseFile` 的精确签名需要查 go-mysql v1.13.0 文档（执行时确认）
-- Task 15 中 `ConnConnConfig.DSN()` 等可能需要新增；执行时根据现有类型调整
-- Task 14 的"保留 go-sql-driver/mysql"决策需要在 Phase 4 更新 spec
+- Task 6 中 `replication.BinlogParser.ParseFile` 的精确签名 — **已解决**（执行时确认 `ParseFile(name, offset)` 可用，Scanner 直接复用）
+- Task 15 中 `ConnConnConfig.DSN()` 等 — **已解决**（按现有类型实现，flashback CLI 重接线成功）
+- Task 14 的"保留 go-sql-driver/mysql"决策需要在 Phase 4 更新 spec（遗留）
 
 ---
 
