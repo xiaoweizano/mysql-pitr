@@ -68,12 +68,14 @@ func Stream(ctx context.Context, cfg Config) (<-chan Result, <-chan error) {
 		}
 
 		s := binlog.NewScanner(cfg.SchemaFetcher, binlog.WithLogger(cfg.Logger))
+		// 两个 defer 都必须注册在任何 return 之前（vet lostcancel）。cancel 声明在
+		// s.Close 之后 → LIFO 先执行 cancel 再执行 s.Close：先停解析，再关 scanner。
+		defer s.Close()
+		defer cancel()
 		if err := s.Scan(ctx, f); err != nil {
 			errCh <- err
 			return
 		}
-		defer s.Close()
-		defer cancel() // 最后声明 → 最先执行：先停解析，再关 scanner
 
 		sent := 0 // 已发送结果数（不能看 len(out)：channel 有缓冲，消费者可能滞后）
 		for {
