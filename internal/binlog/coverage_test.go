@@ -195,6 +195,25 @@ func craftTestBinlog() []byte {
 	)
 }
 
+// craftMultiTxBinlog 生成 n 个独立事务（GTID + BEGIN + TableMap + WRITE + XID），
+// 用于填满 txs 缓冲、制造 emit 阻塞的 Close 中断/泄漏回归场景。
+func craftMultiTxBinlog(n int) []byte {
+	const ts = uint32(1750000000)
+	sid := []byte{0x3f, 0x9a, 0x5c, 0x8e, 0x12, 0x34, 0x56, 0x78,
+		0x90, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67}
+	evs := make([][]byte, 0, n*5)
+	for i := 0; i < n; i++ {
+		evs = append(evs,
+			craftEvent(ts, replication.GTID_EVENT, 1, craftGTID(sid, int64(1000+i))),
+			craftEvent(ts, replication.QUERY_EVENT, 1, craftQuery("shop", "BEGIN")),
+			craftEvent(ts, replication.TABLE_MAP_EVENT, 1, craftTableMap(1, "shop", "orders")),
+			craftEvent(ts, replication.WRITE_ROWS_EVENTv2, 1, craftWriteRows(1, []int64{int64(i)})),
+			craftEvent(ts, replication.XID_EVENT, 1, craftXID(uint64(1000+i))),
+		)
+	}
+	return craftBinlog(ts, evs...)
+}
+
 func writeBinlog(t *testing.T, data []byte) string {
 	t.Helper()
 	dir := t.TempDir()

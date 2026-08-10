@@ -5,8 +5,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
+	"time"
 
+	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -239,4 +243,124 @@ func copyFile(t *testing.T, src, dst string) {
 	defer out.Close()
 	_, err = io.Copy(out, in)
 	require.NoError(t, err)
+}
+
+// ---------- Task 3：SelectedTxIDs / EndPos.Pos / Close 中断 ----------
+
+// scanFilter 用给定 Filter 完整扫描一次并返回所有事务。
+// 注：coverage_test.go 已有 scanAll(t, sc Scanner)；这里 Filter 版本另命名避免重定义。
+func scanFilter(t *testing.T, f Filter) []*Transaction {
+	t.Helper()
+	s := NewScanner(nil, WithMaxRowsPerTx(0))
+	require.NoError(t, s.Scan(context.Background(), f))
+	return scanAll(t, s)
+}
+
+// TestScanner_FilterSelectedTxIDs 校验 Filter.SelectedTxIDs：只保留 TxID
+// 命中的事务（SELECTED_SQL 定向二次扫描的匹配基础）。
+// 注：brief 原稿直接用 BinlogDir:"testdata"，但 testdata 下唯一的
+// mysql-8.0-row-full.bin 不满足 isBinlogFile 命名（后缀 .bin 非全数字），
+// EnumerateBinlogFiles 会报 "no binlog files"；故拷贝到临时目录并命名为
+// mysql-bin.000001。
+func TestScanner_FilterSelectedTxIDs(t *testing.T) {
+	fixture := filepath.Join("testdata", "mysql-8.0-row-full.bin")
+	if _, err := os.Stat(fixture); err != nil {
+		t.Skipf("fixture %s not present; run `make -C testdata all` to generate", fixture)
+	}
+	dir := t.TempDir()
+	copyFile(t, fixture, filepath.Join(dir, "mysql-bin.000001"))
+
+	all := scanFilter(t, Filter{BinlogDir: dir})
+	require.NotEmpty(t, all)
+
+	want := all[0].TxID
+	got := scanFilter(t, Filter{BinlogDir: dir, SelectedTxIDs: []string{want}})
+	require.Len(t, got, 1)
+	require.Equal(t, want, got[0].TxID)
+}
+
+// firstXIDLogPos 返回文件中第一个 XID 事件的 LogPos（即第一个事务的结束位置）。
+func firstXIDLogPos(t *testing.T, path string) uint32 {
+	t.Helper()
+	src, err := OpenFileSource(context.Background(), path, 0, replication.NewBinlogParser())
+	require.NoError(t, err)
+	defer src.Close()
+	for {
+		ev, err := src.Next(context.Background())
+		if err == io.EOF {
+			t.Fatalf("no XID event found in %s", path)
+		}
+		require.NoError(t, err)
+		if ev.Header.EventType == replication.XID_EVENT {
+			return ev.Header.LogPos
+		}
+	}
+}
+
+// TestScanner_EndPosStopsMidFile 校验 EndPos.Pos 生效：仅当 EndPos.Name 非空且
+// 等于当前文件名时，解析到事件 LogPos > EndPos.Pos 即停止，不再继续。
+// 以第一个 XID 事件的 LogPos 为界：该事件（LogPos == Pos，含）产出第 1 个事务，
+// 其后的事件 LogPos > Pos 触发停止 → 返回的事务数比不设 EndPos 时少。
+func TestScanner_EndPosStopsMidFile(t *testing.T) {
+	fixture := filepath.Join("testdata", "mysql-8.0-row-full.bin")
+	if _, err := os.Stat(fixture); err != nil {
+		t.Skipf("fixture %s not present; run `make -C testdata all` to generate", fixture)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mysql-bin.000001")
+	copyFile(t, fixture, path)
+
+	all := scanFilter(t, Filter{BinlogDir: dir})
+	require.Len(t, all, 3, "fixture 语义：3 个 DML 事务（见 TestScanner_ParsesKnownFixture）")
+
+	pos := firstXIDLogPos(t, path)
+	require.Greater(t, pos, uint32(0))
+
+	got := scanFilter(t, Filter{BinlogDir: dir, EndPos: mysql.Position{Name: "mysql-bin.000001", Pos: pos}})
+	require.Less(t, len(got), len(all), "EndPos.Pos 必须截断后续事务")
+	require.Len(t, got, 1, "第一个 XID 的 LogPos 应恰好覆盖第 1 个事务")
+	require.Equal(t, all[0].TxID, got[0].TxID)
+}
+
+// TestScanner_CloseInterruptsMidScan 回归评审发现：Close() 从未关闭 s.done，
+// 消费者中途放弃时解析协程会永久阻塞在 emit 的 s.txs <-（缓冲满）并泄漏。
+// 64 个事务远超 txs 缓冲（16）：不消费时协程必然卡在 emit；Close 必须通过
+// 关闭 s.done 中断它，使其退出并关闭 channel。断言：不消费 + Close 后解析
+// 协程退出（goroutine 数回落），且 Next() 快速返回非 nil 错误（io.EOF 亦可），
+// 而非死锁。
+func TestScanner_CloseInterruptsMidScan(t *testing.T) {
+	dir := writeBinlog(t, craftMultiTxBinlog(64))
+	sc := NewScanner(StaticSchemaFetcher{})
+	before := runtime.NumGoroutine()
+	require.NoError(t, sc.Scan(context.Background(), Filter{BinlogDir: dir}))
+	require.NoError(t, sc.Close())
+
+	// 观察 1：Close 后不消费，runParseLoop 与 FileSource.run 两个协程必须退出。
+	deadline := time.Now().Add(5 * time.Second)
+	for runtime.NumGoroutine() > before {
+		if time.Now().After(deadline) {
+			t.Fatal("parse goroutines leaked after Close: s.done 未关闭，emit 阻塞未中断")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// 观察 2：Close 后 Next 必须快速返回非 nil 错误（缓冲中的事务可先被取走），
+	// 而非死锁。
+	doneCh := make(chan error, 1)
+	go func() {
+		var last error
+		for {
+			if _, err := sc.Next(); err != nil {
+				last = err
+				break
+			}
+		}
+		doneCh <- last
+	}()
+	select {
+	case err := <-doneCh:
+		require.Error(t, err, "Close 后流必须以非 nil 错误（io.EOF 亦可）结束")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Next() hung after Close")
+	}
 }

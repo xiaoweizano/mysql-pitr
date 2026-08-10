@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -121,7 +121,13 @@ func (s *scanner) Close() error {
 		return nil
 	}
 	s.closed = true
-	// parser 没有 Close；channel 由 runParseLoop 结束时关闭
+	// 中断解析协程：emit 的 select 观察到 done 关闭后立即返回，避免消费者中途
+	// 放弃（不再调用 Next）时解析协程永久阻塞在 s.txs <-（缓冲满）并泄漏。
+	// done 由 Scan 创建；未 Scan 过则为 nil（此时也不可能有解析协程）。
+	// closed 标志保证幂等：只有第一次 Close 会走到这里。
+	if s.done != nil {
+		close(s.done)
+	}
 	return nil
 }
 
@@ -138,117 +144,133 @@ func (s *scanner) runParseLoop(ctx context.Context, files []string, f Filter) {
 	}
 }
 
-// parseFile 打开单个 binlog 文件，读 magic 后用 BinlogParser 逐个解析事件，
+// parseFile 打开单个 binlog 文件（经 FileSource 后台解析），逐个消费事件，
 // 并在事务边界（XID / COMMIT / DDL）聚合出 Transaction 发到 s.txs。
 func (s *scanner) parseFile(ctx context.Context, path string, f Filter) error {
-	f2, err := os.Open(path)
+	// 起始偏移只对与 StartPos.Name 匹配的文件生效；其余文件（StartPos 之后的
+	// 后续文件）从头解析，避免把第一个文件的偏移误用到后续文件。
+	offset := int64(0)
+	if f.StartPos.Name != "" && filepath.Base(path) == f.StartPos.Name {
+		offset = int64(f.StartPos.Pos)
+	}
+	src, err := OpenFileSource(ctx, path, offset, s.parser)
 	if err != nil {
-		return fmt.Errorf("binlog: open %s: %w", path, err)
+		return err
 	}
-	defer f2.Close()
-
-	// 读 magic
-	magic := make([]byte, 4)
-	if _, err := io.ReadFull(f2, magic); err != nil {
-		return fmt.Errorf("binlog: read magic %s: %w", path, err)
-	}
-	if string(magic) != "\xfe\x62\x69\x6e" {
-		return fmt.Errorf("binlog: bad magic in %s", path)
-	}
+	defer src.Close()
 
 	// 当前未提交事务的累积状态
 	var pending *pendingTx
 	tableMaps := map[uint64]*replication.TableMapEvent{}
 
-	onEvent := func(ev *replication.BinlogEvent) error {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
+	for {
+		// FileSource 内部也处理取消，但取消后它可能以 io.EOF 收尾（errs 只收
+		// 非 context.Canceled 错误）；这里显式检查，保证取消必然以 ctx 错误
+		// 结束而不是被伪装成 EOF。
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		s.logger.Debug("event", "type", ev.Header.EventType, "pos", ev.Header.LogPos)
+		ev, err := src.Next(ctx)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("binlog: parse events in %s: %w", path, err)
+		}
+		// EndPos.Pos 只在 EndPos.Name 非空且等于当前文件名时生效：事件结束
+		// 位置（LogPos）超过 EndPos.Pos 即停止解析，不再继续。LogPos == Pos
+		// 的事件（恰好结束于边界）仍被处理。
+		if f.EndPos.Name != "" && filepath.Base(path) == f.EndPos.Name && ev.Header.LogPos > f.EndPos.Pos {
+			break
+		}
+		if err := s.handleEvent(ev, &pending, tableMaps, f); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-		switch e := ev.Event.(type) {
-		case *replication.FormatDescriptionEvent:
-			// 让 parser 自己处理
-		case *replication.RotateEvent:
-			// 文件切换；忽略
-		case *replication.TableMapEvent:
-			tableMaps[e.TableID] = e
-		case *replication.RowsEvent:
-			rcs, err := s.rowChangeFromEvent(e, ev.Header.EventType, tableMaps)
-			if err != nil {
-				s.logger.Warn("skip row event", "err", err)
-				return nil
-			}
-			if pending == nil {
-				pending = &pendingTx{}
-			}
-			pending.rows = append(pending.rows, rcs...)
+// handleEvent 处理单个 binlog 事件，按事务边界（XID / COMMIT / DDL）聚合出
+// Transaction 并 emit。取消由 parseFile 循环与 FileSource 处理，这里不需要
+// 再检查 ctx。
+func (s *scanner) handleEvent(ev *replication.BinlogEvent, pending **pendingTx, tableMaps map[uint64]*replication.TableMapEvent, f Filter) error {
+	s.logger.Debug("event", "type", ev.Header.EventType, "pos", ev.Header.LogPos)
 
-		case *replication.QueryEvent:
-			// QueryEvent 可能是事务边界（BEGIN / COMMIT）或 DDL
-			q := string(e.Query)
-			switch q {
-			case "BEGIN":
-				if pending == nil {
-					pending = &pendingTx{}
-				}
-				// 保留可能已记录的 GTID（GTIDEvent 在 BEGIN 之前到达）
-				pending.schema = string(e.Schema)
-			case "COMMIT":
-				if pending != nil {
-					pending.commitTs = eventTime(ev.Header)
-					if err := s.emit(pending, f); err != nil {
-						return err
-					}
-					pending = nil
-				}
-			default:
-				// DDL：忽略（reverse 会标 warning），如果之前有 pending 也 emit
-				if pending != nil {
-					if err := s.emit(pending, f); err != nil {
-						return err
-					}
-					pending = nil
-				}
+	switch e := ev.Event.(type) {
+	case *replication.FormatDescriptionEvent:
+		// 让 parser 自己处理
+	case *replication.RotateEvent:
+		// 文件切换；忽略
+	case *replication.TableMapEvent:
+		tableMaps[e.TableID] = e
+	case *replication.RowsEvent:
+		rcs, err := s.rowChangeFromEvent(e, ev.Header.EventType, tableMaps)
+		if err != nil {
+			s.logger.Warn("skip row event", "err", err)
+			return nil
+		}
+		if *pending == nil {
+			*pending = &pendingTx{}
+		}
+		(*pending).rows = append((*pending).rows, rcs...)
+
+	case *replication.QueryEvent:
+		// QueryEvent 可能是事务边界（BEGIN / COMMIT）或 DDL
+		q := string(e.Query)
+		switch q {
+		case "BEGIN":
+			if *pending == nil {
+				*pending = &pendingTx{}
 			}
-		case *replication.XIDEvent:
-			// XID = autocommit 提交点
-			if pending != nil {
-				pending.xid = e.XID
-				pending.commitTs = eventTime(ev.Header)
-				if err := s.emit(pending, f); err != nil {
+			// 保留可能已记录的 GTID（GTIDEvent 在 BEGIN 之前到达）
+			(*pending).schema = string(e.Schema)
+		case "COMMIT":
+			if *pending != nil {
+				(*pending).commitTs = eventTime(ev.Header)
+				if err := s.emit(*pending, f); err != nil {
 					return err
 				}
-				pending = nil
-			}
-		case *replication.GTIDEvent:
-			// GTID 事件出现在事务开头；记到 pending。
-			// Anonymous GTID（SID 全 0）不是真实 GTID，跳过。
-			if pending == nil {
-				pending = &pendingTx{}
-			}
-			if !isZeroSID(e.SID) {
-				gtid := formatGTID(e.SID, e.GNO)
-				if gs, err := mysql.ParseGTIDSet(mysql.MySQLFlavor, gtid); err == nil {
-					pending.gtidSet = gs
-					pending.gtid = gtid
-				}
-			}
-		case *replication.MariadbGTIDEvent:
-			// MariaDB；类似处理
-			if pending == nil {
-				pending = &pendingTx{}
+				*pending = nil
 			}
 		default:
-			// 其他事件忽略
+			// DDL：忽略（reverse 会标 warning），如果之前有 pending 也 emit
+			if *pending != nil {
+				if err := s.emit(*pending, f); err != nil {
+					return err
+				}
+				*pending = nil
+			}
 		}
-		return nil
-	}
-
-	if err := s.parser.ParseReader(f2, onEvent); err != nil {
-		return fmt.Errorf("binlog: parse events in %s: %w", path, err)
+	case *replication.XIDEvent:
+		// XID = autocommit 提交点
+		if *pending != nil {
+			(*pending).xid = e.XID
+			(*pending).commitTs = eventTime(ev.Header)
+			if err := s.emit(*pending, f); err != nil {
+				return err
+			}
+			*pending = nil
+		}
+	case *replication.GTIDEvent:
+		// GTID 事件出现在事务开头；记到 pending。
+		// Anonymous GTID（SID 全 0）不是真实 GTID，跳过。
+		if *pending == nil {
+			*pending = &pendingTx{}
+		}
+		if !isZeroSID(e.SID) {
+			gtid := formatGTID(e.SID, e.GNO)
+			if gs, err := mysql.ParseGTIDSet(mysql.MySQLFlavor, gtid); err == nil {
+				(*pending).gtidSet = gs
+				(*pending).gtid = gtid
+			}
+		}
+	case *replication.MariadbGTIDEvent:
+		// MariaDB；类似处理
+		if *pending == nil {
+			*pending = &pendingTx{}
+		}
+	default:
+		// 其他事件忽略
 	}
 	return nil
 }
@@ -292,6 +314,14 @@ func (s *scanner) emit(p *pendingTx, f Filter) error {
 		tx.MarkTruncated()
 	}
 
+	// 先尝试非阻塞投递：Close 之后消费者若仍在取数（缓冲区有空位），事务仍会
+	// 送达（与既有测试"Close 后取完剩余事务"的语义一致）；仅当缓冲区满（消费者
+	// 放弃）时才进入阻塞 select，由 done 中断，避免永久阻塞。
+	select {
+	case s.txs <- &tx:
+		return nil
+	default:
+	}
 	select {
 	case s.txs <- &tx:
 	case <-s.done: // closed by Close
@@ -361,6 +391,19 @@ func (s *scanner) matchesFilter(tx *Transaction, f Filter) bool {
 	}
 	if f.GTIDSet != nil && tx.GTID != "" {
 		if !MatchGTID(f.GTIDSet, tx.GTID) {
+			return false
+		}
+	}
+	// SelectedTxIDs：SELECTED_SQL 定向二次扫描，只保留 TxID 命中的事务
+	if len(f.SelectedTxIDs) > 0 {
+		found := false
+		for _, id := range f.SelectedTxIDs {
+			if id == tx.TxID {
+				found = true
+				break
+			}
+		}
+		if !found {
 			return false
 		}
 	}

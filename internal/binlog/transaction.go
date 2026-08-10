@@ -39,13 +39,14 @@ type Transaction struct {
 }
 
 type Filter struct {
-	BinlogDir    string // binlog 文件所在目录
-	Tables       []TableRef
-	TimeRange    *TimeRange
-	GTIDSet      mysql.GTIDSet
-	StartPos     mysql.Position
-	EndPos       mysql.Position
-	MaxRowsPerTx int
+	BinlogDir     string // binlog 文件所在目录
+	Tables        []TableRef
+	TimeRange     *TimeRange
+	GTIDSet       mysql.GTIDSet
+	StartPos      mysql.Position
+	EndPos        mysql.Position
+	MaxRowsPerTx  int
+	SelectedTxIDs []string // SELECTED_SQL 定向二次扫描：仅保留 TxID 命中的事务
 }
 
 // NewTransaction 构造一个 Transaction，自动生成规范 TxID。
