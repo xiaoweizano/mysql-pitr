@@ -81,8 +81,8 @@ func (s *scanner) Scan(ctx context.Context, f Filter) error {
 
 	s.parser = replication.NewBinlogParser()
 	s.parser.SetVerifyChecksum(true)
-	s.parser.SetParseTime(true)   // TIMESTAMP/DATETIME → time.Time
-	s.parser.SetUseDecimal(true)  // DECIMAL → decimal.Decimal
+	s.parser.SetParseTime(true)  // TIMESTAMP/DATETIME → time.Time
+	s.parser.SetUseDecimal(true) // DECIMAL → decimal.Decimal
 	s.txs = make(chan *Transaction, 16)
 	s.errs = make(chan error, 1)
 	s.done = make(chan struct{})
@@ -300,6 +300,13 @@ func (s *scanner) emit(p *pendingTx, f Filter) error {
 		return err
 	}
 	tx.Statements = p.rows
+	if tx.GTID == "" && tx.XID == 0 {
+		// 匿名事务（GTID 与 XID 双缺）：NewTransaction 的随机占位 TxID 使
+		// 同一文件两次扫描结果不同，SELECTED_SQL 两阶段定向二次扫描静默匹配
+		// 不到 → 替换为基于 commitTs + 行内容的确定性 TxID（final review
+		// Important #2）。
+		tx.TxID = anonymousTxID(tx.CommitTime, tx.Statements)
+	}
 
 	// 应用 Filter
 	if !s.matchesFilter(&tx, f) {

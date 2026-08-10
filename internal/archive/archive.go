@@ -75,6 +75,9 @@ func (w *Writer) Consume(ctx context.Context, src binlog.Source) error {
 			if err != nil {
 				return err
 			}
+			if err := validateRotateName(name); err != nil {
+				return err
+			}
 			next = name
 			if f != nil {
 				f.Close()
@@ -99,6 +102,30 @@ func (w *Writer) Consume(ctx context.Context, src binlog.Source) error {
 			return err
 		}
 	}
+}
+
+// validateRotateName 校验 ROTATE_EVENT 给出的下一个文件名可以安全地作为归档
+// 目录下的文件名。恶意/损坏事件携带的 "../evil"、"C:\evil"、空串等必须拒绝，
+// 否则 filepath.Join(w.dir, name+".partial") 会把文件写出归档目录（final
+// review Important #4）。MySQL 的 binlog 文件名恒为 "<前缀>.<全数字>"
+// （如 mysql-bin.000002），因此该模式可作为强校验。
+func validateRotateName(name string) error {
+	if name == "" {
+		return fmt.Errorf("archive: rotate next log name is empty")
+	}
+	if name != filepath.Base(name) || strings.ContainsAny(name, `/\`) {
+		return fmt.Errorf("archive: rotate next log name %q contains path separators (path traversal rejected)", name)
+	}
+	i := strings.LastIndex(name, ".")
+	if i <= 0 || i == len(name)-1 {
+		return fmt.Errorf("archive: rotate next log name %q does not match binlog naming (<prefix>.<digits>)", name)
+	}
+	for _, c := range name[i+1:] {
+		if c < '0' || c > '9' {
+			return fmt.Errorf("archive: rotate next log name %q does not match binlog naming (<prefix>.<digits>)", name)
+		}
+	}
+	return nil
 }
 
 // rotateNextLogName 从 ROTATE_EVENT 提取下一个文件名。

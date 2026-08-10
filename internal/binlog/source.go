@@ -31,7 +31,8 @@ type FileSource struct {
 }
 
 // OpenFileSource 打开文件、校验 magic，并从 offset 处开始后台解析。
-// offset <= 4 表示从文件头开始；offset > 4 时 FDE 会被重新解析（ParseFile 语义）。
+// offset <= 4 表示从文件头开始；offset > 4 时先从文件头重读 FDE
+// （与 go-mysql ParseFile 的语义一致），再跳到目标偏移开始解析。
 func OpenFileSource(ctx context.Context, path string, offset int64, parser *replication.BinlogParser) (*FileSource, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -48,6 +49,21 @@ func OpenFileSource(ctx context.Context, path string, offset int64, parser *repl
 	}
 	if offset < 4 {
 		offset = 4
+	}
+	if offset > 4 {
+		// 从文件中间开始（StartPos.Pos 等场景）必须先重读 FDE 初始化 parser
+		// 的 format 状态（校验和算法、事件头长度表）——否则 ParseReader 从中间
+		// 开始遇到 TableMap/Rows 事件时 p.format 为 nil，go-mysql 会 nil 解引用
+		// panic（StartPos.Pos 引擎级测试暴露）。重读的 FDE 不投递给调用方
+		// （no-op callback）；后续 ParseReader 会正常校验 CRC。
+		if _, err := f.Seek(4, io.SeekStart); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("binlog: seek %s to 4: %w", path, err)
+		}
+		if _, err := parser.ParseSingleEvent(f, func(*replication.BinlogEvent) error { return nil }); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("binlog: re-parse FDE %s: %w", path, err)
+		}
 	}
 	if _, err := f.Seek(offset, io.SeekStart); err != nil {
 		f.Close()

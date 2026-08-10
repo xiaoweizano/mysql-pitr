@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -98,6 +99,41 @@ func scanAll(t *testing.T, sc Scanner) []*Transaction {
 		require.NoError(t, err)
 		txs = append(txs, tx)
 	}
+}
+
+// ---------- 匿名事务确定性 TxID（final review Important #2） ----------
+
+// craftAnonTxBinlog 构造一个匿名事务（无 GTID 无 XID）的 binlog 文件：
+// TableMap + WRITE[7] + COMMIT（COMMIT QueryEvent 触发 emit，无 XID）。
+func craftAnonTxBinlog() []byte {
+	return craftedBinlog(
+		binlogtest.MustCraft(binlogtest.CraftTableMap("shop", "orders", 1)),
+		binlogtest.MustCraft(binlogtest.CraftWriteRowsValues(1, 7)),
+		binlogtest.MustCraft(binlogtest.CraftQuery("COMMIT")),
+	)
+}
+
+// TestScanner_AnonymousTxDeterministicTxID 回归 final review Important #2：
+// 无 GTID 无 XID 的匿名事务 TxID 必须是确定性哈希——同一文件两次扫描得到
+// 相同 TxID（SELECTED_SQL 两阶段定向二次扫描的匹配基础），而非随机占位。
+func TestScanner_AnonymousTxDeterministicTxID(t *testing.T) {
+	dir := writeBinlog(t, craftAnonTxBinlog())
+
+	first := scanFilter(t, Filter{BinlogDir: dir})
+	require.Len(t, first, 1)
+	tx := first[0]
+	require.Empty(t, tx.GTID)
+	require.Zero(t, tx.XID)
+	require.True(t, strings.HasPrefix(tx.TxID, "tx-"), "TxID = %q", tx.TxID)
+	require.Len(t, tx.TxID, 3+64, "TxID = %q，应为 tx- + 64 位 hex sha256", tx.TxID)
+
+	second := scanFilter(t, Filter{BinlogDir: dir})
+	require.Len(t, second, 1)
+	require.Equal(t, tx.TxID, second[0].TxID, "同一文件两次扫描匿名事务 TxID 必须一致")
+
+	hit := scanFilter(t, Filter{BinlogDir: dir, SelectedTxIDs: []string{tx.TxID}})
+	require.Len(t, hit, 1, "SELECTED_SQL 定向二次扫描必须命中")
+	require.Equal(t, tx.TxID, hit[0].TxID)
 }
 
 // ---------- 解析分支覆盖 ----------

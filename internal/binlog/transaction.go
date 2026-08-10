@@ -2,6 +2,8 @@ package binlog
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"time"
@@ -100,4 +102,67 @@ func randomID(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// anonymousTxID 为无 GTID 无 XID 的匿名事务生成确定性 TxID：
+// "tx-" + hex(sha256(commitTs 纳秒 + 行签名))。
+//
+// 同一 binlog 文件重复扫描结果一致（SELECTED_SQL 两阶段定向二次扫描的匹配
+// 基础）；NewTransaction 的随机占位 TxID 会在 emit 拿到行数据后被替换掉。
+// 注：commitTs 来自事件头（秒级精度），内容与时间戳完全相同的两个匿名事务
+// 会得到相同 TxID——这是匿名事务可用的最强判别信息，可接受（报告说明）。
+func anonymousTxID(commitTs time.Time, rows []RowChange) string {
+	h := sha256.New()
+	var ts [8]byte
+	binary.LittleEndian.PutUint64(ts[:], uint64(commitTs.UnixNano()))
+	h.Write(ts[:])
+	h.Write(rowSignature(rows))
+	return "tx-" + hex.EncodeToString(h.Sum(nil))
+}
+
+// maxSigRows 限制参与行签名的事务行数：大事务（万级行）只取前 maxSigRows 个
+// RowChange，控制哈希成本（每值最多写前 64 字节，见 appendImagePrefix）。
+// 签名只用于区分事务内容，截断不影响确定性。
+const maxSigRows = 256
+
+// rowSignature 累积行变更签名：schema.table + action 字节 + 每行镜像值前缀。
+func rowSignature(rows []RowChange) []byte {
+	buf := make([]byte, 0, 256)
+	n := len(rows)
+	if n > maxSigRows {
+		n = maxSigRows
+	}
+	for i := 0; i < n; i++ {
+		rc := rows[i]
+		buf = append(buf, rc.Schema...)
+		buf = append(buf, '.')
+		buf = append(buf, rc.Table...)
+		buf = append(buf, byte(rc.Action))
+		for _, v := range rc.Before {
+			buf = appendImagePrefix(buf, v)
+		}
+		for _, v := range rc.After {
+			buf = appendImagePrefix(buf, v)
+		}
+	}
+	return buf
+}
+
+// appendImagePrefix 追加镜像值的前 64 字节：[]byte/string 截断（BLOB/TEXT
+// 不整值入签名），其余标量（int/float/decimal/time 等）用确定性文本表示。
+func appendImagePrefix(buf []byte, v interface{}) []byte {
+	switch x := v.(type) {
+	case []byte:
+		if len(x) > 64 {
+			x = x[:64]
+		}
+		return append(buf, x...)
+	case string:
+		if len(x) > 64 {
+			x = x[:64]
+		}
+		return append(buf, x...)
+	default:
+		return fmt.Appendf(buf, "%v", x)
+	}
 }

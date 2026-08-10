@@ -322,6 +322,35 @@ func TestScanner_EndPosStopsMidFile(t *testing.T) {
 	require.Equal(t, all[0].TxID, got[0].TxID)
 }
 
+// TestScanner_StartPosStartsMidFile 校验 Filter.StartPos.Pos 生效：仅对与
+// StartPos.Name 匹配的文件生效，从该偏移开始解析。安全取值 = 第一个事务
+// 的 XID 事件 LogPos（即第一个事务的结束位置、下一个事件的起点）——从那里
+// 开始扫描会跳过第 1 个事务：事务数少于全扫、第一个事务不同。
+//
+// 此测试同时回归 OpenFileSource 的中间偏移解析：不重读 FDE 时 go-mysql 的
+// p.format 为 nil，遇到 TableMap/Rows 会 nil 解引用 panic（StartPos.Pos 此前
+// 无引擎级测试即因该缺陷）。
+func TestScanner_StartPosStartsMidFile(t *testing.T) {
+	fixture := filepath.Join("testdata", "mysql-8.0-row-full.bin")
+	if _, err := os.Stat(fixture); err != nil {
+		t.Skipf("fixture %s not present; run `make -C testdata all` to generate", fixture)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mysql-bin.000001")
+	copyFile(t, fixture, path)
+
+	all := scanFilter(t, Filter{BinlogDir: dir})
+	require.Len(t, all, 3, "fixture 语义：3 个 DML 事务（见 TestScanner_ParsesKnownFixture）")
+
+	pos := firstXIDLogPos(t, path)
+	require.Greater(t, pos, uint32(0))
+
+	got := scanFilter(t, Filter{BinlogDir: dir, StartPos: mysql.Position{Name: "mysql-bin.000001", Pos: pos}})
+	require.NotEmpty(t, got, "StartPos.Pos 定位必须仍能产出事务")
+	require.Less(t, len(got), len(all), "StartPos.Pos 必须跳过开头的事务")
+	require.NotEqual(t, all[0].TxID, got[0].TxID, "第一个事务应从第 2 个事务开始")
+}
+
 // TestScanner_CloseInterruptsMidScan 回归评审发现：Close() 从未关闭 s.done，
 // 消费者中途放弃时解析协程会永久阻塞在 emit 的 s.txs <-（缓冲满）并泄漏。
 // 64 个事务远超 txs 缓冲（16）：不消费时协程必然卡在 emit；Close 必须通过

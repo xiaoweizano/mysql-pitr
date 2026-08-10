@@ -13,9 +13,9 @@ import (
 type Mode int
 
 const (
-	ModeMetaOnly Mode = iota // 仅事务元数据（轻量）
-	ModeWithSQL              // 元数据 + 逆向 SQL（边扫边生成）
-	ModeSelectedSQL          // 定向二次扫描：Filter.SelectedTxIDs 命中才生成 SQL
+	ModeMetaOnly    Mode = iota // 仅事务元数据（轻量）
+	ModeWithSQL                 // 元数据 + 逆向 SQL（边扫边生成）
+	ModeSelectedSQL             // 定向二次扫描：Filter.SelectedTxIDs 命中才生成 SQL
 )
 
 type TxMeta struct {
@@ -49,6 +49,10 @@ func Stream(ctx context.Context, cfg Config) (<-chan Result, <-chan error) {
 	out := make(chan Result, 16)
 	errCh := make(chan error, 1)
 	go func() {
+		// 子 ctx：MaxPreview 早退 / 提前返回时必须 cancel，否则解析 goroutine
+		// 会继续扫完整个归档（大文件白耗 IO，final review Minor）。defer 保证
+		// 所有退出路径（MaxPreview、错误、EOF、父 ctx 取消）都取消。
+		ctx, cancel := context.WithCancel(ctx)
 		defer close(out)
 		defer close(errCh)
 		if cfg.MaxPreview <= 0 {
@@ -69,6 +73,7 @@ func Stream(ctx context.Context, cfg Config) (<-chan Result, <-chan error) {
 			return
 		}
 		defer s.Close()
+		defer cancel() // 最后声明 → 最先执行：先停解析，再关 scanner
 
 		sent := 0 // 已发送结果数（不能看 len(out)：channel 有缓冲，消费者可能滞后）
 		for {
