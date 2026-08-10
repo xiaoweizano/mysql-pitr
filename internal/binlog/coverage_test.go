@@ -1,16 +1,15 @@
 package binlog
 
-// 本文件补齐 Task 7 的覆盖率缺口。核心手段是手工构造 binlog 字节流
-// （craft* 系列 helper），让 Scanner 走完真实解析管线，从而覆盖单靠
-// testdata fixture 无法触达的分支：BEGIN/COMMIT/DDL 事件、XID 空 pending、
-// Anonymous GTID（全 0 SID）、MariaDB GTID、PARTIAL_UPDATE_ROWS_EVENT
-// 跳过路径、Filter 拒绝路径等。
+// 本文件补齐覆盖率缺口。核心手段是手工构造 binlog 字节流，让 Scanner
+// 走完真实解析管线，从而覆盖单靠 testdata fixture 无法触达的分支：
+// BEGIN/COMMIT/DDL 事件、XID 空 pending、Anonymous GTID（全 0 SID）、
+// MariaDB GTID、PARTIAL_UPDATE_ROWS_EVENT 跳过路径、Filter 拒绝路径等。
+//
+// 底层 craft* 构造 helpers 已迁至 internal/binlogtest（导出为 CraftXXX），
+// 供 binlog / archive / stream 等包测试共用；本文件只保留便捷包装。
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
-	"hash/crc32"
 	"io"
 	"log/slog"
 	"os"
@@ -18,148 +17,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/a-shan/mysql-pitr/internal/binlogtest"
 )
 
 // ---------- 手工构造 binlog 的 helpers ----------
 
-// craftEvent 构造一个完整 binlog 事件：19 字节 header + body + CRC32。
-// 校验和按 MySQL 规范覆盖 header+body（与 parser.SetVerifyChecksum(true) 一致）。
-func craftEvent(ts uint32, etype replication.EventType, serverID uint32, body []byte) []byte {
-	ev := make([]byte, replication.EventHeaderSize,
-		replication.EventHeaderSize+len(body)+replication.BinlogChecksumLength)
-	binary.LittleEndian.PutUint32(ev[0:], ts)
-	ev[4] = byte(etype)
-	binary.LittleEndian.PutUint32(ev[5:], serverID)
-	binary.LittleEndian.PutUint32(ev[9:], uint32(replication.EventHeaderSize+len(body)+replication.BinlogChecksumLength))
-	// LogPos 不参与 go-mysql 的校验，保持 0
-	binary.LittleEndian.PutUint16(ev[17:], 0)
-	ev = append(ev, body...)
-	crc := crc32.ChecksumIEEE(ev)
-	var cb [replication.BinlogChecksumLength]byte
-	binary.LittleEndian.PutUint32(cb[:], crc)
-	return append(ev, cb[:]...)
-}
-
-// craftFDE 构造 FormatDescriptionEvent 的 body（不含 CRC；由 craftEvent 追加）。
-// 事件类型 header 长度数组全部填 8 → go-mysql 用 6 字节 table id。
-func craftFDE(serverVersion string) []byte {
-	body := make([]byte, 0, 2+50+4+1+42+1)
-	body = binary.LittleEndian.AppendUint16(body, 4) // binlog version
-	sv := make([]byte, 50)
-	copy(sv, serverVersion)
-	body = append(body, sv...)
-	body = binary.LittleEndian.AppendUint32(body, 0) // create timestamp
-	body = append(body, replication.EventHeaderSize) // header length = 19
-	body = append(body, bytes.Repeat([]byte{8}, 42)...)
-	body = append(body, byte(replication.BINLOG_CHECKSUM_ALG_CRC32))
-	return body
-}
-
-func craftQuery(schema, query string) []byte {
-	body := make([]byte, 0, 13+len(schema)+1+len(query))
-	body = binary.LittleEndian.AppendUint32(body, 1) // thread id
-	body = binary.LittleEndian.AppendUint32(body, 0) // exec time
-	body = append(body, byte(len(schema)))
-	body = binary.LittleEndian.AppendUint16(body, 0) // error code
-	body = binary.LittleEndian.AppendUint16(body, 0) // status vars length
-	body = append(body, schema...)
-	body = append(body, 0) // 结尾 NUL
-	body = append(body, query...)
-	return body
-}
-
-func craftXID(xid uint64) []byte {
-	body := make([]byte, 8)
-	binary.LittleEndian.PutUint64(body, xid)
-	return body
-}
-
-func craftGTID(sid []byte, gno int64) []byte {
-	body := make([]byte, 0, 1+16+8)
-	body = append(body, 1) // commit flag
-	body = append(body, sid...)
-	body = binary.LittleEndian.AppendUint64(body, uint64(gno))
-	return body
-}
-
-func craftMariaDBGTID(seq uint64, domain uint32, flags byte) []byte {
-	body := make([]byte, 13)
-	binary.LittleEndian.PutUint64(body[0:], seq)
-	binary.LittleEndian.PutUint32(body[8:], domain)
-	body[12] = flags
-	return body
-}
-
-// craftTableMap 构造 1 列（LONGLONG）的表映射事件 body。
-func craftTableMap(tableID uint64, schema, table string) []byte {
-	body := make([]byte, 0, 32)
-	id := make([]byte, 8)
-	binary.LittleEndian.PutUint64(id, tableID)
-	body = append(body, id[:6]...)
-	body = binary.LittleEndian.AppendUint16(body, 0) // flags
-	body = append(body, byte(len(schema)))
-	body = append(body, schema...)
-	body = append(body, 0)
-	body = append(body, byte(len(table)))
-	body = append(body, table...)
-	body = append(body, 0)
-	body = append(body, 1) // column count (lenenc)
-	body = append(body, mysql.MYSQL_TYPE_LONGLONG)
-	body = append(body, 1, 0) // meta: lenenc 长度 1，值 0
-	body = append(body, 0)    // null bitmap
-	return body
-}
-
-// craftWriteRows 构造 WRITE/DELETE ROWS_EVENTv2 的 body（单列 LONGLONG 行）。
-func craftWriteRows(tableID uint64, values []int64) []byte {
-	body := make([]byte, 0, 6+2+2+2+len(values)*9)
-	id := make([]byte, 8)
-	binary.LittleEndian.PutUint64(id, tableID)
-	body = append(body, id[:6]...)
-	body = binary.LittleEndian.AppendUint16(body, 0) // flags
-	body = binary.LittleEndian.AppendUint16(body, 2) // extra data length（无）
-	body = append(body, 1)                           // column count
-	body = append(body, 0x01)                        // bitmap1：第 0 列存在
-	for _, v := range values {
-		body = append(body, 0x00) // null bitmap：第 0 列非 NULL
-		body = binary.LittleEndian.AppendUint64(body, uint64(v))
-	}
-	return body
-}
-
-// craftPartialUpdateRows 构造 PARTIAL_UPDATE_ROWS_EVENT 的 body。
-// before/after image 各 1 行；after image 前缀是 binlog_row_value_options（0 = 非 partial JSON）。
-func craftPartialUpdateRows(tableID uint64, before, after int64) []byte {
-	body := make([]byte, 0, 6+2+2+2+19)
-	id := make([]byte, 8)
-	binary.LittleEndian.PutUint64(id, tableID)
-	body = append(body, id[:6]...)
-	body = binary.LittleEndian.AppendUint16(body, 0) // flags
-	body = binary.LittleEndian.AppendUint16(body, 2) // extra data length（无）
-	body = append(body, 1)                           // column count
-	body = append(body, 0x01)                        // bitmap1
-	body = append(body, 0x01)                        // bitmap2
-	body = append(body, 0x00)                        // before: null bitmap
-	body = binary.LittleEndian.AppendUint64(body, uint64(before))
-	body = append(body, 0x00) // after: binlog_row_value_options = 0
-	body = append(body, 0x00) // after: null bitmap
-	body = binary.LittleEndian.AppendUint64(body, uint64(after))
-	return body
-}
-
-// craftBinlog 把 FDE + 事件序列组装成完整 binlog 文件字节。
-func craftBinlog(ts uint32, events ...[]byte) []byte {
-	out := make([]byte, 0)
-	out = append(out, replication.BinLogFileHeader...)
-	out = append(out, craftEvent(ts, replication.FORMAT_DESCRIPTION_EVENT, 1, craftFDE("8.0.36"))...)
-	for _, e := range events {
-		out = append(out, e...)
-	}
-	return out
+// craftedBinlog 把 FDE + 事件序列组装成完整 binlog 文件字节。
+func craftedBinlog(events ...binlogtest.Event) []byte {
+	fde := binlogtest.MustCraft(binlogtest.CraftFDE())
+	return binlogtest.CraftFile(append([]binlogtest.Event{fde}, events...))
 }
 
 // craftTestBinlog 生成覆盖核心解析分支的 binlog：
@@ -169,49 +39,45 @@ func craftBinlog(ts uint32, events ...[]byte) []byte {
 //	GTID(全0) GTID(uuid:11) BEGIN TableMap WRITE[4] DDL     → tx3（DDL flush，commitTs 回退 now）
 //	COMMIT(无 pending) MariaDBGTID BEGIN COMMIT XID(200)
 func craftTestBinlog() []byte {
-	const ts = uint32(1750000000)
-	sid := []byte{0x3f, 0x9a, 0x5c, 0x8e, 0x12, 0x34, 0x56, 0x78,
-		0x90, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67}
-	return craftBinlog(ts,
-		craftEvent(ts, replication.GTID_EVENT, 1, craftGTID(sid, 10)),
-		craftEvent(ts, replication.QUERY_EVENT, 1, craftQuery("shop", "BEGIN")),
-		craftEvent(ts, replication.TABLE_MAP_EVENT, 1, craftTableMap(1, "shop", "orders")),
-		craftEvent(ts, replication.WRITE_ROWS_EVENTv2, 1, craftWriteRows(1, []int64{1, 2})),
-		craftEvent(ts, replication.XID_EVENT, 1, craftXID(100)),
-		craftEvent(ts, replication.TABLE_MAP_EVENT, 1, craftTableMap(1, "shop", "orders")),
-		craftEvent(ts, replication.WRITE_ROWS_EVENTv2, 1, craftWriteRows(1, []int64{3})),
-		craftEvent(ts, replication.XID_EVENT, 1, craftXID(101)),
-		craftEvent(ts, replication.GTID_EVENT, 1, craftGTID(make([]byte, 16), 0)),
-		craftEvent(ts, replication.GTID_EVENT, 1, craftGTID(sid, 11)),
-		craftEvent(ts, replication.QUERY_EVENT, 1, craftQuery("shop", "BEGIN")),
-		craftEvent(ts, replication.TABLE_MAP_EVENT, 1, craftTableMap(1, "shop", "orders")),
-		craftEvent(ts, replication.WRITE_ROWS_EVENTv2, 1, craftWriteRows(1, []int64{4})),
-		craftEvent(ts, replication.QUERY_EVENT, 1, craftQuery("shop", "ALTER TABLE orders ADD COLUMN note VARCHAR(16)")),
-		craftEvent(ts, replication.QUERY_EVENT, 1, craftQuery("", "COMMIT")),
-		craftEvent(ts, replication.MARIADB_GTID_EVENT, 1, craftMariaDBGTID(1, 0, 0)),
-		craftEvent(ts, replication.QUERY_EVENT, 1, craftQuery("shop", "BEGIN")),
-		craftEvent(ts, replication.QUERY_EVENT, 1, craftQuery("", "COMMIT")),
-		craftEvent(ts, replication.XID_EVENT, 1, craftXID(200)),
+	const sid = "3f9a5c8e1234567890abcdef01234567"
+	return craftedBinlog(
+		binlogtest.MustCraft(binlogtest.CraftGTID(sid, 10)),
+		binlogtest.MustCraft(binlogtest.CraftQuery("BEGIN", "shop")),
+		binlogtest.MustCraft(binlogtest.CraftTableMap("shop", "orders", 1)),
+		binlogtest.MustCraft(binlogtest.CraftWriteRowsValues(1, 1, 2)),
+		binlogtest.MustCraft(binlogtest.CraftXID(100)),
+		binlogtest.MustCraft(binlogtest.CraftTableMap("shop", "orders", 1)),
+		binlogtest.MustCraft(binlogtest.CraftWriteRowsValues(1, 3)),
+		binlogtest.MustCraft(binlogtest.CraftXID(101)),
+		binlogtest.MustCraft(binlogtest.CraftGTID("", 0)),
+		binlogtest.MustCraft(binlogtest.CraftGTID(sid, 11)),
+		binlogtest.MustCraft(binlogtest.CraftQuery("BEGIN", "shop")),
+		binlogtest.MustCraft(binlogtest.CraftTableMap("shop", "orders", 1)),
+		binlogtest.MustCraft(binlogtest.CraftWriteRowsValues(1, 4)),
+		binlogtest.MustCraft(binlogtest.CraftQuery("ALTER TABLE orders ADD COLUMN note VARCHAR(16)", "shop")),
+		binlogtest.MustCraft(binlogtest.CraftQuery("COMMIT")),
+		binlogtest.MustCraft(binlogtest.CraftMariaDBGTID(1, 0, 0)),
+		binlogtest.MustCraft(binlogtest.CraftQuery("BEGIN", "shop")),
+		binlogtest.MustCraft(binlogtest.CraftQuery("COMMIT")),
+		binlogtest.MustCraft(binlogtest.CraftXID(200)),
 	)
 }
 
 // craftMultiTxBinlog 生成 n 个独立事务（GTID + BEGIN + TableMap + WRITE + XID），
 // 用于填满 txs 缓冲、制造 emit 阻塞的 Close 中断/泄漏回归场景。
 func craftMultiTxBinlog(n int) []byte {
-	const ts = uint32(1750000000)
-	sid := []byte{0x3f, 0x9a, 0x5c, 0x8e, 0x12, 0x34, 0x56, 0x78,
-		0x90, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67}
-	evs := make([][]byte, 0, n*5)
+	const sid = "3f9a5c8e1234567890abcdef01234567"
+	evs := make([]binlogtest.Event, 0, n*5)
 	for i := 0; i < n; i++ {
 		evs = append(evs,
-			craftEvent(ts, replication.GTID_EVENT, 1, craftGTID(sid, int64(1000+i))),
-			craftEvent(ts, replication.QUERY_EVENT, 1, craftQuery("shop", "BEGIN")),
-			craftEvent(ts, replication.TABLE_MAP_EVENT, 1, craftTableMap(1, "shop", "orders")),
-			craftEvent(ts, replication.WRITE_ROWS_EVENTv2, 1, craftWriteRows(1, []int64{int64(i)})),
-			craftEvent(ts, replication.XID_EVENT, 1, craftXID(uint64(1000+i))),
+			binlogtest.MustCraft(binlogtest.CraftGTID(sid, int64(1000+i))),
+			binlogtest.MustCraft(binlogtest.CraftQuery("BEGIN", "shop")),
+			binlogtest.MustCraft(binlogtest.CraftTableMap("shop", "orders", 1)),
+			binlogtest.MustCraft(binlogtest.CraftWriteRowsValues(1, int64(i))),
+			binlogtest.MustCraft(binlogtest.CraftXID(uint64(1000+i))),
 		)
 	}
-	return craftBinlog(ts, evs...)
+	return craftedBinlog(evs...)
 }
 
 func writeBinlog(t *testing.T, data []byte) string {
@@ -278,12 +144,11 @@ func TestScanner_CraftedEventSequence(t *testing.T) {
 // TestScanner_CraftedPartialUpdateSkips 覆盖 RowsEvent 转换失败的跳过路径
 // （PARTIAL_UPDATE_ROWS_EVENT 是 RowsEvent 但事件类型不受支持 → Warn + 跳过）。
 func TestScanner_CraftedPartialUpdateSkips(t *testing.T) {
-	const ts = uint32(1750000000)
-	data := craftBinlog(ts,
-		craftEvent(ts, replication.TABLE_MAP_EVENT, 1, craftTableMap(1, "shop", "orders")),
-		craftEvent(ts, replication.PARTIAL_UPDATE_ROWS_EVENT, 1, craftPartialUpdateRows(1, 1, 2)),
-		craftEvent(ts, replication.QUERY_EVENT, 1, craftQuery("shop", "BEGIN")),
-		craftEvent(ts, replication.QUERY_EVENT, 1, craftQuery("", "COMMIT")),
+	data := craftedBinlog(
+		binlogtest.MustCraft(binlogtest.CraftTableMap("shop", "orders", 1)),
+		binlogtest.MustCraft(binlogtest.CraftPartialUpdateRows(1, 1, 2)),
+		binlogtest.MustCraft(binlogtest.CraftQuery("BEGIN", "shop")),
+		binlogtest.MustCraft(binlogtest.CraftQuery("COMMIT")),
 	)
 	dir := writeBinlog(t, data)
 	sc := NewScanner(StaticSchemaFetcher{})
