@@ -746,6 +746,18 @@ var fixtureSchema = binlog.StaticSchemaFetcher{
     },
 }
 
+// fixtureDir 把 testdata 的 fixture 拷贝到临时目录并重命名为 mysql-bin.000001。
+// 必须重命名：EnumerateBinlogFiles 只认数字后缀（isBinlogFile 规则），
+// 而提交的 fixture 文件名为 mysql-8.0-row-full.bin。
+func fixtureDir(t *testing.T) string {
+    t.Helper()
+    src, err := os.ReadFile(filepath.Join("..", "binlog", "testdata", "mysql-8.0-row-full.bin"))
+    require.NoError(t, err)
+    dir := t.TempDir()
+    require.NoError(t, os.WriteFile(filepath.Join(dir, "mysql-bin.000001"), src, 0o644))
+    return dir
+}
+
 func collect(t *testing.T, cfg scan.Config) ([]scan.Result, error) {
     t.Helper()
     ctx := context.Background()
@@ -759,7 +771,7 @@ func collect(t *testing.T, cfg scan.Config) ([]scan.Result, error) {
 
 func TestStream_ModeMetaOnly(t *testing.T) {
     out, err := collect(t, scan.Config{
-        ArchiveDir: "../binlog/testdata",
+        ArchiveDir: fixtureDir(t),
         Filter:     binlog.Filter{},
         Mode:       scan.ModeMetaOnly,
         SchemaFetcher: fixtureSchema,
@@ -775,7 +787,7 @@ func TestStream_ModeMetaOnly(t *testing.T) {
 
 func TestStream_ModeWithSQL_ProducesReverseStatements(t *testing.T) {
     out, err := collect(t, scan.Config{
-        ArchiveDir: "../binlog/testdata",
+        ArchiveDir: fixtureDir(t),
         Filter:     binlog.Filter{},
         Mode:       scan.ModeWithSQL,
         SchemaFetcher: fixtureSchema,
@@ -796,7 +808,7 @@ func TestStream_ModeWithSQL_ProducesReverseStatements(t *testing.T) {
 
 func TestStream_ModeSelectedSQL_OnlySelected(t *testing.T) {
     all, err := collect(t, scan.Config{
-        ArchiveDir: "../binlog/testdata",
+        ArchiveDir: fixtureDir(t),
         Filter:     binlog.Filter{},
         Mode:       scan.ModeMetaOnly,
         SchemaFetcher: fixtureSchema,
@@ -806,7 +818,7 @@ func TestStream_ModeSelectedSQL_OnlySelected(t *testing.T) {
 
     sel := all[0].Meta.TxID
     out, err := collect(t, scan.Config{
-        ArchiveDir: "../binlog/testdata",
+        ArchiveDir: fixtureDir(t),
         Filter:     binlog.Filter{SelectedTxIDs: []string{sel}},
         Mode:       scan.ModeSelectedSQL,
         SchemaFetcher: fixtureSchema,
@@ -819,7 +831,7 @@ func TestStream_ModeSelectedSQL_OnlySelected(t *testing.T) {
 
 func TestStream_MaxPreviewCap(t *testing.T) {
     out, err := collect(t, scan.Config{
-        ArchiveDir: "../binlog/testdata",
+        ArchiveDir: fixtureDir(t),
         Filter:     binlog.Filter{},
         Mode:       scan.ModeMetaOnly,
         SchemaFetcher: fixtureSchema,
@@ -1530,7 +1542,7 @@ import (
 // 此处断言 WITH_SQL 模式产出的逆向 SQL 精确覆盖三种操作类型。
 func TestGolden_SetupSQLReverseStatements(t *testing.T) {
     out, err := collect(t, scan.Config{
-        ArchiveDir: "../binlog/testdata",
+        ArchiveDir: fixtureDir(t),
         Filter:     binlog.Filter{Tables: []binlog.TableRef{{Schema: "shop", Table: "orders"}}},
         Mode:       scan.ModeWithSQL,
         SchemaFetcher: fixtureSchema,
