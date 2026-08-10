@@ -51,7 +51,8 @@ func TestWriter_ConsumeRoundTrip(t *testing.T) {
 		binlogtest.MustCraft(binlogtest.CraftXID(100)),
 	}
 	src := &sliceSource{evs: evs}
-	require.NoError(t, w.Consume(context.Background(), src))
+	_, err := w.Consume(context.Background(), src)
+	require.NoError(t, err)
 	require.NoError(t, w.Seal("mysql-bin.000001.partial"))
 
 	// 还原出的文件字节 == craft 拼接
@@ -65,7 +66,8 @@ func TestWriter_SealCorruptedFails(t *testing.T) {
 	dir := t.TempDir()
 	w := archive.NewWriter(dir)
 	evs := []binlogtest.Event{binlogtest.MustCraft(binlogtest.CraftFDE()), binlogtest.MustCraft(binlogtest.CraftXID(1))}
-	require.NoError(t, w.Consume(context.Background(), &sliceSource{evs: evs}))
+	_, err := w.Consume(context.Background(), &sliceSource{evs: evs})
+	require.NoError(t, err)
 	// 篡改一个字节破坏校验和
 	p := filepath.Join(dir, "mysql-bin.000001.partial")
 	b, _ := os.ReadFile(p)
@@ -90,14 +92,27 @@ func TestWriter_ConsumeRotateStartsNewFile(t *testing.T) {
 	dir := t.TempDir()
 	w := archive.NewWriter(dir)
 
-	evs := []binlogtest.Event{
+	// 段 1：无公告轮转，首个文件用默认名 mysql-bin.000001；真实轮转结束段
+	seg1 := []binlogtest.Event{
 		binlogtest.MustCraft(binlogtest.CraftFDE()),
 		binlogtest.MustCraft(binlogtest.CraftXID(1)),
 		binlogtest.MustCraft(binlogtest.CraftRotate("mysql-bin.000002")),
-		binlogtest.MustCraft(binlogtest.CraftXID(2)),
 	}
-	require.NoError(t, w.Consume(context.Background(), &sliceSource{evs: evs}))
+	next, err := w.Consume(context.Background(), &sliceSource{evs: seg1})
+	require.NoError(t, err)
+	require.Equal(t, "mysql-bin.000002", next, "真实轮转必须返回下一个文件名并结束本段")
 	require.NoError(t, w.Seal("mysql-bin.000001.partial"))
+
+	// 段 2：起始公告轮转命名文件（fake rotate，不结束段），随后真实轮转结束
+	seg2 := []binlogtest.Event{
+		binlogtest.MustCraft(binlogtest.CraftRotate("mysql-bin.000002")),
+		binlogtest.MustCraft(binlogtest.CraftFDE()),
+		binlogtest.MustCraft(binlogtest.CraftXID(2)),
+		binlogtest.MustCraft(binlogtest.CraftRotate("mysql-bin.000003")),
+	}
+	next, err = w.Consume(context.Background(), &sliceSource{evs: seg2})
+	require.NoError(t, err)
+	require.Equal(t, "mysql-bin.000003", next)
 	require.NoError(t, w.Seal("mysql-bin.000002.partial"))
 
 	for _, name := range []string{"mysql-bin.000001", "mysql-bin.000002"} {
@@ -120,7 +135,7 @@ func TestWriter_ConsumeRejectsPathTraversalName(t *testing.T) {
 		binlogtest.MustCraft(binlogtest.CraftRotate("../evil")),
 		binlogtest.MustCraft(binlogtest.CraftXID(1)),
 	}
-	err := w.Consume(context.Background(), &sliceSource{evs: evs})
+	_, err := w.Consume(context.Background(), &sliceSource{evs: evs})
 	require.Error(t, err, "路径穿越名必须被拒绝")
 	assert.Contains(t, err.Error(), "rotate next log name")
 
@@ -144,12 +159,14 @@ func TestWriter_ConsumeAppend_AppendsToSealed(t *testing.T) {
 	w := archive.NewWriter(dir)
 	// 先造一个"已回填"的封口文件：全量重建一份 FDE+XID
 	evs := []binlogtest.Event{binlogtest.MustCraft(binlogtest.CraftFDE()), binlogtest.MustCraft(binlogtest.CraftXID(1))}
-	require.NoError(t, w.Consume(context.Background(), &sliceSource{evs: evs}))
+	_, err := w.Consume(context.Background(), &sliceSource{evs: evs})
+	require.NoError(t, err)
 	require.NoError(t, w.Seal("mysql-bin.000001.partial"))
 
 	// append 续写：XID(2) 尾部
 	tail := []binlogtest.Event{binlogtest.MustCraft(binlogtest.CraftXID(2))}
-	require.NoError(t, w.ConsumeAppend(context.Background(), &sliceSource{evs: tail}, "mysql-bin.000001"))
+	_, err = w.ConsumeAppend(context.Background(), &sliceSource{evs: tail}, "mysql-bin.000001")
+	require.NoError(t, err)
 	require.NoError(t, w.Seal("mysql-bin.000001.partial"))
 
 	// 最终文件 = 原封口内容 + 尾部（无重复 magic）
@@ -164,10 +181,12 @@ func TestWriter_SealFullReconstructionOverExistingRefuses(t *testing.T) {
 	dir := t.TempDir()
 	w := archive.NewWriter(dir)
 	evs := []binlogtest.Event{binlogtest.MustCraft(binlogtest.CraftFDE()), binlogtest.MustCraft(binlogtest.CraftXID(1))}
-	require.NoError(t, w.Consume(context.Background(), &sliceSource{evs: evs}))
+	_, err := w.Consume(context.Background(), &sliceSource{evs: evs})
+	require.NoError(t, err)
 	require.NoError(t, w.Seal("mysql-bin.000001.partial"))
 	// 再次全量重建同名文件 → Seal 必须拒绝（防覆盖）
-	require.NoError(t, w.Consume(context.Background(), &sliceSource{evs: evs}))
+	_, err = w.Consume(context.Background(), &sliceSource{evs: evs})
+	require.NoError(t, err)
 	require.Error(t, w.Seal("mysql-bin.000001.partial"))
 }
 
@@ -181,12 +200,14 @@ func TestWriter_ConsumeAppendVerifyTailCorruption(t *testing.T) {
 	dir := t.TempDir()
 	w := archive.NewWriter(dir)
 	evs := []binlogtest.Event{binlogtest.MustCraft(binlogtest.CraftFDE()), binlogtest.MustCraft(binlogtest.CraftXID(1))}
-	require.NoError(t, w.Consume(context.Background(), &sliceSource{evs: evs}))
+	_, err := w.Consume(context.Background(), &sliceSource{evs: evs})
+	require.NoError(t, err)
 	require.NoError(t, w.Seal("mysql-bin.000001.partial"))
 
 	// append 尾部后篡改 EventSize：XID 事件头 [9:13] 是 event size
 	tail := []binlogtest.Event{binlogtest.MustCraft(binlogtest.CraftXID(2))}
-	require.NoError(t, w.ConsumeAppend(context.Background(), &sliceSource{evs: tail}, "mysql-bin.000001"))
+	_, err = w.ConsumeAppend(context.Background(), &sliceSource{evs: tail}, "mysql-bin.000001")
+	require.NoError(t, err)
 	p := filepath.Join(dir, "mysql-bin.000001.partial")
 	b, err := os.ReadFile(p)
 	require.NoError(t, err)
@@ -213,8 +234,61 @@ func TestWriter_ConsumeRejectsRotateNonBinlogName(t *testing.T) {
 			binlogtest.MustCraft(binlogtest.CraftRotate(name)),
 			binlogtest.MustCraft(binlogtest.CraftXID(1)),
 		}
-		err := w.Consume(context.Background(), &sliceSource{evs: evs})
+		_, err := w.Consume(context.Background(), &sliceSource{evs: evs})
 		require.Error(t, err, "rotate name %q 必须被拒绝", name)
 		assert.Contains(t, err.Error(), "rotate next log name")
 	}
+}
+
+// TestWriter_SealAppendVerified_AppendsToSealed 验证 CRC 强化的 append 封口
+// 正常路径：最终文件 + 尾部组合验证通过后追加，结果与 Seal 的 append 分支一致。
+func TestWriter_SealAppendVerified_AppendsToSealed(t *testing.T) {
+	dir := t.TempDir()
+	w := archive.NewWriter(dir)
+	evs := []binlogtest.Event{binlogtest.MustCraft(binlogtest.CraftFDE()), binlogtest.MustCraft(binlogtest.CraftXID(1))}
+	_, err := w.Consume(context.Background(), &sliceSource{evs: evs})
+	require.NoError(t, err)
+	require.NoError(t, w.Seal("mysql-bin.000001.partial"))
+
+	tail := []binlogtest.Event{binlogtest.MustCraft(binlogtest.CraftXID(2))}
+	_, err = w.ConsumeAppend(context.Background(), &sliceSource{evs: tail}, "mysql-bin.000001")
+	require.NoError(t, err)
+	require.NoError(t, w.SealAppendVerified("mysql-bin.000001.partial"))
+
+	got, _ := os.ReadFile(filepath.Join(dir, "mysql-bin.000001"))
+	want := append(append([]byte{}, binlogtest.CraftFile(evs)...), tail[0].Raw...)
+	require.Equal(t, want, got)
+}
+
+// TestWriter_SealAppendVerified_RejectsTamperedFinal 验证组合验证启用 CRC：
+// 篡改最终文件内一个事件字节（XID body）→ 组合验证失败 → 不追加、partial 保留。
+// 这是 Seal 的 append 分支（magic+tail 无 FDE，CRC 被 go-mysql 跳过）捕获不到的
+// 场景，T4 评审 carry-in 要求归档循环的 append 封口必须使用本方法。
+func TestWriter_SealAppendVerified_RejectsTamperedFinal(t *testing.T) {
+	dir := t.TempDir()
+	w := archive.NewWriter(dir)
+	evs := []binlogtest.Event{binlogtest.MustCraft(binlogtest.CraftFDE()), binlogtest.MustCraft(binlogtest.CraftXID(1))}
+	_, err := w.Consume(context.Background(), &sliceSource{evs: evs})
+	require.NoError(t, err)
+	require.NoError(t, w.Seal("mysql-bin.000001.partial"))
+
+	// 篡改最终文件 XID(1) 的事件体一个字节（CRC 之前的 body 区）
+	finalPath := filepath.Join(dir, "mysql-bin.000001")
+	b, err := os.ReadFile(finalPath)
+	require.NoError(t, err)
+	b[len(b)-5] ^= 0x01 // XID body 末字节（末 4 字节是 CRC）
+	require.NoError(t, os.WriteFile(finalPath, b, 0o644))
+
+	// append 尾部后组合验证必须失败
+	tail := []binlogtest.Event{binlogtest.MustCraft(binlogtest.CraftXID(2))}
+	_, err = w.ConsumeAppend(context.Background(), &sliceSource{evs: tail}, "mysql-bin.000001")
+	require.NoError(t, err)
+	require.Error(t, w.SealAppendVerified("mysql-bin.000001.partial"))
+
+	// 不追加：最终文件保持篡改后原样（无 XID(2) 尾部），partial 仍在
+	got, err := os.ReadFile(finalPath)
+	require.NoError(t, err)
+	require.Equal(t, b, got)
+	_, err = os.Stat(filepath.Join(dir, "mysql-bin.000001.partial"))
+	require.NoError(t, err, "验证失败后 partial 必须保留，供调用方回退/重试")
 }

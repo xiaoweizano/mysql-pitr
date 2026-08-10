@@ -51,26 +51,44 @@ func NewWriter(dir string) *Writer { return &Writer{dir: dir} }
 // 首个事件前写 magic，默认文件名 mysql-bin.000001；收到 ROTATE_EVENT 时
 // 关闭当前文件，并取 RotateEvent.NextLogName 作为下一个文件名（等下一个
 // 事件到达才开新文件、写 magic）。
-func (w *Writer) Consume(ctx context.Context, src binlog.Source) error {
+//
+// 返回值是段边界信息：遇到**真实轮转**（流起始的公告轮转除外，见下）时
+// 返回该轮转的目标文件名（rotate 的 NextLogName）与 nil 错误——调用方应
+// Seal 本段写出的 .partial（段起始文件），并把状态推进到返回的文件名；
+// 流正常结束（io.EOF）但未发生轮转时返回 ("", nil)。
+//
+// 流起始的公告轮转（StartSync 时 master 重发的 fake ROTATE_EVENT，目标名
+// 即本段要写的文件）不会结束本段：它在任何内容事件之前出现，仅用于给
+// 全量重建模式命名目标文件。
+func (w *Writer) Consume(ctx context.Context, src binlog.Source) (string, error) {
 	return w.consume(ctx, src, "", true)
 }
 
 // ConsumeAppend 把事件流续写到指定文件名的 .partial（append 续写模式）。
 //
 // 与 Consume 的区别：不写 magic（.partial 只含续写尾部的事件字节，Seal 时
-// 追加到已封口文件末尾）；文件名由 fileName 参数给定而非 rotate 事件决定；
-// 收到 ROTATE_EVENT 时只关闭当前文件，不切换新文件。
-func (w *Writer) ConsumeAppend(ctx context.Context, src binlog.Source, fileName string) error {
+// 追加到已封口文件末尾）；文件名由 fileName 参数给定而非 rotate 事件决定。
+//
+// 返回值与 Consume 相同：真实轮转 → (目标文件名, nil)；EOF 无轮转 → ("", nil)。
+func (w *Writer) ConsumeAppend(ctx context.Context, src binlog.Source, fileName string) (string, error) {
 	return w.consume(ctx, src, fileName, false)
 }
 
 // consume 是 Consume / ConsumeAppend 的共用实现。
 // writeMagic=true（全量重建）：首个事件前写 magic，ROTATE_EVENT 更新下一个
 // 文件名，事件流从头开始；writeMagic=false（append 续写）：fileName 固定目标
-// 文件名（首事件前不写 magic），ROTATE_EVENT 只关闭当前文件。
-func (w *Writer) consume(ctx context.Context, src binlog.Source, fileName string, writeMagic bool) error {
+// 文件名（首事件前不写 magic）。
+//
+// ROTATE_EVENT 语义（两种）：
+//   - started==false（本段尚未写任何内容）：流起始公告（fake rotate）——
+//     全量重建模式用它命名目标文件（next=name），append 模式忽略，均继续。
+//   - started==true：真实轮转——关闭当前文件，段结束，返回目标文件名。
+//
+// io.EOF 返回 ("", nil)（段未完成，调用方决定丢弃或封口）。
+func (w *Writer) consume(ctx context.Context, src binlog.Source, fileName string, writeMagic bool) (string, error) {
 	var f *os.File
 	next := fileName // 下一个文件名；全量重建模式初始为空 = 默认名
+	started := false // 本段是否已写出任何内容
 	defer func() {
 		if f != nil {
 			f.Close()
@@ -81,9 +99,9 @@ func (w *Writer) consume(ctx context.Context, src binlog.Source, fileName string
 		ev, err := src.Next(ctx)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return nil // 流正常结束
+				return "", nil // 流正常结束（未轮转，段不完整）
 			}
-			return err
+			return "", err
 		}
 		if ev.Header == nil {
 			continue
@@ -91,19 +109,24 @@ func (w *Writer) consume(ctx context.Context, src binlog.Source, fileName string
 		if ev.Header.EventType == replication.ROTATE_EVENT {
 			name, err := rotateNextLogName(ev)
 			if err != nil {
-				return err
+				return "", err
 			}
 			if err := validateRotateName(name); err != nil {
-				return err
+				return "", err
 			}
-			if writeMagic {
-				next = name
+			if !started {
+				// 流起始公告（fake rotate）：仅命名/忽略，段继续
+				if writeMagic {
+					next = name
+				}
+				continue
 			}
+			// 真实轮转：关闭当前文件，段结束，返回下一个文件名
 			if f != nil {
 				f.Close()
 				f = nil
 			}
-			continue
+			return name, nil
 		}
 		if f == nil {
 			name := next
@@ -114,21 +137,22 @@ func (w *Writer) consume(ctx context.Context, src binlog.Source, fileName string
 			if writeMagic {
 				// 全量重建：截断重建，写入 magic
 				if f, err = os.Create(path); err != nil {
-					return err
+					return "", err
 				}
 				if _, err := f.Write(binlogMagic); err != nil {
-					return err
+					return "", err
 				}
 			} else {
 				// append 续写：只追加（不写 magic）。O_APPEND 让 Seal 失败后
 				// 残留的旧 partial 可以安全续写（重试语义），不重复写入。
 				if f, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644); err != nil {
-					return err
+					return "", err
 				}
 			}
+			started = true
 		}
 		if _, err := f.Write(ev.RawData); err != nil {
-			return err
+			return "", err
 		}
 	}
 }
@@ -221,6 +245,75 @@ func (w *Writer) Seal(partialName string) error {
 		return fmt.Errorf("archive: open final %s: %w", partialName, err)
 	}
 	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return fmt.Errorf("archive: append %s: %w", partialName, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("archive: close final: %w", err)
+	}
+	return os.Remove(src)
+}
+
+// SealAppendVerified 是 append 封口的 CRC 强化版本（T5/T4 评审 carry-in）：
+// 把「最终文件全部内容 + 尾部」拼临时文件做整体 ParseFile + SetVerifyChecksum，
+// 验证通过才把尾部追加到最终文件末尾、删除 .partial。
+//
+// 与 Seal 的 append 分支（magic+tail 单独验证）区别：组合验证里 FDE 存在，
+// 使 go-mysql 对每个事件的 CRC32 校验生效——即使篡改最终文件内部的一个事件
+// 字节也会被捕获（Seal 的 append 分支因尾部无 FDE 会跳过 CRC）。
+//
+// 前置条件：最终文件必须已存在（本方法不做回填）；partial 可含任意事件字节。
+func (w *Writer) SealAppendVerified(partialName string) error {
+	src := filepath.Join(w.dir, partialName)
+	final := strings.TrimSuffix(src, ".partial")
+
+	tail, err := os.ReadFile(src)
+	if err != nil {
+		return fmt.Errorf("archive: read partial %s: %w", partialName, err)
+	}
+	if _, err := os.Stat(final); err != nil {
+		return fmt.Errorf("archive: append seal %s but final %s missing", partialName, filepath.Base(final))
+	}
+
+	// 组合验证：临时文件 = final 内容（含 magic）+ tail（事件字节），整体解析。
+	// 用流式拷贝而非一次性 ReadFile，避免 1GB 级文件双份内存。
+	tmp := filepath.Join(w.dir, ".verify-"+fmt.Sprint(time.Now().UnixNano()))
+	tf, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp)
+	fr, err := os.Open(final)
+	if err != nil {
+		tf.Close()
+		return fmt.Errorf("archive: open final %s: %w", partialName, err)
+	}
+	if _, err := io.Copy(tf, fr); err != nil {
+		fr.Close()
+		tf.Close()
+		return fmt.Errorf("archive: copy final %s: %w", partialName, err)
+	}
+	fr.Close()
+	if _, err := tf.Write(tail); err != nil {
+		tf.Close()
+		return fmt.Errorf("archive: write tail %s: %w", partialName, err)
+	}
+	if err := tf.Close(); err != nil {
+		return fmt.Errorf("archive: close verify tmp: %w", err)
+	}
+
+	parser := replication.NewBinlogParser()
+	parser.SetVerifyChecksum(true)
+	if err := parser.ParseFile(tmp, 0, func(*replication.BinlogEvent) error { return nil }); err != nil {
+		return fmt.Errorf("archive: append seal verify %s: %w", partialName, err)
+	}
+
+	// 验证通过：追加尾部到最终文件
+	f, err := os.OpenFile(final, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("archive: open final %s: %w", partialName, err)
+	}
+	if _, err := f.Write(tail); err != nil {
 		f.Close()
 		return fmt.Errorf("archive: append %s: %w", partialName, err)
 	}

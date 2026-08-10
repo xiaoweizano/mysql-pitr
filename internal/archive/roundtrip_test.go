@@ -28,7 +28,8 @@ func TestRoundtrip_FixtureBytesIdentical(t *testing.T) {
 
 	dir := t.TempDir()
 	w := archive.NewWriter(dir)
-	require.NoError(t, w.Consume(context.Background(), src))
+	_, err = w.Consume(context.Background(), src)
+	require.NoError(t, err)
 	require.NoError(t, w.Seal("mysql-bin.000001.partial"))
 
 	got, err := os.ReadFile(filepath.Join(dir, "mysql-bin.000001"))
