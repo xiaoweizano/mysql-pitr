@@ -603,6 +603,8 @@ func (l *Loop) syncOnce(ctx context.Context, pos mysql.Position) error {
 
 `syncOnce` 的轮转封口与状态更新：`Consume`/`ConsumeAppend` 在 Rotate 时已自动 Seal（Phase 1 Consume 在 Rotate 时只关文件——**注意**：Phase 1 的 Consume 不 Seal！轮转时只是关掉当前文件，Seal 由调用方做。Phase 2 归档循环在 `Consume*` 返回后统一 `Seal("当前文件.partial")`。为让循环知道「哪个文件刚被轮转」，`Consume*` 需返回最后处理的文件名——**扩展接口**：`Consume*` 返回值 `(lastFileName string, err error)`。Phase 1 的调用（roundtrip 测试）同步适配。）
 
+**封口 CRC 强化（T4 评审 carry-in，控制器裁决）**：T4 的 append Seal 对无 FDE 尾部只做结构验证（go-mysql 对无 FDE 文件跳过 CRC）——归档循环的 append 封口必须改为**「最终文件 + 尾部」拼临时文件整体验证**（FDE 存在使 CRC 生效），验证通过才追加。实现位置：collector 循环在调用 `Seal` 前自行为 append 场景做组合验证，或扩展 archive.Writer 的 Seal（新增 `SealAppendVerified(finalName string)` 之类）——实现选择以「archive 包内扩展 + 测试」为准（成本：每个封口文件一次全量解析，轮转频率（~1GB/次）下可接受）。附测试：篡改最终文件内一个事件字节 → 组合验证失败，不追加。
+
 轮转后：`SaveState(State{LastFile: nextName, LastPos: 0 或轮转位置, ...})`——简化：轮转后 LastFile=新文件、LastPos=0（新文件从头开始）；下一次 syncOnce 从新文件头开始。`syncOnce` 返回 nil 后循环读最新状态继续。状态里 LastPos 对已轮转文件无意义（文件已封口），记录 LastFile 即可。
 
 `sleepBackoff`：1s 起步、60s 封顶、指数退避，ctx 取消即返回 false。
