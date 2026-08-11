@@ -13,6 +13,7 @@ import (
 	"github.com/a-shan/mysql-pitr/internal/server/auth"
 	"github.com/a-shan/mysql-pitr/internal/server/org"
 	"github.com/a-shan/mysql-pitr/internal/server/pitr"
+	"github.com/a-shan/mysql-pitr/internal/server/store"
 )
 
 // newWebRouter builds the REST + SPA router from pre-initialised handlers.
@@ -124,7 +125,17 @@ func NewRouter() *chi.Mux {
 	userStore := auth.NewInMemoryUserStore()
 	orgStore := org.NewInMemoryOrgStore()
 	agentStore := agent.NewInMemoryAgentStore()
-	pitrStore := pitr.NewInMemoryOperationStore()
+	// TODO(Task 7): wire the shared platform SQLite database; the pitr store
+	// currently uses a throwaway in-memory database so each NewRouter gets an
+	// isolated, migrated schema.
+	db, err := store.Open(":memory:")
+	if err != nil {
+		panic("pitr: open sqlite: " + err.Error())
+	}
+	if err := store.Migrate(db); err != nil {
+		panic("pitr: migrate sqlite: " + err.Error())
+	}
+	pitrStore := pitr.NewSQLiteOperationStore(db)
 	auditStore := audit.NewInMemoryAuditStore()
 
 	authHandler := auth.NewHandler(userStore, jwtSecret)

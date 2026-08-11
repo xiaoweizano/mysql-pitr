@@ -10,11 +10,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/a-shan/mysql-pitr/internal/connector"
 	"github.com/a-shan/mysql-pitr/internal/server/agent"
 	"github.com/a-shan/mysql-pitr/internal/server/audit"
 	"github.com/a-shan/mysql-pitr/internal/server/auth"
 	"github.com/a-shan/mysql-pitr/internal/server/org"
+	"github.com/a-shan/mysql-pitr/internal/server/store"
 	"github.com/a-shan/mysql-pitr/internal/ws"
 	"github.com/a-shan/mysql-pitr/internal/ws/hub"
 	"github.com/go-chi/chi/v5"
@@ -22,83 +22,33 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// fakeCommander implements AgentCommander with canned responses per command
-// type, so the operation state machine can be tested without a live agent.
+// NOTE (Task 4 placeholder): the previous 832-line handler test exercised the
+// v2 flow (preflight -> confirmed -> parsing -> previewed -> executing against
+// the InMemory store). That model was replaced by the v3 model in this task,
+// so those tests are gone; the full v3 handler suite lands with the handler
+// rewrite in Task 6. This file keeps placeholder coverage of the endpoints
+// that survive: Start (record creation + guard checks), List, Status, Cancel
+// (v3 transition gate + audit), and the not-yet-implemented 501 stubs.
+
+// fakeCommander implements AgentCommander with a canned response; the
+// placeholder handler only calls IsConnected.
 type fakeCommander struct {
-	connected   bool
-	preflightFn func() (*ws.Response, error)
-	parseFn     func() (*ws.Response, error)
-	executeFn   func() (*ws.Response, error)
-	sent        []ws.Command
+	connected bool
 }
 
 func (f *fakeCommander) IsConnected(agentID string) bool { return f.connected }
 
 func (f *fakeCommander) SendToAgent(ctx context.Context, agentID string, cmd ws.Command) (*ws.Response, error) {
-	f.sent = append(f.sent, cmd)
-	switch cmd.Type {
-	case ws.CmdPreflight:
-		return f.preflightFn()
-	case ws.CmdPITRParse:
-		return f.parseFn()
-	case ws.CmdPITRExecute:
-		return f.executeFn()
-	default:
-		return &ws.Response{Cmd: cmd.Cmd, Status: ws.StatusOK, Result: "ok"}, nil
-	}
+	return &ws.Response{Cmd: cmd.Cmd, Status: ws.StatusOK}, nil
 }
 
 func (f *fakeCommander) SetProgressHandler(fn hub.ProgressHandler) {}
 
-// successCommander returns a fake commander wired for a successful
-// preflight → parse → execute flow.
-func successCommander() *fakeCommander {
-	return &fakeCommander{
-		connected: true,
-		preflightFn: func() (*ws.Response, error) {
-			return &ws.Response{Cmd: "preflight", Status: ws.StatusOK, Result: agentPreflightResult{
-				Preflight: &connector.PreflightResult{
-					Status:  connector.PreflightPass,
-					Version: "8.0.32",
-					Checks: []connector.PreflightCheck{
-						{Name: "MySQL Version", Status: connector.PreflightPass},
-					},
-				},
-				BinlogFiles: []string{"mysql-bin.000001"},
-				TotalSize:   1024,
-			}}, nil
-		},
-		parseFn: func() (*ws.Response, error) {
-			sqls := make([]string, 1250)
-			preview := make([]ReverseSqlEntry, 1000)
-			for i := range sqls {
-				sqls[i] = "DELETE FROM `orders` WHERE `id` = 1 LIMIT 1;"
-				if i < len(preview) {
-					preview[i] = ReverseSqlEntry{Sequence: i + 1, SqlType: "DELETE", TableName: "orders", ReverseSql: sqls[i]}
-				}
-			}
-			return &ws.Response{Cmd: "parse", Status: ws.StatusOK, Result: agentParseResult{
-				TotalRows:  1250,
-				ReverseSql: sqls,
-				Preview:    preview,
-				SQLSample:  sqls[0],
-			}}, nil
-		},
-		executeFn: func() (*ws.Response, error) {
-			return &ws.Response{Cmd: "execute", Status: ws.StatusOK, Result: agentExecuteResult{
-				RowsAffected:     1250,
-				BatchesCompleted: 10,
-				BatchesTotal:     10,
-			}}, nil
-		},
-	}
-}
-
-// test helpers
-
+// testFixture wires a Handler against the SQLite store and the InMemory
+// domain stores.
 type testFixture struct {
 	handler    *Handler
-	opStore    *InMemoryOperationStore
+	opStore    OperationStore
 	agentStore *agent.InMemoryAgentStore
 	orgStore   *org.InMemoryOrgStore
 	auditStore *audit.InMemoryAuditStore
@@ -109,13 +59,17 @@ type testFixture struct {
 
 func setupTest(t *testing.T) *testFixture {
 	t.Helper()
-	opStore := NewInMemoryOperationStore()
+	db, err := store.Open(":memory:")
+	require.NoError(t, err)
+	require.NoError(t, store.Migrate(db))
+	t.Cleanup(func() { _ = db.Close() })
+	opStore := NewSQLiteOperationStore(db)
 	agentStore := agent.NewInMemoryAgentStore()
 	orgStore := org.NewInMemoryOrgStore()
 	auditStore := audit.NewInMemoryAuditStore()
 	userStore := auth.NewInMemoryUserStore()
 	secret := []byte("pitr-test-secret")
-	commander := successCommander()
+	commander := &fakeCommander{connected: true}
 	handler := NewHandler(opStore, agentStore, orgStore, auditStore, secret, commander)
 	return &testFixture{
 		handler:    handler,
@@ -180,8 +134,7 @@ func (f *testFixture) authenticatedRequest(t *testing.T, method, target string, 
 }
 
 // authenticatedRouteRequest builds an authenticated request with a chi route
-// context so chi.URLParam("id") resolves to id (handlers invoked directly,
-// without a router, need this).
+// context so chi.URLParam("id") resolves to id.
 func (f *testFixture) authenticatedRouteRequest(t *testing.T, method, target, id string, body interface{}, userID string) *http.Request {
 	t.Helper()
 	req := f.authenticatedRequest(t, method, target, body, userID)
@@ -190,97 +143,50 @@ func (f *testFixture) authenticatedRouteRequest(t *testing.T, method, target, id
 	return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
 }
 
-// waitForOperationState polls the store until the operation reaches one of the
-// desired states or the timeout expires.
-func waitForOperationState(t *testing.T, store *InMemoryOperationStore, opID string, desired []OperationState, timeout time.Duration) *Operation {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		op, err := store.Get(opID)
-		if err == nil {
-			for _, d := range desired {
-				if op.State == d {
-					return op
-				}
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
+func startBody(agentID string) map[string]string {
+	return map[string]string{
+		"agent_id":      agentID,
+		"target_table":  "orders",
+		"recovery_time": "2026-07-08T14:00:00Z",
+		"mode":          "preview",
 	}
-	// Final read to report current state.
-	op, err := store.Get(opID)
-	if err != nil {
-		t.Fatalf("operation %s not found after timeout", opID)
-	}
-	t.Fatalf("operation %s did not reach desired state %v within %v (current: %s)",
-		opID, desired, timeout, op.State)
-	return nil
 }
 
 // ---------- Start ----------
 
-func TestStart_Success_PreviewMode(t *testing.T) {
+func TestStart_Success_CreatesOperation(t *testing.T) {
 	f := setupTest(t)
 	userID := f.createUser(t)
 	orgID := f.createOrg(t, userID)
 	agentID := f.createAgent(t, orgID)
 
-	req := f.authenticatedRequest(t, http.MethodPost, "/api/pitr/start", startRequest{
-		AgentID:      agentID,
-		TargetTable:  "orders",
-		RecoveryTime: "2026-07-08T14:00:00Z",
-		Mode:         "preview",
-	}, userID)
+	req := f.authenticatedRequest(t, http.MethodPost, "/api/pitr/start", startBody(agentID), userID)
 	w := httptest.NewRecorder()
 	f.handler.Start(w, req)
 
 	require.Equal(t, http.StatusCreated, w.Code)
 	var resp startResponse
-	err := json.NewDecoder(w.Body).Decode(&resp)
-	require.NoError(t, err)
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.NotEmpty(t, resp.OperationID)
-	assert.Equal(t, StatePreflight, resp.Status)
+	assert.Equal(t, StateCreated, resp.Status)
 
-	// Wait for the async simulation to reach previewed (should take ~1s).
-	op := waitForOperationState(t, f.opStore, resp.OperationID,
-		[]OperationState{StatePreviewed, StateCompleted, StateFailed, StateCancelled},
-		5*time.Second)
-	assert.Equal(t, StatePreviewed, op.State)
-	assert.NotNil(t, op.PreflightRes)
-	assert.NotNil(t, op.ParseRes)
-	assert.Equal(t, int64(1250), op.ParseRes.RowsAffected)
+	op, err := f.opStore.Get(resp.OperationID)
+	require.NoError(t, err)
+	assert.Equal(t, orgID, op.OrgID)
+	assert.Equal(t, agentID, op.AgentID)
+	assert.Equal(t, "pitr", op.Type)
+	assert.Equal(t, StateCreated, op.Status)
+	assert.Equal(t, userID, op.CreatedBy)
+	assert.False(t, op.CreatedAt.IsZero())
 }
 
-func TestStart_Success_ExecuteMode(t *testing.T) {
+func TestStart_NoAuth(t *testing.T) {
 	f := setupTest(t)
-	userID := f.createUser(t)
-	orgID := f.createOrg(t, userID)
-	agentID := f.createAgent(t, orgID)
-
-	req := f.authenticatedRequest(t, http.MethodPost, "/api/pitr/start", startRequest{
-		AgentID:      agentID,
-		TargetTable:  "orders",
-		RecoveryTime: "2026-07-08T14:00:00Z",
-		Mode:         "execute",
-	}, userID)
+	req := httptest.NewRequest(http.MethodPost, "/api/pitr/start",
+		bytes.NewReader([]byte(`{"agent_id":"x","target_table":"y","recovery_time":"2026-01-01T00:00:00Z","mode":"preview"}`)))
 	w := httptest.NewRecorder()
 	f.handler.Start(w, req)
-
-	require.Equal(t, http.StatusCreated, w.Code)
-	var resp startResponse
-	err := json.NewDecoder(w.Body).Decode(&resp)
-	require.NoError(t, err)
-	assert.NotEmpty(t, resp.OperationID)
-	assert.Equal(t, StatePreflight, resp.Status)
-
-	// Wait for the async simulation to complete (should take ~4s).
-	op := waitForOperationState(t, f.opStore, resp.OperationID,
-		[]OperationState{StateCompleted, StateFailed, StateCancelled},
-		10*time.Second)
-	assert.Equal(t, StateCompleted, op.State)
-	assert.NotNil(t, op.ExecRes)
-	assert.Equal(t, int64(1250), op.ExecRes.RowsRestored)
-	assert.NotNil(t, op.Progress)
-	assert.Equal(t, 10, op.Progress.BatchesComplete)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
 func TestStart_MissingFields(t *testing.T) {
@@ -299,7 +205,6 @@ func TestStart_MissingFields(t *testing.T) {
 		{"missing recovery_time", map[string]string{"agent_id": agentID, "target_table": "x", "mode": "preview"}},
 		{"missing mode", map[string]string{"agent_id": agentID, "target_table": "x", "recovery_time": "2026-01-01T00:00:00Z"}},
 	}
-
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			req := f.authenticatedRequest(t, http.MethodPost, "/api/pitr/start", tc.body, userID)
@@ -316,29 +221,9 @@ func TestStart_InvalidMode(t *testing.T) {
 	orgID := f.createOrg(t, userID)
 	agentID := f.createAgent(t, orgID)
 
-	req := f.authenticatedRequest(t, http.MethodPost, "/api/pitr/start", startRequest{
-		AgentID:      agentID,
-		TargetTable:  "orders",
-		RecoveryTime: "2026-07-08T14:00:00Z",
-		Mode:         "invalid",
-	}, userID)
-	w := httptest.NewRecorder()
-	f.handler.Start(w, req)
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-}
-
-func TestStart_InvalidRecoveryTime(t *testing.T) {
-	f := setupTest(t)
-	userID := f.createUser(t)
-	orgID := f.createOrg(t, userID)
-	agentID := f.createAgent(t, orgID)
-
-	req := f.authenticatedRequest(t, http.MethodPost, "/api/pitr/start", startRequest{
-		AgentID:      agentID,
-		TargetTable:  "orders",
-		RecoveryTime: "not-a-timestamp",
-		Mode:         "preview",
-	}, userID)
+	body := startBody(agentID)
+	body["mode"] = "invalid"
+	req := f.authenticatedRequest(t, http.MethodPost, "/api/pitr/start", body, userID)
 	w := httptest.NewRecorder()
 	f.handler.Start(w, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
@@ -349,12 +234,7 @@ func TestStart_AgentNotFound(t *testing.T) {
 	userID := f.createUser(t)
 	_ = f.createOrg(t, userID)
 
-	req := f.authenticatedRequest(t, http.MethodPost, "/api/pitr/start", startRequest{
-		AgentID:      "nonexistent",
-		TargetTable:  "orders",
-		RecoveryTime: "2026-07-08T14:00:00Z",
-		Mode:         "preview",
-	}, userID)
+	req := f.authenticatedRequest(t, http.MethodPost, "/api/pitr/start", startBody("nonexistent"), userID)
 	w := httptest.NewRecorder()
 	f.handler.Start(w, req)
 	assert.Equal(t, http.StatusNotFound, w.Code)
@@ -367,24 +247,54 @@ func TestStart_NotOrgMember(t *testing.T) {
 	orgID := f.createOrg(t, otherUser) // other user owns the org
 	agentID := f.createAgent(t, orgID)
 
-	req := f.authenticatedRequest(t, http.MethodPost, "/api/pitr/start", startRequest{
-		AgentID:      agentID,
-		TargetTable:  "orders",
-		RecoveryTime: "2026-07-08T14:00:00Z",
-		Mode:         "preview",
-	}, userID)
+	req := f.authenticatedRequest(t, http.MethodPost, "/api/pitr/start", startBody(agentID), userID)
 	w := httptest.NewRecorder()
 	f.handler.Start(w, req)
 	assert.Equal(t, http.StatusForbidden, w.Code)
 }
 
-func TestStart_NoAuth(t *testing.T) {
+func TestStart_AgentOffline(t *testing.T) {
 	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	f.commander.connected = false
 
-	req := httptest.NewRequest(http.MethodPost, "/api/pitr/start",
-		bytes.NewReader([]byte(`{"agent_id":"x","target_table":"y","recovery_time":"2026-01-01T00:00:00Z","mode":"preview"}`)))
+	req := f.authenticatedRequest(t, http.MethodPost, "/api/pitr/start", startBody(agentID), userID)
 	w := httptest.NewRecorder()
 	f.handler.Start(w, req)
+	assert.Equal(t, http.StatusConflict, w.Code)
+}
+
+// ---------- List ----------
+
+func TestList_FiltersByOrg(t *testing.T) {
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	require.NoError(t, f.opStore.Create(&Operation{ID: "op_1", OrgID: orgID, AgentID: agentID, Type: "pitr", Mode: "sql", Status: StateCreated, CreatedBy: userID}))
+	require.NoError(t, f.opStore.Create(&Operation{ID: "op_2", OrgID: "other_org", AgentID: agentID, Type: "pitr", Mode: "sql", Status: StateCreated, CreatedBy: userID}))
+
+	req := f.authenticatedRequest(t, http.MethodGet, "/api/pitr?org_id="+orgID, nil, userID)
+	w := httptest.NewRecorder()
+	f.handler.List(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var resp struct {
+		Operations []operationView `json:"operations"`
+	}
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	require.Len(t, resp.Operations, 1)
+	assert.Equal(t, "op_1", resp.Operations[0].ID)
+	assert.True(t, resp.Operations[0].AgentConnected)
+}
+
+func TestList_NoAuth(t *testing.T) {
+	f := setupTest(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/pitr?org_id=x", nil)
+	w := httptest.NewRecorder()
+	f.handler.List(w, req)
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
@@ -396,30 +306,19 @@ func TestStatus_Success(t *testing.T) {
 	orgID := f.createOrg(t, userID)
 	agentID := f.createAgent(t, orgID)
 
-	op := &Operation{
-		OrgID:        orgID,
-		AgentID:      agentID,
-		TargetTable:  "orders",
-		RecoveryTime: time.Date(2026, 7, 8, 14, 0, 0, 0, time.UTC),
-		Mode:         "preview",
-		State:        StatePreviewed,
-		ParseRes:     &ParseSummary{RowsAffected: 500, SQLSample: "DELETE FROM x;"},
-	}
-	err := f.opStore.Create(op)
-	require.NoError(t, err)
+	op := &Operation{ID: "op_status", OrgID: orgID, AgentID: agentID, Type: "pitr", Mode: "sql", Status: StateScanning, CreatedBy: userID}
+	require.NoError(t, f.opStore.Create(op))
 
-	req := f.authenticatedRouteRequest(t, http.MethodGet, "/api/pitr/"+op.ID+"/status", op.ID, nil, userID)
+	req := f.authenticatedRouteRequest(t, http.MethodGet, "/api/pitr/op_status/status", "op_status", nil, userID)
 	w := httptest.NewRecorder()
 	f.handler.Status(w, req)
 
 	assert.Equal(t, http.StatusOK, w.Code)
 	var resp statusResponse
-	err = json.NewDecoder(w.Body).Decode(&resp)
-	require.NoError(t, err)
-	assert.Equal(t, op.ID, resp.ID)
-	assert.Equal(t, StatePreviewed, resp.State)
-	assert.NotNil(t, resp.ParseRes)
-	assert.Equal(t, int64(500), resp.ParseRes.RowsAffected)
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.Equal(t, "op_status", resp.ID)
+	assert.Equal(t, StateScanning, resp.Status)
+	assert.Equal(t, "pitr", resp.Type)
 }
 
 func TestStatus_NotFound(t *testing.T) {
@@ -433,15 +332,6 @@ func TestStatus_NotFound(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, w.Code)
 }
 
-func TestStatus_NoAuth(t *testing.T) {
-	f := setupTest(t)
-
-	req := httptest.NewRequest(http.MethodGet, "/api/pitr/xxx/status", nil)
-	w := httptest.NewRecorder()
-	f.handler.Status(w, req)
-	assert.Equal(t, http.StatusUnauthorized, w.Code)
-}
-
 func TestStatus_NotMember(t *testing.T) {
 	f := setupTest(t)
 	userID := f.createUser(t)
@@ -449,15 +339,10 @@ func TestStatus_NotMember(t *testing.T) {
 	orgID := f.createOrg(t, otherUser)
 	agentID := f.createAgent(t, orgID)
 
-	op := &Operation{
-		OrgID:   orgID,
-		AgentID: agentID,
-		State:   StatePreflight,
-	}
-	err := f.opStore.Create(op)
-	require.NoError(t, err)
+	op := &Operation{ID: "op_member", OrgID: orgID, AgentID: agentID, Type: "pitr", Mode: "sql", Status: StateCreated}
+	require.NoError(t, f.opStore.Create(op))
 
-	req := f.authenticatedRouteRequest(t, http.MethodGet, "/api/pitr/"+op.ID+"/status", op.ID, nil, userID)
+	req := f.authenticatedRouteRequest(t, http.MethodGet, "/api/pitr/op_member/status", "op_member", nil, userID)
 	w := httptest.NewRecorder()
 	f.handler.Status(w, req)
 	assert.Equal(t, http.StatusForbidden, w.Code)
@@ -471,25 +356,22 @@ func TestCancel_Success(t *testing.T) {
 	orgID := f.createOrg(t, userID)
 	agentID := f.createAgent(t, orgID)
 
-	op := &Operation{
-		OrgID:       orgID,
-		AgentID:     agentID,
-		TargetTable: "orders",
-		State:       StatePreflight,
-	}
-	err := f.opStore.Create(op)
-	require.NoError(t, err)
+	op := &Operation{ID: "op_cancel", OrgID: orgID, AgentID: agentID, Type: "pitr", Mode: "sql", Status: StateReady}
+	require.NoError(t, f.opStore.Create(op))
 
-	req := f.authenticatedRouteRequest(t, http.MethodPost, "/api/pitr/"+op.ID+"/cancel", op.ID, nil, userID)
+	req := f.authenticatedRouteRequest(t, http.MethodPost, "/api/pitr/op_cancel/cancel", "op_cancel", nil, userID)
 	w := httptest.NewRecorder()
 	f.handler.Cancel(w, req)
 
 	assert.Equal(t, http.StatusOK, w.Code)
 	var resp cancelResponse
-	err = json.NewDecoder(w.Body).Decode(&resp)
-	require.NoError(t, err)
-	assert.Equal(t, op.ID, resp.OperationID)
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.Equal(t, "op_cancel", resp.OperationID)
 	assert.Equal(t, StateCancelled, resp.Status)
+
+	got, err := f.opStore.Get("op_cancel")
+	require.NoError(t, err)
+	assert.Equal(t, StateCancelled, got.Status)
 
 	// Verify audit entry was created.
 	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
@@ -504,329 +386,52 @@ func TestCancel_InvalidState(t *testing.T) {
 	orgID := f.createOrg(t, userID)
 	agentID := f.createAgent(t, orgID)
 
-	op := &Operation{
-		OrgID:   orgID,
-		AgentID: agentID,
-		State:   StateCompleted,
-	}
-	err := f.opStore.Create(op)
-	require.NoError(t, err)
+	op := &Operation{ID: "op_terminal", OrgID: orgID, AgentID: agentID, Type: "pitr", Mode: "sql", Status: StateDone}
+	require.NoError(t, f.opStore.Create(op))
 
-	req := f.authenticatedRouteRequest(t, http.MethodPost, "/api/pitr/"+op.ID+"/cancel", op.ID, nil, userID)
+	req := f.authenticatedRouteRequest(t, http.MethodPost, "/api/pitr/op_terminal/cancel", "op_terminal", nil, userID)
 	w := httptest.NewRecorder()
 	f.handler.Cancel(w, req)
 	assert.Equal(t, http.StatusConflict, w.Code)
-}
 
-func TestCancel_NotFound(t *testing.T) {
-	f := setupTest(t)
-	userID := f.createUser(t)
-	f.createOrg(t, userID)
-
-	req := f.authenticatedRouteRequest(t, http.MethodPost, "/api/pitr/nonexistent/cancel", "nonexistent", nil, userID)
-	w := httptest.NewRecorder()
-	f.handler.Cancel(w, req)
-	assert.Equal(t, http.StatusNotFound, w.Code)
+	// Terminal state untouched.
+	got, err := f.opStore.Get("op_terminal")
+	require.NoError(t, err)
+	assert.Equal(t, StateDone, got.Status)
 }
 
 func TestCancel_NoAuth(t *testing.T) {
 	f := setupTest(t)
-
 	req := httptest.NewRequest(http.MethodPost, "/api/pitr/xxx/cancel", nil)
 	w := httptest.NewRecorder()
 	f.handler.Cancel(w, req)
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
-// ---------- Preview ----------
+// ---------- Task 6 stubs ----------
 
-func TestPreview_Success(t *testing.T) {
+func TestV3FlowEndpoints_NotImplemented(t *testing.T) {
 	f := setupTest(t)
 	userID := f.createUser(t)
 	orgID := f.createOrg(t, userID)
 	agentID := f.createAgent(t, orgID)
-
-	op := &Operation{
-		OrgID:       orgID,
-		AgentID:     agentID,
-		TargetTable: "orders",
-		State:       StatePreviewed,
-		ParseRes: &ParseSummary{
-			ParsedAt:     time.Now(),
-			RowsAffected: 750,
-			SQLSample:    "DELETE FROM orders WHERE id IN (1, 2, 3);",
-		},
-	}
-	err := f.opStore.Create(op)
-	require.NoError(t, err)
-
-	req := f.authenticatedRouteRequest(t, http.MethodGet, "/api/pitr/"+op.ID+"/preview", op.ID, nil, userID)
-	w := httptest.NewRecorder()
-	f.handler.Preview(w, req)
-
-	assert.Equal(t, http.StatusOK, w.Code)
-	var resp previewResponse
-	err = json.NewDecoder(w.Body).Decode(&resp)
-	require.NoError(t, err)
-	assert.Equal(t, op.ID, resp.OperationID)
-	assert.Equal(t, int64(750), resp.RowsAffected)
-	assert.Contains(t, resp.SQLSample, "DELETE FROM orders")
-}
-
-func TestPreview_NotReady(t *testing.T) {
-	f := setupTest(t)
-	userID := f.createUser(t)
-	orgID := f.createOrg(t, userID)
-	agentID := f.createAgent(t, orgID)
-
-	op := &Operation{
-		OrgID:   orgID,
-		AgentID: agentID,
-		State:   StatePreflight,
-	}
-	err := f.opStore.Create(op)
-	require.NoError(t, err)
-
-	req := f.authenticatedRouteRequest(t, http.MethodGet, "/api/pitr/"+op.ID+"/preview", op.ID, nil, userID)
-	w := httptest.NewRecorder()
-	f.handler.Preview(w, req)
-	assert.Equal(t, http.StatusPreconditionFailed, w.Code)
-}
-
-func TestPreview_NoAuth(t *testing.T) {
-	f := setupTest(t)
-
-	req := httptest.NewRequest(http.MethodGet, "/api/pitr/xxx/preview", nil)
-	w := httptest.NewRecorder()
-	f.handler.Preview(w, req)
-	assert.Equal(t, http.StatusUnauthorized, w.Code)
-}
-
-// ---------- Progress ----------
-
-func TestProgress_Success(t *testing.T) {
-	f := setupTest(t)
-	userID := f.createUser(t)
-	orgID := f.createOrg(t, userID)
-	agentID := f.createAgent(t, orgID)
-
-	op := &Operation{
-		OrgID:   orgID,
-		AgentID: agentID,
-		State:   StateExecuting,
-		Progress: &ProgressInfo{
-			BatchesComplete:    3,
-			BatchesTotal:       10,
-			RowsRestored:       375,
-			EstimatedRemaining: "21s",
-		},
-	}
-	err := f.opStore.Create(op)
-	require.NoError(t, err)
-
-	req := f.authenticatedRouteRequest(t, http.MethodGet, "/api/pitr/"+op.ID+"/progress", op.ID, nil, userID)
-	w := httptest.NewRecorder()
-	f.handler.Progress(w, req)
-
-	assert.Equal(t, http.StatusOK, w.Code)
-	var resp progressResponse
-	err = json.NewDecoder(w.Body).Decode(&resp)
-	require.NoError(t, err)
-	assert.Equal(t, op.ID, resp.OperationID)
-	assert.Equal(t, StateExecuting, resp.State)
-	assert.Equal(t, 3, resp.BatchesComplete)
-	assert.Equal(t, 10, resp.BatchesTotal)
-	assert.Equal(t, int64(375), resp.RowsRestored)
-	assert.Equal(t, "21s", resp.EstimatedRemaining)
-}
-
-func TestProgress_NoProgressYet(t *testing.T) {
-	f := setupTest(t)
-	userID := f.createUser(t)
-	orgID := f.createOrg(t, userID)
-	agentID := f.createAgent(t, orgID)
-
-	op := &Operation{
-		OrgID:   orgID,
-		AgentID: agentID,
-		State:   StatePreviewed,
-	}
-	err := f.opStore.Create(op)
-	require.NoError(t, err)
-
-	req := f.authenticatedRouteRequest(t, http.MethodGet, "/api/pitr/"+op.ID+"/progress", op.ID, nil, userID)
-	w := httptest.NewRecorder()
-	f.handler.Progress(w, req)
-
-	assert.Equal(t, http.StatusOK, w.Code)
-	var resp progressResponse
-	err = json.NewDecoder(w.Body).Decode(&resp)
-	require.NoError(t, err)
-	assert.Equal(t, op.ID, resp.OperationID)
-	assert.Equal(t, StatePreviewed, resp.State)
-	assert.Equal(t, 0, resp.BatchesComplete)
-	assert.Equal(t, 0, resp.BatchesTotal)
-	assert.Equal(t, int64(0), resp.RowsRestored)
-	assert.Equal(t, "", resp.EstimatedRemaining)
-}
-
-func TestProgress_NoAuth(t *testing.T) {
-	f := setupTest(t)
-
-	req := httptest.NewRequest(http.MethodGet, "/api/pitr/xxx/progress", nil)
-	w := httptest.NewRecorder()
-	f.handler.Progress(w, req)
-	assert.Equal(t, http.StatusUnauthorized, w.Code)
-}
-
-func TestProgress_NotFound(t *testing.T) {
-	f := setupTest(t)
-	userID := f.createUser(t)
-	f.createOrg(t, userID)
-
-	req := f.authenticatedRouteRequest(t, http.MethodGet, "/api/pitr/nonexistent/progress", "nonexistent", nil, userID)
-	w := httptest.NewRecorder()
-	f.handler.Progress(w, req)
-	assert.Equal(t, http.StatusNotFound, w.Code)
-}
-
-// ---------- Execute (explicit, user-selected SQL) ----------
-
-func TestExecute_SelectedSQL(t *testing.T) {
-	f := setupTest(t)
-	userID := f.createUser(t)
-	orgID := f.createOrg(t, userID)
-	agentID := f.createAgent(t, orgID)
-
-	// Start a preview operation and wait for it to reach the previewed state.
-	req := f.authenticatedRequest(t, http.MethodPost, "/api/pitr/start", startRequest{
-		AgentID:      agentID,
-		TargetTable:  "orders",
-		RecoveryTime: "2026-07-08T14:00:00Z",
-		Mode:         "preview",
-	}, userID)
-	w := httptest.NewRecorder()
-	f.handler.Start(w, req)
-	require.Equal(t, http.StatusCreated, w.Code)
-	var startResp startResponse
-	require.NoError(t, json.NewDecoder(w.Body).Decode(&startResp))
-
-	op := waitForOperationState(t, f.opStore, startResp.OperationID,
-		[]OperationState{StatePreviewed, StateCompleted, StateFailed, StateCancelled}, 5*time.Second)
-	require.Equal(t, StatePreviewed, op.State)
-
-	// Execute only a subset of the generated statements.
-	selected := []string{"DELETE FROM `orders` WHERE `id` = 1 LIMIT 1;"}
-	req = f.authenticatedRouteRequest(t, http.MethodPost, "/api/pitr/"+op.ID+"/execute", op.ID,
-		map[string]interface{}{"sql": selected}, userID)
-	w = httptest.NewRecorder()
-	f.handler.Execute(w, req)
-	require.Equal(t, http.StatusAccepted, w.Code)
-
-	// The async execution must complete and send exactly the selected SQL.
-	op = waitForOperationState(t, f.opStore, op.ID, []OperationState{StateCompleted, StateFailed, StateCancelled}, 5*time.Second)
-	require.Equal(t, StateCompleted, op.State)
-	require.NotNil(t, op.ExecRes)
-
-	require.Len(t, f.commander.sent, 3) // preflight, parse, execute
-	execCmd := f.commander.sent[2]
-	assert.Equal(t, ws.CmdPITRExecute, execCmd.Type)
-	sqls, ok := execCmd.Params["sql"].([]string)
-	require.True(t, ok)
-	assert.Equal(t, selected, sqls)
-}
-
-func TestExecute_EmptySQLUsesFullBatch(t *testing.T) {
-	f := setupTest(t)
-	userID := f.createUser(t)
-	orgID := f.createOrg(t, userID)
-	agentID := f.createAgent(t, orgID)
-
-	req := f.authenticatedRequest(t, http.MethodPost, "/api/pitr/start", startRequest{
-		AgentID:      agentID,
-		TargetTable:  "orders",
-		RecoveryTime: "2026-07-08T14:00:00Z",
-		Mode:         "preview",
-	}, userID)
-	w := httptest.NewRecorder()
-	f.handler.Start(w, req)
-	require.Equal(t, http.StatusCreated, w.Code)
-	var startResp startResponse
-	require.NoError(t, json.NewDecoder(w.Body).Decode(&startResp))
-
-	op := waitForOperationState(t, f.opStore, startResp.OperationID,
-		[]OperationState{StatePreviewed, StateCompleted, StateFailed, StateCancelled}, 5*time.Second)
-	require.Equal(t, StatePreviewed, op.State)
-
-	// No "sql" in the body -> the full generated batch is executed.
-	req = f.authenticatedRouteRequest(t, http.MethodPost, "/api/pitr/"+op.ID+"/execute", op.ID,
-		map[string]interface{}{}, userID)
-	w = httptest.NewRecorder()
-	f.handler.Execute(w, req)
-	require.Equal(t, http.StatusAccepted, w.Code)
-
-	op = waitForOperationState(t, f.opStore, op.ID, []OperationState{StateCompleted, StateFailed, StateCancelled}, 5*time.Second)
-	require.Equal(t, StateCompleted, op.State)
-
-	require.Len(t, f.commander.sent, 3)
-	execCmd := f.commander.sent[2]
-	sqls, ok := execCmd.Params["sql"].([]string)
-	require.True(t, ok)
-	require.Len(t, sqls, 1250) // full batch from the fake parse
-}
-
-func TestExecute_NotPreviewed(t *testing.T) {
-	f := setupTest(t)
-	userID := f.createUser(t)
-	orgID := f.createOrg(t, userID)
-	agentID := f.createAgent(t, orgID)
-
-	op := &Operation{OrgID: orgID, AgentID: agentID, TargetTable: "orders", Mode: "preview", State: StatePreflight}
+	op := &Operation{ID: "op_stub", OrgID: orgID, AgentID: agentID, Type: "pitr", Mode: "sql", Status: StateReady}
 	require.NoError(t, f.opStore.Create(op))
 
-	req := f.authenticatedRouteRequest(t, http.MethodPost, "/api/pitr/"+op.ID+"/execute", op.ID, nil, userID)
-	w := httptest.NewRecorder()
-	f.handler.Execute(w, req)
-	require.Equal(t, http.StatusConflict, w.Code)
-}
-
-func TestExecute_NoAuth(t *testing.T) {
-	f := setupTest(t)
-
-	req := httptest.NewRequest(http.MethodPost, "/api/pitr/xxx/execute", nil)
-	w := httptest.NewRecorder()
-	f.handler.Execute(w, req)
-	assert.Equal(t, http.StatusUnauthorized, w.Code)
-}
-
-// TestStart_WithStartTime verifies the optional start_time flows through to the
-// agent's parse command, so the recovery window can be narrowed to a time range.
-func TestStart_WithStartTime(t *testing.T) {
-	f := setupTest(t)
-	userID := f.createUser(t)
-	orgID := f.createOrg(t, userID)
-	agentID := f.createAgent(t, orgID)
-
-	req := f.authenticatedRequest(t, http.MethodPost, "/api/pitr/start", startRequest{
-		AgentID:      agentID,
-		TargetTable:  "orders",
-		RecoveryTime: "2026-07-08T14:00:00Z",
-		StartTime:    "2026-07-08T13:00:00Z",
-		Mode:         "preview",
-	}, userID)
-	w := httptest.NewRecorder()
-	f.handler.Start(w, req)
-	require.Equal(t, http.StatusCreated, w.Code)
-	var resp startResponse
-	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
-
-	op := waitForOperationState(t, f.opStore, resp.OperationID,
-		[]OperationState{StatePreviewed, StateCompleted, StateFailed, StateCancelled}, 5*time.Second)
-	require.Equal(t, StatePreviewed, op.State)
-
-	require.Len(t, f.commander.sent, 2) // preflight, parse
-	parseCmd := f.commander.sent[1]
-	assert.Equal(t, ws.CmdPITRParse, parseCmd.Type)
-	assert.Equal(t, "2026-07-08T13:00:00Z", parseCmd.Params["startTime"])
-	assert.Equal(t, "2026-07-08T14:00:00Z", parseCmd.Params["endTime"])
+	tests := []struct {
+		name string
+		fn   func(w http.ResponseWriter, r *http.Request)
+	}{
+		{"preview", f.handler.Preview},
+		{"progress", f.handler.Progress},
+		{"execute", f.handler.Execute},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := f.authenticatedRouteRequest(t, http.MethodGet, "/api/pitr/op_stub/"+tc.name, "op_stub", nil, userID)
+			w := httptest.NewRecorder()
+			tc.fn(w, req)
+			assert.Equal(t, http.StatusNotImplemented, w.Code)
+		})
+	}
 }

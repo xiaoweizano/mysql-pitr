@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/tls"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/a-shan/mysql-pitr/internal/server/auth"
 	"github.com/a-shan/mysql-pitr/internal/server/org"
 	"github.com/a-shan/mysql-pitr/internal/server/pitr"
+	"github.com/a-shan/mysql-pitr/internal/server/store"
 	"github.com/a-shan/mysql-pitr/internal/ws/ca"
 	"github.com/a-shan/mysql-pitr/internal/ws/hub"
 )
@@ -59,7 +61,17 @@ func New() (*Server, error) {
 	userStore := auth.NewInMemoryUserStore()
 	orgStore := org.NewInMemoryOrgStore()
 	agentStore := agent.NewInMemoryAgentStore()
-	pitrStore := pitr.NewInMemoryOperationStore()
+	// TODO(Task 7): wire the shared platform SQLite database. The pitr store
+	// currently uses a throwaway in-memory database (equivalent to the old
+	// InMemoryOperationStore: operations are lost on restart).
+	storeDB, err := store.Open(":memory:")
+	if err != nil {
+		return nil, fmt.Errorf("pitr: open sqlite: %w", err)
+	}
+	if err := store.Migrate(storeDB); err != nil {
+		return nil, fmt.Errorf("pitr: migrate sqlite: %w", err)
+	}
+	pitrStore := pitr.NewSQLiteOperationStore(storeDB)
 	auditStore := audit.NewInMemoryAuditStore()
 
 	// ---- handlers ----
