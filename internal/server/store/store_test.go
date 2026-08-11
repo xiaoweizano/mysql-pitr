@@ -17,7 +17,7 @@ func TestOpenAndMigrate_IsIdempotent(t *testing.T) {
 	require.NoError(t, store.Migrate(db))
 	require.NoError(t, store.Migrate(db)) // second migration must be a no-op
 
-	for _, tbl := range []string{"users", "orgs", "members", "agents", "operations",
+	for _, tbl := range []string{"users", "orgs", "members", "agents", "invites", "operations",
 		"operation_txs", "statements", "checkpoints", "archive_state", "audit_logs"} {
 		var n int
 		require.NoError(t, db.QueryRow("SELECT count(*) FROM "+tbl).Scan(&n), "query %s", tbl)

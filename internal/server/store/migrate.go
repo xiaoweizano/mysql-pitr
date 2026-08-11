@@ -8,7 +8,7 @@ import (
 // schemaVersion is the latest schema version, tracked via PRAGMA user_version.
 // Each migration appends one script that upgrades the previous version to the
 // next; the versioned skeleton leaves room for future scripts.
-const schemaVersion = 1
+const schemaVersion = 2
 
 // schemaV1 is the full platform schema (version 1). Every statement is
 // idempotent (CREATE TABLE IF NOT EXISTS), so re-running is a no-op.
@@ -70,9 +70,29 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 );
 `
 
+// schemaV2 extends v1 with the columns/tables the domain stores (auth/org/
+// agent/audit) need: member join time, agent registration/approval state, the
+// invites table, and the audit entry detail columns. All ALTERs are additive
+// (new columns have defaults), so v1 data is preserved; version tracking
+// guarantees each statement runs exactly once per database.
+const schemaV2 = `
+ALTER TABLE members ADD COLUMN joined_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE agents ADD COLUMN registration_token TEXT NOT NULL DEFAULT '';
+ALTER TABLE agents ADD COLUMN approved INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS invites (
+  code TEXT PRIMARY KEY, org_id TEXT NOT NULL, created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+ALTER TABLE audit_logs ADD COLUMN target_table TEXT NOT NULL DEFAULT '';
+ALTER TABLE audit_logs ADD COLUMN recovery_time TEXT NOT NULL DEFAULT '';
+ALTER TABLE audit_logs ADD COLUMN rows_affected INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE audit_logs ADD COLUMN status TEXT NOT NULL DEFAULT '';
+`
+
 // migrations maps each schema version to its upgrade script.
 var migrations = map[int]string{
 	1: schemaV1,
+	2: schemaV2,
 }
 
 // Migrate idempotently brings db up to the current schema version: applied
