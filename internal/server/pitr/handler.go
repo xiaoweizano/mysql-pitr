@@ -273,6 +273,39 @@ func scanFilterToBinlog(f ws.ScanFilter) binlog.Filter {
 	return out
 }
 
+// binlogFilterToWire converts the persisted binlog.Filter back into the wire
+// ScanFilter for a directed re-scan. The round-trip mirrors scanFilterToBinlog,
+// so the agent receives the same scan constraints the operation record
+// reflects; call sites adjust the result (e.g. set SelectedTxIDs).
+func binlogFilterToWire(f binlog.Filter) ws.ScanFilter {
+	var out ws.ScanFilter
+	for _, t := range f.Tables {
+		out.Tables = append(out.Tables, ws.TableRefJSON{Schema: t.Schema, Table: t.Table})
+	}
+	if f.TimeRange != nil {
+		if !f.TimeRange.Start.IsZero() {
+			out.TimeStart = f.TimeRange.Start.Format(time.RFC3339)
+		}
+		if !f.TimeRange.End.IsZero() {
+			out.TimeEnd = f.TimeRange.End.Format(time.RFC3339)
+		}
+	}
+	if f.GTIDSet != nil {
+		out.GTIDSet = f.GTIDSet.String()
+	}
+	if f.StartPos.Name != "" {
+		out.StartFile = f.StartPos.Name
+		out.StartPos = f.StartPos.Pos
+	}
+	if f.EndPos.Name != "" {
+		out.EndFile = f.EndPos.Name
+		out.EndPos = f.EndPos.Pos
+	}
+	out.MaxRowsPerTx = f.MaxRowsPerTx
+	out.SelectedTxIDs = f.SelectedTxIDs
+	return out
+}
+
 // validateScanFilter rejects filters with unparseable time bounds or GTID sets
 // up front, so the agent never receives a scan it would reject.
 func validateScanFilter(f ws.ScanFilter) error {
@@ -573,6 +606,26 @@ func (h *Handler) HandleStreamEvent(agentID string, cmd ws.Command) {
 		h.bus.Publish(opID, ev)
 
 	case ws.EvScanDone:
+		// Idempotent fallback for the rescan transition race: the agent can
+		// finish the directed second scan (scan_done arrives) before the Select
+		// handler persists the ready -> scanning transition, leaving the op on
+		// disk as ready even though the rescan ran. A ready op is treated as
+		// scanning: the fallback CAS persists scanning (false only when a
+		// concurrent actor already advanced the state), then the scanning ->
+		// ready migration below is CAS-authoritative either way — a lost
+		// fallback never writes a bogus ready.
+		if op.Status == StateReady {
+			op.Status = StateScanning
+			op.UpdatedAt = time.Now()
+			applied, ferr := h.opStore.UpdateIfStatus(op, StateReady)
+			if ferr != nil {
+				log.Printf("pitr: op %s: scan_done fallback: %v", opID, ferr)
+				return
+			}
+			if !applied {
+				log.Printf("pitr: op %s: scan_done fallback lost — operation advanced concurrently", opID)
+			}
+		}
 		// Audit and publish only on a successful transition: a late scan_done
 		// (e.g. after the operator cancelled the scan) must not write a ready
 		// audit or move the terminal state. CAS failure means a concurrent actor
@@ -587,6 +640,11 @@ func (h *Handler) HandleStreamEvent(agentID string, cmd ws.Command) {
 			return
 		}
 		h.appendAudit(op, StateReady, "agent", "")
+		// Selected-mode completion: the directed second scan just staged the
+		// SQL for the selected transactions; persist the statements so Execute
+		// can load them. (sql-mode operations persist at Select time and have
+		// no selection recorded here, so this is a no-op for them.)
+		h.persistSelectedStatements(op)
 		h.bus.Publish(opID, ev)
 
 	case ws.EvProgress:
@@ -992,8 +1050,12 @@ func (h *Handler) Transactions(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Select persists the statements of the chosen transactions and records the
-// selection on the operation. Only `ready` operations can be selected.
+// Select drives the second phase of the recovery flow. In `sql` mode the
+// statements were staged during the first scan, so the selection is persisted
+// locally. In `selected` mode the first scan was metadata-only (no SQL was ever
+// produced), so Select dispatches a directed second scan — see selectRescan —
+// whose sql events populate the preview; scan_done returns the operation to
+// ready and persists the statements. Only `ready` operations can be selected.
 //
 // POST /api/pitr/{id}/select   {"txIds": ["..."]}
 func (h *Handler) Select(w http.ResponseWriter, r *http.Request) {
@@ -1016,6 +1078,11 @@ func (h *Handler) Select(w http.ResponseWriter, r *http.Request) {
 	if op.Status != StateReady {
 		writeError(w, http.StatusConflict,
 			fmt.Sprintf("operation must be in state \"ready\" to select transactions (current state %q)", op.Status))
+		return
+	}
+
+	if op.Mode == "selected" {
+		h.selectRescan(w, r, op, req.TxIDs)
 		return
 	}
 
@@ -1084,6 +1151,131 @@ func (h *Handler) Select(w http.ResponseWriter, r *http.Request) {
 		"selectedTxIds":  req.TxIDs,
 		"statementCount": len(stmts),
 	})
+}
+
+// selectRescan implements the second phase of a selected-mode operation: the
+// operator picked transactions from the metadata preview, so a directed second
+// scan (mode=selected, the original filter carrying the selected transaction
+// IDs) is dispatched to generate the SQL statements the first (meta) scan never
+// produced. The selection is persisted first (so a racing scan_done can save
+// the staged statements), the operation moves ready -> scanning while the
+// rescan runs, and scan_done returns it to ready. A transport failure or agent
+// rejection leaves the operation ready and retryable (no state machine has a
+// ready -> failed transition), matching the Execute path.
+func (h *Handler) selectRescan(w http.ResponseWriter, r *http.Request, op *Operation, txIDs []string) {
+	snap := h.snapshot(op.ID)
+	if snap == nil {
+		writeError(w, http.StatusConflict, "no scan preview available for this operation")
+		return
+	}
+
+	// Every selected transaction must be in the metadata preview (the same
+	// validation the sql-mode path applies).
+	known := make(map[string]bool, len(snap.metas))
+	for _, m := range snap.metas {
+		known[m.TxID] = true
+	}
+	var unknown []string
+	for _, id := range txIDs {
+		if !known[id] {
+			unknown = append(unknown, id)
+		}
+	}
+	if len(unknown) > 0 {
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("transaction(s) not in scan preview: %s", strings.Join(unknown, ", ")))
+		return
+	}
+
+	// Persist the selection before the command goes out so a scan_done racing
+	// the ready -> scanning transition knows which transactions to persist.
+	op.SelectedTxIDs = txIDs
+	op.UpdatedAt = time.Now()
+	if err := h.opStore.Update(op); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	filter := binlogFilterToWire(op.Filter)
+	filter.SelectedTxIDs = txIDs
+	resp, err := h.sendCommand(r.Context(), op.AgentID, ws.Command{
+		Cmd:  op.ID,
+		Type: ws.CmdScan,
+		Params: paramsFrom(ws.ScanRequest{
+			Filter: filter,
+			Mode:   "selected",
+		}),
+	})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("send rescan: %v", err))
+		return
+	}
+	if resp != nil && resp.Status == ws.StatusError {
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("agent rejected rescan: %s", resp.Error))
+		return
+	}
+
+	if ok, err := h.transitionTo(op, StateScanning); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	} else if !ok {
+		writeError(w, http.StatusConflict, "operation state changed concurrently — reload and retry")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"operationId":   op.ID,
+		"status":        op.Status,
+		"rescan":        true,
+		"selectedTxIds": txIDs,
+	})
+}
+
+// persistSelectedStatements saves the SQL staged by a selected-mode rescan for
+// the recorded selection. It runs on scan_done (after the operation returns to
+// ready): the preview's sqlByTx holds the statements emitted by the directed
+// second scan, and they are persisted in the operator's requested order so
+// Execute runs them exactly as selected. It is a no-op for modes that persist
+// at Select time (sql) or that never record a selection. A missing preview or
+// a transaction with no staged SQL is logged and skipped — the selection is
+// persisted as far as the rescan produced statements for it.
+func (h *Handler) persistSelectedStatements(op *Operation) {
+	if op.Mode != "selected" || len(op.SelectedTxIDs) == 0 {
+		return
+	}
+	snap := h.snapshot(op.ID)
+	if snap == nil {
+		log.Printf("pitr: op %s: selected-mode scan_done: no preview to save statements from", op.ID)
+		return
+	}
+	txIndex := make(map[string]int, len(snap.metas))
+	for i, m := range snap.metas {
+		txIndex[m.TxID] = i
+	}
+	var stmts []Statement
+	stmtIdx := 0
+	for _, id := range op.SelectedTxIDs {
+		wires := snap.sqlByTx[id]
+		if len(wires) == 0 {
+			log.Printf("pitr: op %s: selected-mode scan_done: no SQL staged for transaction %s", op.ID, id)
+			continue
+		}
+		for _, w := range wires {
+			stmts = append(stmts, Statement{
+				TxIndex:   txIndex[id],
+				StmtIndex: stmtIdx,
+				SQL:       w.SQL,
+				TxID:      w.TxID,
+				TxOrder:   w.TxOrder,
+				Warnings:  w.Warnings,
+				Status:    "pending",
+			})
+			stmtIdx++
+		}
+	}
+	if err := h.opStore.SaveStatements(op.ID, stmts); err != nil {
+		log.Printf("pitr: op %s: selected-mode scan_done: save statements: %v", op.ID, err)
+	}
 }
 
 // Execute issues CmdExecute with the persisted selected statements, moving a

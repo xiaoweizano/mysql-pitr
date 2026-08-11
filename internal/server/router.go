@@ -68,6 +68,7 @@ func newWebRouter(
 				r.Post("/approve", agentHandler.Approve)
 				r.Post("/reject", agentHandler.Reject)
 				r.Get("/", agentHandler.Get)
+				r.Get("/archive", agentHandler.ArchiveStatus)
 			})
 		})
 
@@ -148,7 +149,7 @@ func NewRouter() *chi.Mux {
 
 	authHandler := auth.NewHandler(userStore, jwtSecret)
 	orgHandler := org.NewHandler(orgStore, userStore, jwtSecret)
-	agentHandler := agent.NewHandler(agentStore, orgStore, jwtSecret)
+	agentHandler := agent.NewHandler(agentStore, orgStore, jwtSecret, nil)
 	pitrHandler := pitr.NewHandler(pitrStore, agentStore, orgStore, auditStore, pitr.NewEventBus(), nil, jwtSecret)
 	auditHandler := audit.NewHandler(auditStore, orgStore, jwtSecret)
 

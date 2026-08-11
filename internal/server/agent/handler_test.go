@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 
 	"github.com/a-shan/mysql-pitr/internal/server/auth"
 	"github.com/a-shan/mysql-pitr/internal/server/org"
+	"github.com/a-shan/mysql-pitr/internal/ws"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -27,13 +29,53 @@ func withChiURLParam(r *http.Request, key, value string) *http.Request {
 
 // test helpers
 
+// fakeCommander implements the archive endpoint's AgentCommander: it records
+// every dispatched command and lets tests control connectivity, transport
+// errors, and the agent's response payload.
+type fakeCommander struct {
+	mu        sync.Mutex
+	connected bool
+	sendErr   error
+	agentErr  string
+	result    interface{}
+	sent      []ws.Command
+}
+
+func (f *fakeCommander) IsConnected(agentID string) bool { return f.connected }
+
+func (f *fakeCommander) SendToAgent(ctx context.Context, agentID string, cmd ws.Command) (*ws.Response, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sent = append(f.sent, cmd)
+	if f.sendErr != nil {
+		return nil, f.sendErr
+	}
+	if f.agentErr != "" {
+		return &ws.Response{Cmd: cmd.Cmd, Status: ws.StatusError, Error: f.agentErr}, nil
+	}
+	return &ws.Response{Cmd: cmd.Cmd, Status: ws.StatusOK, Result: f.result}, nil
+}
+
+func (f *fakeCommander) commands() []ws.Command {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]ws.Command(nil), f.sent...)
+}
+
 func setupAgentTest(t *testing.T) (*Handler, *InMemoryAgentStore, *org.InMemoryOrgStore, *auth.InMemoryUserStore, []byte) {
+	t.Helper()
+	return setupAgentTestWithCommander(t, &fakeCommander{connected: true})
+}
+
+// setupAgentTestWithCommander wires a Handler with an explicit commander for
+// endpoints that talk to the agent hub (e.g. archive status).
+func setupAgentTestWithCommander(t *testing.T, commander AgentCommander) (*Handler, *InMemoryAgentStore, *org.InMemoryOrgStore, *auth.InMemoryUserStore, []byte) {
 	t.Helper()
 	agentStore := NewInMemoryAgentStore()
 	orgStore := org.NewInMemoryOrgStore()
 	userStore := auth.NewInMemoryUserStore()
 	secret := []byte("agent-test-secret")
-	handler := NewHandler(agentStore, orgStore, secret)
+	handler := NewHandler(agentStore, orgStore, secret, commander)
 	return handler, agentStore, orgStore, userStore, secret
 }
 
@@ -301,4 +343,85 @@ func TestGetAgent_NotFound(t *testing.T) {
 	w := httptest.NewRecorder()
 	h.Get(w, req)
 	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+// ---------- ArchiveStatus ----------
+
+func TestArchiveStatus_Online(t *testing.T) {
+	// The agent's archive loop answers with a collector.State (delivered by the
+	// hub as a decoded map with the agent's snake_case keys); the endpoint maps
+	// it to the camelCase archive JSON contract.
+	fake := &fakeCommander{connected: true, result: map[string]interface{}{
+		"last_file":  "mysql-bin.000008",
+		"last_pos":   float64(1024),
+		"last_gtid":  "c84e7f4a-3d1c-11ee-ba6b-00155d000001",
+		"updated_at": "2026-07-08T12:00:00Z",
+	}}
+	h, agentStore, orgStore, userStore, secret := setupAgentTestWithCommander(t, fake)
+	adminID := createTestUser(t, userStore)
+	o := createTestOrg(t, orgStore, adminID)
+	agent := &AgentRecord{OrgID: o.ID, Hostname: "db-1"}
+	require.NoError(t, agentStore.Create(agent))
+
+	req := authenticatedRequest(t, http.MethodGet,
+		"/api/agents/"+agent.ID+"/archive", nil, adminID, secret)
+	req = withChiURLParam(req, "id", agent.ID)
+	w := httptest.NewRecorder()
+	h.ArchiveStatus(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	cmds := fake.commands()
+	require.Len(t, cmds, 1)
+	assert.Equal(t, ws.CmdArchiveStatus, cmds[0].Type)
+	assert.Equal(t, agent.ID, cmds[0].Cmd, "archive status is correlated by agent id")
+
+	var resp struct {
+		LastFile  string    `json:"lastFile"`
+		LastPos   uint32    `json:"lastPos"`
+		LastGTID  string    `json:"lastGtid"`
+		UpdatedAt time.Time `json:"updatedAt"`
+	}
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.Equal(t, "mysql-bin.000008", resp.LastFile)
+	assert.Equal(t, uint32(1024), resp.LastPos)
+	assert.Equal(t, "c84e7f4a-3d1c-11ee-ba6b-00155d000001", resp.LastGTID)
+	assert.Equal(t, "2026-07-08T12:00:00Z", resp.UpdatedAt.Format(time.RFC3339))
+}
+
+func TestArchiveStatus_Offline(t *testing.T) {
+	// An offline agent cannot answer archive status: 503, no command sent.
+	fake := &fakeCommander{connected: false}
+	h, agentStore, orgStore, userStore, secret := setupAgentTestWithCommander(t, fake)
+	adminID := createTestUser(t, userStore)
+	o := createTestOrg(t, orgStore, adminID)
+	agent := &AgentRecord{OrgID: o.ID, Hostname: "db-1"}
+	require.NoError(t, agentStore.Create(agent))
+
+	req := authenticatedRequest(t, http.MethodGet,
+		"/api/agents/"+agent.ID+"/archive", nil, adminID, secret)
+	req = withChiURLParam(req, "id", agent.ID)
+	w := httptest.NewRecorder()
+	h.ArchiveStatus(w, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	require.Empty(t, fake.commands(), "no archive command to an offline agent")
+}
+
+func TestArchiveStatus_NotMember(t *testing.T) {
+	fake := &fakeCommander{connected: true}
+	h, agentStore, orgStore, userStore, secret := setupAgentTestWithCommander(t, fake)
+	adminID := createTestUser(t, userStore)
+	otherID := createTestUser(t, userStore)
+	o := createTestOrg(t, orgStore, adminID)
+	agent := &AgentRecord{OrgID: o.ID, Hostname: "db-1"}
+	require.NoError(t, agentStore.Create(agent))
+
+	req := authenticatedRequest(t, http.MethodGet,
+		"/api/agents/"+agent.ID+"/archive", nil, otherID, secret)
+	req = withChiURLParam(req, "id", agent.ID)
+	w := httptest.NewRecorder()
+	h.ArchiveStatus(w, req)
+
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	require.Empty(t, fake.commands(), "no archive command for a non-member")
 }

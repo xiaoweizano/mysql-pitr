@@ -35,7 +35,7 @@ const (
 //
 //	created   -> {scanning, blocked, failed}
 //	scanning  -> {ready, failed, cancelled, blocked}
-//	ready     -> {executing, cancelled}
+//	ready     -> {executing, cancelled, scanning}
 //	executing <-> paused; executing -> {done, failed, blocked}
 //	paused    -> {executing, cancelled}
 //
@@ -43,14 +43,19 @@ const (
 // longer make progress; the operation is blocked (terminal) and the operator
 // starts a new attempt after the agent reconnects.
 //
+// ready -> scanning: the operator selected transactions on a selected-mode
+// operation, so a directed second scan (SELECTED_SQL) runs to generate the SQL
+// statements the metadata-only first scan never produced; scan_done returns
+// the operation to ready.
+//
 // Terminal states (done, failed, cancelled, blocked) are not included as
 // sources since no transition is valid from them.
 var validTransitions = map[OperationState][]OperationState{
-	StateCreated:  {StateScanning, StateBlocked, StateFailed},
-	StateScanning: {StateReady, StateFailed, StateCancelled, StateBlocked},
-	StateReady:    {StateExecuting, StateCancelled},
+	StateCreated:   {StateScanning, StateBlocked, StateFailed},
+	StateScanning:  {StateReady, StateFailed, StateCancelled, StateBlocked},
+	StateReady:     {StateExecuting, StateCancelled, StateScanning},
 	StateExecuting: {StatePaused, StateDone, StateFailed, StateBlocked},
-	StatePaused:   {StateExecuting, StateCancelled},
+	StatePaused:    {StateExecuting, StateCancelled},
 }
 
 // TransitionValid checks whether moving from current state `from` to new state

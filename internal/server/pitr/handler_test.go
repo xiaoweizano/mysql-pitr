@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/a-shan/mysql-pitr/internal/binlog"
 	"github.com/a-shan/mysql-pitr/internal/server/agent"
 	"github.com/a-shan/mysql-pitr/internal/server/audit"
 	"github.com/a-shan/mysql-pitr/internal/server/auth"
@@ -1111,6 +1112,164 @@ func TestSelect_NoSQLPreview(t *testing.T) {
 	w := httptest.NewRecorder()
 	f.handler.Select(w, req)
 	assert.Equal(t, http.StatusConflict, w.Code)
+}
+
+func TestSelect_SelectedMode_TriggersRescan(t *testing.T) {
+	// Phase 3 gap: a selected-mode operation's first scan is metadata-only, so
+	// no SQL is ever staged for Select. The second phase dispatches a directed
+	// rescan (mode=selected, original filter carrying selectedTxIds) whose sql
+	// events populate the preview; scan_done returns the operation to ready and
+	// persists the staged statements.
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	op := f.createOp(t, "op_rescan", orgID, agentID, StateReady)
+	op.Mode = "selected"
+	op.Filter = binlog.Filter{
+		Tables:       []binlog.TableRef{{Schema: "shop", Table: "orders"}},
+		MaxRowsPerTx: 500,
+	}
+	require.NoError(t, f.opStore.Update(op))
+
+	// First scan: metadata only (no sql events — the Phase 3 gap).
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvTxMeta, txMetaData("aaa:1", "2026-07-08T12:00:00Z", 2))
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvTxMeta, txMetaData("aaa:2", "2026-07-08T12:01:00Z", 1))
+
+	req := f.authenticatedRouteRequest(t, http.MethodPost, "/api/pitr/op_rescan/select", "op_rescan",
+		map[string]interface{}{"txIds": []string{"aaa:1", "aaa:2"}}, userID)
+	w := httptest.NewRecorder()
+	f.handler.Select(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	// The directed second scan is dispatched: mode=selected, the original
+	// filter carrying the selected transaction IDs, command ID == operation ID.
+	cmds := f.commander.commands()
+	require.Len(t, cmds, 1)
+	scan := cmds[0]
+	assert.Equal(t, ws.CmdScan, scan.Type)
+	assert.Equal(t, op.ID, scan.Cmd)
+	var scanReq ws.ScanRequest
+	decodeParams(t, scan, &scanReq)
+	assert.Equal(t, "selected", scanReq.Mode)
+	require.Len(t, scanReq.Filter.Tables, 1)
+	assert.Equal(t, "shop", scanReq.Filter.Tables[0].Schema)
+	assert.Equal(t, "orders", scanReq.Filter.Tables[0].Table)
+	assert.Equal(t, 500, scanReq.Filter.MaxRowsPerTx)
+	assert.Equal(t, []string{"aaa:1", "aaa:2"}, scanReq.Filter.SelectedTxIDs)
+
+	// The operation moved ready -> scanning for the rescan, and the selection
+	// is recorded so scan_done can persist the staged statements.
+	got, err := f.opStore.Get(op.ID)
+	require.NoError(t, err)
+	assert.Equal(t, StateScanning, got.Status)
+	assert.Equal(t, []string{"aaa:1", "aaa:2"}, got.SelectedTxIDs)
+
+	// Second scan: sql events for the selected transactions.
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvSQL, []ws.StatementWire{
+		{SQL: "DELETE FROM shop.orders WHERE id=1", TxID: "aaa:1", TxOrder: 0},
+		{SQL: "DELETE FROM shop.orders WHERE id=2", TxID: "aaa:1", TxOrder: 1},
+		{SQL: "DELETE FROM shop.orders WHERE id=3", TxID: "aaa:2", TxOrder: 0},
+	})
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvScanDone, map[string]interface{}{})
+
+	// scan_done returns the operation to ready with the statements persisted.
+	got, err = f.opStore.Get(op.ID)
+	require.NoError(t, err)
+	assert.Equal(t, StateReady, got.Status)
+
+	stmts, err := f.opStore.LoadStatements(op.ID)
+	require.NoError(t, err)
+	require.Len(t, stmts, 3)
+	assert.Equal(t, "DELETE FROM shop.orders WHERE id=1", stmts[0].SQL)
+	assert.Equal(t, 0, stmts[0].TxIndex)
+	assert.Equal(t, 0, stmts[0].StmtIndex)
+	assert.Equal(t, "DELETE FROM shop.orders WHERE id=2", stmts[1].SQL)
+	assert.Equal(t, 1, stmts[1].StmtIndex)
+	assert.Equal(t, "DELETE FROM shop.orders WHERE id=3", stmts[2].SQL)
+	assert.Equal(t, 1, stmts[2].TxIndex)
+	assert.Equal(t, 2, stmts[2].StmtIndex)
+}
+
+func TestSelect_SelectedMode_UnknownTxID_NoRescan(t *testing.T) {
+	// The rescan path validates the selection against the metadata preview
+	// exactly like the sql path: unknown transaction IDs are rejected before
+	// any command goes out.
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	op := f.createOp(t, "op_rescan_unknown", orgID, agentID, StateReady)
+	op.Mode = "selected"
+	require.NoError(t, f.opStore.Update(op))
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvTxMeta, txMetaData("aaa:1", "2026-07-08T12:00:00Z", 2))
+
+	req := f.authenticatedRouteRequest(t, http.MethodPost, "/api/pitr/op_rescan_unknown/select", "op_rescan_unknown",
+		map[string]interface{}{"txIds": []string{"aaa:9"}}, userID)
+	w := httptest.NewRecorder()
+	f.handler.Select(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	require.Empty(t, f.commander.commands(), "no rescan for a selection containing unknown transactions")
+}
+
+func TestSelect_SqlMode_StaysCurrent(t *testing.T) {
+	// The sql-mode select path is untouched: the statements were staged during
+	// the first scan, so Select persists them locally without dispatching any
+	// second command, and the operation stays ready.
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	op := f.createOp(t, "op_sqlsel", orgID, agentID, StateReady)
+
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvTxMeta, txMetaData("aaa:1", "2026-07-08T12:00:00Z", 2))
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvSQL, []ws.StatementWire{
+		{SQL: "DELETE FROM shop.orders WHERE id=1", TxID: "aaa:1", TxOrder: 0},
+	})
+
+	req := f.authenticatedRouteRequest(t, http.MethodPost, "/api/pitr/op_sqlsel/select", "op_sqlsel",
+		map[string]interface{}{"txIds": []string{"aaa:1"}}, userID)
+	w := httptest.NewRecorder()
+	f.handler.Select(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	require.Empty(t, f.commander.commands(), "sql-mode select is local — no agent command")
+
+	stmts, err := f.opStore.LoadStatements(op.ID)
+	require.NoError(t, err)
+	require.Len(t, stmts, 1)
+	assert.Equal(t, "DELETE FROM shop.orders WHERE id=1", stmts[0].SQL)
+
+	got, err := f.opStore.Get(op.ID)
+	require.NoError(t, err)
+	assert.Equal(t, StateReady, got.Status)
+}
+
+func TestScanDone_IdempotentFallback(t *testing.T) {
+	// Rescan race (T2 carry-in): the agent finishes the directed second scan
+	// (scan_done arrives) before the Select handler persists the ready ->
+	// scanning transition, leaving the op on disk as ready even though the
+	// rescan ran. A ready op is treated as scanning: the fallback CAS lands
+	// scanning, then the scanning -> ready migration completes normally with
+	// exactly one ready audit.
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	op := f.createOp(t, "op_fallback", orgID, agentID, StateReady)
+	op.Mode = "selected"
+	require.NoError(t, f.opStore.Update(op))
+
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvScanDone, map[string]interface{}{})
+
+	got, err := f.opStore.Get(op.ID)
+	require.NoError(t, err)
+	assert.Equal(t, StateReady, got.Status, "scan_done to a ready op must fall back to scanning then ready")
+
+	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "exactly one ready audit")
+	assert.Equal(t, "ready", entries[0].Status)
 }
 
 func TestSelect_NotMember(t *testing.T) {

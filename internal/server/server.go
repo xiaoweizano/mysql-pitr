@@ -90,7 +90,7 @@ func newServer(dataDir string, commander pitr.AgentCommander) (*Server, error) {
 	// ---- handlers ----
 	authHandler := auth.NewHandler(userStore, jwtSecret())
 	orgHandler := org.NewHandler(orgStore, userStore, jwtSecret())
-	agentHandler := agent.NewHandler(agentStore, orgStore, jwtSecret())
+	agentHandler := agent.NewHandler(agentStore, orgStore, jwtSecret(), agentHub)
 	pitrBus := pitr.NewEventBus()
 	if commander == nil {
 		commander = agentHub
