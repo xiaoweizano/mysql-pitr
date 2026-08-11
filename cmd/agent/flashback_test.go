@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,19 +23,19 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Mock connector
+// Fakes
 // ---------------------------------------------------------------------------
 
+// mockConnector is a Connector that returns canned results. AsDB returns a
+// recordingDB so the execute path can be verified without a live MySQL server.
 type mockConnector struct {
 	connectErr      error
 	preflightResult *connector.PreflightResult
 	preflightErr    error
-	binlogFiles     []connector.BinlogFile
-	binlogErr       error
-	parseResult     *connector.ParseResult
-	parseErr        error
-	execResult      *connector.ExecResult
-	execErr         error
+	binlogDir       string
+	binlogDirErr    error
+	schemas         map[string]binlog.TableSchema // "schema.table" -> schema
+	db              *recordingDB
 	closeCalled     bool
 }
 
@@ -42,19 +44,25 @@ func (m *mockConnector) Connect(cfg connector.ConnConfig) error {
 }
 
 func (m *mockConnector) GetBinlogFiles(ctx context.Context) ([]connector.BinlogFile, error) {
-	return m.binlogFiles, m.binlogErr
+	return nil, nil
 }
 
 func (m *mockConnector) GetBinlogDir(ctx context.Context) (string, error) {
+	if m.binlogDirErr != nil {
+		return "", m.binlogDirErr
+	}
+	if m.binlogDir != "" {
+		return m.binlogDir, nil
+	}
 	return "/var/lib/mysql/", nil
 }
 
 func (m *mockConnector) ParseBinlog(ctx context.Context, req connector.ParseRequest) (*connector.ParseResult, error) {
-	return m.parseResult, m.parseErr
+	return nil, nil
 }
 
 func (m *mockConnector) ExecuteRollback(ctx context.Context, sqls []string, opts connector.ExecOptions) (*connector.ExecResult, error) {
-	return m.execResult, m.execErr
+	return nil, nil
 }
 
 func (m *mockConnector) Preflight(ctx context.Context) (*connector.PreflightResult, error) {
@@ -62,26 +70,98 @@ func (m *mockConnector) Preflight(ctx context.Context) (*connector.PreflightResu
 }
 
 func (m *mockConnector) FetchSchema(ctx context.Context, schema, table string) (binlog.TableSchema, error) {
-	return binlog.TableSchema{Schema: schema, Table: table}, nil
+	if m.schemas != nil {
+		if sch, ok := m.schemas[schema+"."+table]; ok {
+			return sch, nil
+		}
+	}
+	return binlog.TableSchema{}, fmt.Errorf("mock: no schema for %s.%s", schema, table)
 }
 
-func (m *mockConnector) AsDB() executor.DB { return nil }
+func (m *mockConnector) AsDB() executor.DB {
+	if m.db == nil {
+		m.db = &recordingDB{}
+	}
+	return m.db
+}
 
 func (m *mockConnector) Close() error {
 	m.closeCalled = true
 	return nil
 }
 
-// withFakeParse substitutes the mysqlbinlog parse seam for the duration of a
-// test, returning a fake result so flashback orchestration can be tested
-// without a live MySQL server.
-func withFakeParse(t *testing.T, result *connector.ParseResult, parseErr error) {
-	t.Helper()
-	orig := mysqlbinlogParse
-	mysqlbinlogParse = func(cfg connector.ConnConfig, paths []string, opts binlogParseOpts) (*connector.ParseResult, error) {
-		return result, parseErr
+// recordingDB records the SQL executed through the executor path.
+type recordingDB struct {
+	executed []string
+	commits  int
+}
+
+type recordingResult struct{}
+
+func (recordingResult) LastInsertId() (int64, error) { return 0, nil }
+func (recordingResult) RowsAffected() (int64, error) { return 1, nil }
+
+type recordingTx struct{ db *recordingDB }
+
+func (t *recordingTx) Exec(query string, args ...interface{}) (executor.Result, error) {
+	t.db.executed = append(t.db.executed, query)
+	return recordingResult{}, nil
+}
+func (t *recordingTx) Commit() error {
+	t.db.commits++
+	return nil
+}
+func (t *recordingTx) Rollback() error { return nil }
+
+func (d *recordingDB) Exec(query string, args ...interface{}) (executor.Result, error) {
+	d.executed = append(d.executed, query)
+	return recordingResult{}, nil
+}
+func (d *recordingDB) Begin() (executor.Tx, error) { return &recordingTx{db: d}, nil }
+func (d *recordingDB) Close() error                { return nil }
+
+// fakeScanner is a binlog.Scanner that yields canned transactions.
+type fakeScanner struct {
+	txs        []*binlog.Transaction
+	scanErr    error
+	nextErr    error
+	filter     binlog.Filter
+	scanCalled bool
+	closed     bool
+}
+
+func (f *fakeScanner) Scan(ctx context.Context, filter binlog.Filter) error {
+	f.scanCalled = true
+	f.filter = filter
+	return f.scanErr
+}
+
+func (f *fakeScanner) Next() (*binlog.Transaction, error) {
+	if f.nextErr != nil {
+		return nil, f.nextErr
 	}
-	t.Cleanup(func() { mysqlbinlogParse = orig })
+	if len(f.txs) == 0 {
+		return nil, io.EOF
+	}
+	tx := f.txs[0]
+	f.txs = f.txs[1:]
+	return tx, nil
+}
+
+func (f *fakeScanner) Close() error {
+	f.closed = true
+	return nil
+}
+
+// withFakeScanner substitutes the binlog scanner seam for the duration of a
+// test so RunFlashback can be exercised without a live binlog directory.
+func withFakeScanner(t *testing.T, fs *fakeScanner) {
+	t.Helper()
+	orig := newBinlogScanner
+	newBinlogScanner = func(sf binlog.SchemaFetcher, opts ...binlog.Option) binlog.Scanner {
+		return fs
+	}
+	t.Cleanup(func() { newBinlogScanner = orig })
 }
 
 // defaultMock creates a mock connector configured for a successful flashback.
@@ -95,48 +175,75 @@ func defaultMock() *mockConnector {
 				{Name: "Binlog Format", Status: connector.PreflightPass},
 				{Name: "Binary Logging Enabled", Status: connector.PreflightPass},
 				{Name: "User Privileges", Status: connector.PreflightPass},
-				{Name: "Database Size", Status: connector.PreflightPass},
-				{Name: "Column Metadata", Status: connector.PreflightPass},
-				{Name: "Foreign Key Dependencies", Status: connector.PreflightPass},
 			},
 		},
-		binlogFiles: []connector.BinlogFile{
-			{Name: "mysql-bin.000001", Size: 1024},
-			{Name: "mysql-bin.000002", Size: 2048},
-		},
-		parseResult: &connector.ParseResult{
-			TotalRows: 2,
-			Events: []connector.RowEvent{
-				{
-					Type:      connector.InsertEvent,
-					Database:  "mydb",
-					Table:     "orders",
-					Timestamp: time.Date(2024, 1, 15, 10, 0, 0, 0, time.UTC),
-					After: map[string]interface{}{
-						"id":   int64(1),
-						"name": "widget",
-					},
-				},
-				{
-					Type:      connector.UpdateEvent,
-					Database:  "mydb",
-					Table:     "orders",
-					Timestamp: time.Date(2024, 1, 15, 10, 5, 0, 0, time.UTC),
-					Before: map[string]interface{}{
-						"id":   int64(1),
-						"name": "widget",
-					},
-					After: map[string]interface{}{
-						"id":   int64(1),
-						"name": "gadget",
-					},
-				},
+		schemas: ordersSchema(),
+	}
+}
+
+// ordersSchema is the mydb.orders column metadata used by fixtures.
+func ordersSchema() map[string]binlog.TableSchema {
+	return map[string]binlog.TableSchema{
+		"mydb.orders": {
+			Schema: "mydb",
+			Table:  "orders",
+			Columns: []binlog.ColumnDef{
+				{Name: "id"},
+				{Name: "name"},
 			},
 		},
-		execResult: &connector.ExecResult{
-			RowsAffected:     2,
-			BatchesCompleted: 1,
+	}
+}
+
+// flashbackFixture returns one transaction containing an INSERT then an UPDATE
+// on mydb.orders. reverse.Generate emits LIFO: the UPDATE reversal first, then
+// the INSERT reversal.
+func flashbackFixture() []*binlog.Transaction {
+	tx, err := binlog.NewTransaction(
+		"11111111-1111-1111-1111-111111111111:1", 0,
+		time.Date(2024, 1, 15, 10, 30, 0, 0, time.UTC), "mydb")
+	if err != nil {
+		panic(err)
+	}
+	tx.Statements = []binlog.RowChange{
+		{
+			Schema: "mydb", Table: "orders", Action: binlog.ActionInsert,
+			After: []interface{}{int64(1), "widget"},
 		},
+		{
+			Schema: "mydb", Table: "orders", Action: binlog.ActionUpdate,
+			Before: []interface{}{int64(1), "widget"},
+			After:  []interface{}{int64(1), "gadget"},
+		},
+	}
+	return []*binlog.Transaction{&tx}
+}
+
+// expected fixture SQL, in LIFO generation order (UPDATE reversal first).
+var (
+	fixtureUpdateSQL = "UPDATE `mydb`.`orders` SET `id` = 1, `name` = 'widget' WHERE `id` = 1 AND `name` = 'gadget'"
+	fixtureDeleteSQL = "DELETE FROM `mydb`.`orders` WHERE `id` = 1 AND `name` = 'widget'"
+)
+
+// captureStdout redirects os.Stdout for the duration of the test and returns a
+// function that restores it and returns everything printed.
+func captureStdout(t *testing.T) func() string {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	os.Stdout = w
+
+	out := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(r)
+		out <- string(b)
+	}()
+
+	return func() string {
+		_ = w.Close()
+		os.Stdout = old
+		return <-out
 	}
 }
 
@@ -190,24 +297,31 @@ func TestFlashbackCommand_ValidatesRequiredFlags(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Test: RunFlashback with mock
+// Test: RunFlashback with mock connector + fake scanner
 // ---------------------------------------------------------------------------
 
 func TestRunFlashback_DryRun(t *testing.T) {
 	mock := defaultMock()
-	withFakeParse(t, mock.parseResult, nil)
+	fs := &fakeScanner{txs: flashbackFixture()}
+	withFakeScanner(t, fs)
 	opts := FlashbackOptions{
 		Connector:    mock,
-		DSN:          "root:pass@tcp(127.0.0.1:3306)/mydb",
 		TargetTable:  "mydb.orders",
 		RecoveryTime: "2024-01-15T11:00:00Z",
 		DryRun:       true,
 		BatchSize:    1000,
 	}
 
+	gotStdout := captureStdout(t)
 	err := RunFlashback(context.Background(), opts)
 	require.NoError(t, err)
+	output := gotStdout()
+
 	assert.True(t, mock.closeCalled, "connector should be closed")
+	assert.True(t, fs.scanCalled)
+	assert.True(t, fs.closed)
+	assert.Contains(t, output, fixtureUpdateSQL+";")
+	assert.Contains(t, output, fixtureDeleteSQL+";")
 }
 
 func TestRunFlashback_OutputFile(t *testing.T) {
@@ -215,10 +329,10 @@ func TestRunFlashback_OutputFile(t *testing.T) {
 	outputPath := filepath.Join(dir, "rollback.sql")
 
 	mock := defaultMock()
-	withFakeParse(t, mock.parseResult, nil)
+	fs := &fakeScanner{txs: flashbackFixture()}
+	withFakeScanner(t, fs)
 	opts := FlashbackOptions{
 		Connector:    mock,
-		DSN:          "root:pass@tcp(127.0.0.1:3306)/mydb",
 		TargetTable:  "mydb.orders",
 		RecoveryTime: "2024-01-15T11:00:00Z",
 		OutputFile:   outputPath,
@@ -232,16 +346,16 @@ func TestRunFlashback_OutputFile(t *testing.T) {
 	data, err := os.ReadFile(outputPath)
 	require.NoError(t, err)
 	content := string(data)
-	assert.Contains(t, content, "DELETE FROM")
-	assert.Contains(t, content, "UPDATE")
+	assert.Contains(t, content, fixtureUpdateSQL+";")
+	assert.Contains(t, content, fixtureDeleteSQL+";")
 }
 
 func TestRunFlashback_Execute(t *testing.T) {
 	mock := defaultMock()
-	withFakeParse(t, mock.parseResult, nil)
+	fs := &fakeScanner{txs: flashbackFixture()}
+	withFakeScanner(t, fs)
 	opts := FlashbackOptions{
 		Connector:    mock,
-		DSN:          "root:pass@tcp(127.0.0.1:3306)/mydb",
 		TargetTable:  "mydb.orders",
 		RecoveryTime: "2024-01-15T11:00:00Z",
 		BatchSize:    1000,
@@ -249,6 +363,34 @@ func TestRunFlashback_Execute(t *testing.T) {
 
 	err := RunFlashback(context.Background(), opts)
 	require.NoError(t, err)
+
+	// Both statements executed in LIFO order via a single committed batch.
+	require.NotNil(t, mock.db)
+	assert.Equal(t, []string{fixtureUpdateSQL, fixtureDeleteSQL}, mock.db.executed)
+	assert.Equal(t, 1, mock.db.commits)
+}
+
+func TestRunFlashback_BuildsCorrectFilter(t *testing.T) {
+	mock := defaultMock()
+	fs := &fakeScanner{txs: flashbackFixture()}
+	withFakeScanner(t, fs)
+
+	recoveryTime := time.Date(2024, 1, 15, 11, 0, 0, 0, time.UTC)
+	opts := FlashbackOptions{
+		Connector:    mock,
+		TargetTable:  "mydb.orders",
+		RecoveryTime: recoveryTime.Format(time.RFC3339),
+		DryRun:       true,
+	}
+
+	err := RunFlashback(context.Background(), opts)
+	require.NoError(t, err)
+
+	require.True(t, fs.scanCalled)
+	assert.Equal(t, "/var/lib/mysql/", fs.filter.BinlogDir)
+	assert.Equal(t, []binlog.TableRef{{Schema: "mydb", Table: "orders"}}, fs.filter.Tables)
+	require.NotNil(t, fs.filter.TimeRange)
+	assert.Equal(t, recoveryTime, fs.filter.TimeRange.End)
 }
 
 func TestRunFlashback_PreflightFail(t *testing.T) {
@@ -263,7 +405,6 @@ func TestRunFlashback_PreflightFail(t *testing.T) {
 
 	opts := FlashbackOptions{
 		Connector:    mock,
-		DSN:          "root:pass@tcp(127.0.0.1:3306)/mydb",
 		TargetTable:  "mydb.orders",
 		RecoveryTime: "2024-01-15T11:00:00Z",
 	}
@@ -273,45 +414,57 @@ func TestRunFlashback_PreflightFail(t *testing.T) {
 	assert.Contains(t, err.Error(), "preflight FAILED")
 }
 
-func TestRunFlashback_NoEvents(t *testing.T) {
+func TestRunFlashback_NoTransactions(t *testing.T) {
 	mock := defaultMock()
-	withFakeParse(t, &connector.ParseResult{
-		TotalRows: 0,
-		Events:    []connector.RowEvent{},
-	}, nil)
+	withFakeScanner(t, &fakeScanner{txs: nil})
 
 	opts := FlashbackOptions{
 		Connector:    mock,
-		DSN:          "root:pass@tcp(127.0.0.1:3306)/mydb",
 		TargetTable:  "mydb.orders",
 		RecoveryTime: "2024-01-15T11:00:00Z",
 	}
 
 	err := RunFlashback(context.Background(), opts)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "no row events found")
+	assert.Contains(t, err.Error(), "no transactions found")
 }
 
-func TestRunFlashback_NoBinlogs(t *testing.T) {
+func TestRunFlashback_ScanError(t *testing.T) {
 	mock := defaultMock()
-	mock.binlogFiles = []connector.BinlogFile{}
+	withFakeScanner(t, &fakeScanner{scanErr: errors.New("binlog file corrupted")})
 
 	opts := FlashbackOptions{
 		Connector:    mock,
-		DSN:          "root:pass@tcp(127.0.0.1:3306)/mydb",
 		TargetTable:  "mydb.orders",
 		RecoveryTime: "2024-01-15T11:00:00Z",
+		DryRun:       true,
 	}
 
 	err := RunFlashback(context.Background(), opts)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "no binlog files found")
+	assert.Contains(t, err.Error(), "scan")
+}
+
+func TestRunFlashback_NextError(t *testing.T) {
+	mock := defaultMock()
+	withFakeScanner(t, &fakeScanner{nextErr: errors.New("parse failure")})
+
+	opts := FlashbackOptions{
+		Connector:    mock,
+		TargetTable:  "mydb.orders",
+		RecoveryTime: "2024-01-15T11:00:00Z",
+		DryRun:       true,
+	}
+
+	err := RunFlashback(context.Background(), opts)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "scan next")
 }
 
 func TestRunFlashback_ConnectorProvided(t *testing.T) {
 	// When using a pre-injected connector, DSN is not required.
 	mock := defaultMock()
-	withFakeParse(t, mock.parseResult, nil)
+	withFakeScanner(t, &fakeScanner{txs: flashbackFixture()})
 	opts := FlashbackOptions{
 		Connector:    mock,
 		TargetTable:  "mydb.orders",
@@ -327,7 +480,6 @@ func TestRunFlashback_InvalidRecoveryTime(t *testing.T) {
 	mock := defaultMock()
 	opts := FlashbackOptions{
 		Connector:    mock,
-		DSN:          "root:pass@tcp(127.0.0.1:3306)/mydb",
 		TargetTable:  "mydb.orders",
 		RecoveryTime: "not-a-timestamp",
 		DryRun:       true,
@@ -336,6 +488,39 @@ func TestRunFlashback_InvalidRecoveryTime(t *testing.T) {
 	err := RunFlashback(context.Background(), opts)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "parse recovery-time")
+}
+
+func TestRunFlashback_InvalidTargetTable(t *testing.T) {
+	mock := defaultMock()
+	withFakeScanner(t, &fakeScanner{})
+
+	opts := FlashbackOptions{
+		Connector:    mock,
+		TargetTable:  "orders", // missing schema part
+		RecoveryTime: "2024-01-15T11:00:00Z",
+		DryRun:       true,
+	}
+
+	err := RunFlashback(context.Background(), opts)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "must be schema.table")
+}
+
+// ---------------------------------------------------------------------------
+// Test: splitTableRef
+// ---------------------------------------------------------------------------
+
+func TestSplitTableRef(t *testing.T) {
+	schema, table, err := splitTableRef("mydb.orders")
+	require.NoError(t, err)
+	assert.Equal(t, "mydb", schema)
+	assert.Equal(t, "orders", table)
+
+	for _, bad := range []string{"orders", ".orders", "mydb.", ""} {
+		_, _, err := splitTableRef(bad)
+		assert.Error(t, err, "expected error for %q", bad)
+		assert.Contains(t, err.Error(), "must be schema.table")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -445,72 +630,4 @@ func TestNewRootCommand_HasFlashbackSubcommand(t *testing.T) {
 	assert.NotNil(t, flashbackCmd.Flags().Lookup("mysql-dsn"))
 	assert.NotNil(t, flashbackCmd.Flags().Lookup("target-table"))
 	assert.NotNil(t, flashbackCmd.Flags().Lookup("recovery-time"))
-}
-
-// ---------------------------------------------------------------------------
-// Test: Error reporting edge cases
-// ---------------------------------------------------------------------------
-
-func TestRunFlashback_ParseError(t *testing.T) {
-	mock := defaultMock()
-	withFakeParse(t, nil, errors.New("binlog file corrupted"))
-
-	opts := FlashbackOptions{
-		Connector:    mock,
-		DSN:          "root:pass@tcp(127.0.0.1:3306)/mydb",
-		TargetTable:  "mydb.orders",
-		RecoveryTime: "2024-01-15T11:00:00Z",
-		DryRun:       true,
-	}
-
-	err := RunFlashback(context.Background(), opts)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "parse binlogs")
-}
-
-// ---------------------------------------------------------------------------
-// Test: mysqlbinlog datetime formatting (timezone handling)
-// ---------------------------------------------------------------------------
-
-func TestMysqlbinlogDateTime(t *testing.T) {
-	old := time.Local
-	defer func() { time.Local = old }()
-
-	utc := time.Date(2026, 8, 6, 5, 42, 29, 0, time.UTC)
-
-	// The instant must be expressed in the machine's local zone: mysqlbinlog
-	// interprets --stop-datetime strings in local time.
-	time.Local = time.FixedZone("UTC+8", 8*3600)
-	assert.Equal(t, "2026-08-06 13:42:29", mysqlbinlogDateTime(utc))
-
-	time.Local = time.UTC
-	assert.Equal(t, "2026-08-06 05:42:29", mysqlbinlogDateTime(utc))
-
-	time.Local = time.FixedZone("UTC-5", -5*3600)
-	assert.Equal(t, "2026-08-06 00:42:29", mysqlbinlogDateTime(utc))
-}
-
-// ---------------------------------------------------------------------------
-// Test: binlog path joining (trailing-slash tolerance)
-// ---------------------------------------------------------------------------
-
-func TestBinlogPaths(t *testing.T) {
-	names := []string{"mysql-bin.000001", "mysql-bin.000002"}
-	join := func(dir, name string) string { return filepath.Join(dir, name) }
-
-	// Directory without trailing slash (as written by the provision config)
-	// must still produce valid paths — the previous dataDir+name concat
-	// produced "/var/lib/mysqlmysql-bin.000001".
-	got := binlogPaths("/var/lib/mysql", names)
-	assert.Equal(t, []string{
-		join("/var/lib/mysql", "mysql-bin.000001"),
-		join("/var/lib/mysql", "mysql-bin.000002"),
-	}, got)
-
-	// Trailing slash (as returned by resolveDataDir) keeps working.
-	got = binlogPaths("/var/log/mysql/", names)
-	assert.Equal(t, []string{
-		join("/var/log/mysql", "mysql-bin.000001"),
-		join("/var/log/mysql", "mysql-bin.000002"),
-	}, got)
 }

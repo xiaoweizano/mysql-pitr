@@ -574,3 +574,47 @@ CommonName of the mTLS client certificate when the flag is omitted.`,
 
 	return cmd
 }
+
+// resolveDataDir queries MySQL for the data directory path.
+// (Moved here from the legacy flashback.go, which was replaced by the new
+// engine-based implementation in the flashback CLI rewire.)
+func resolveDataDir(cfg connector.ConnConfig) (string, error) {
+	if cfg.Host == "" {
+		cfg.Host = "127.0.0.1"
+	}
+	if cfg.Port == 0 {
+		cfg.Port = 3306
+	}
+
+	mysqlCfg := mysql.NewConfig()
+	mysqlCfg.User = cfg.User
+	mysqlCfg.Passwd = cfg.Password
+	mysqlCfg.Net = "tcp"
+	mysqlCfg.Addr = fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+	mysqlCfg.ParseTime = true
+
+	db, err := sql.Open("mysql", mysqlCfg.FormatDSN())
+	if err != nil {
+		return "", fmt.Errorf("connect: %w", err)
+	}
+	defer db.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var name, value string
+	if err := db.QueryRowContext(ctx, "SHOW VARIABLES LIKE 'log_bin_basename'").Scan(&name, &value); err != nil {
+		return "", fmt.Errorf("query log_bin_basename: %w", err)
+	}
+	if value == "" {
+		return "", fmt.Errorf("log_bin_basename is empty — binary logging may not be enabled")
+	}
+	// Extract directory from the full path (e.g. "/var/log/mysql/mysql-bin" -> "/var/log/mysql/").
+	dir := filepath.Dir(value)
+	if dir != "." {
+		value = dir + string(filepath.Separator)
+	} else {
+		value = ""
+	}
+	return value, nil
+}
