@@ -37,6 +37,7 @@
 	import { listAgents, type AgentInfo } from '$lib/api/agents.js';
 	import { listOrgs } from '$lib/api/orgs.js';
 	import { connectSSE, type SSEClient, type SSEEventKind } from '$lib/sse.js';
+	import { decideScanDone, selectionChanged, type ScanFlowMode } from '$lib/pitr/scan-flow.js';
 	import TxTable from '$lib/components/pitr/TxTable.svelte';
 	import SqlPreview from '$lib/components/pitr/SqlPreview.svelte';
 	import ExecutePanel from '$lib/components/pitr/ExecutePanel.svelte';
@@ -76,6 +77,8 @@
 
 	/** "sql" for flashback/update_rollback/指定时间; "selected" for 指定事务/GTID. */
 	const mode = $derived<PitrMode>(typeChoice === 'pitr_tx' || typeChoice === 'gtid' ? 'selected' : 'sql');
+	/** The wizard only ever runs sql or selected — meta is a server-internal mode. */
+	const scanMode = $derived<ScanFlowMode>(mode === 'selected' ? 'selected' : 'sql');
 	const opType = $derived<PitrType>(
 		typeChoice === 'flashback' ? 'flashback' : typeChoice === 'update_rollback' ? 'update_rollback' : 'pitr'
 	);
@@ -146,26 +149,54 @@
 		};
 	});
 
-	// Polling fallback while the SSE stream is down: observe terminal
-	// transitions (e.g. agent disconnect → blocked) a dead stream would hide.
+	// Polling safety net while the wizard is parked waiting for a scan (step 3,
+	// or a selected-mode rescan — which also runs at step 3):
+	//
+	//   - The server event bus is small and non-blocking, so a scan_done frame
+	//     can be dropped even while the SSE stream stays connected.
+	//   - A reconnect after the stream dropped at scan completion never replays
+	//     history.
+	//
+	// So the step advance cannot rely on the event alone: watch /status (the
+	// authoritative archive state) and advance the wizard from the snapshot when
+	// it reports ready. Outside step 3 this poll also preserves the original
+	// fallback of observing terminal transitions while the stream is down.
+	const SCAN_POLL_MS = 10_000;
 	$effect(() => {
 		const id = opId;
-		if (!id || isTerminalState(opStatus) || sseConnected) return;
+		if (
+			!id ||
+			isTerminalState(opStatus) ||
+			(step !== 3 && sseConnected && !rescanning && !pendingExecute)
+		) {
+			return;
+		}
+		let inFlight = false;
 		const iv = setInterval(async () => {
+			if (inFlight) return;
 			if (!opId || isTerminalState(opStatus)) {
 				clearInterval(iv);
 				return;
 			}
+			inFlight = true;
 			try {
 				const st = await getStatus(opId);
 				if (st.status !== opStatus) {
 					opStatus = st.status;
-					if (isTerminalState(st.status)) clearInterval(iv);
+					if (isTerminalState(st.status)) {
+						clearInterval(iv);
+						return;
+					}
+				}
+				if (opStatus === 'ready' && step === 3) {
+					await advanceAfterScanDone();
 				}
 			} catch {
 				// transient — keep polling
+			} finally {
+				inFlight = false;
 			}
-		}, 15000);
+		}, SCAN_POLL_MS);
 		return () => clearInterval(iv);
 	});
 
@@ -316,26 +347,31 @@
 		}
 	}
 
-	async function handleScanDone() {
+	/**
+	 * A scan finished — either via the SSE `scan_done` event or via the
+	 * /status polling safety net (see the effect above; the frame can be
+	 * dropped by the small non-blocking event bus, or the stream may have been
+	 * down at scan completion and reconnects never replay history). Both paths
+	 * converge here, advancing the wizard from the authoritative
+	 * /transactions snapshot and the pure state-machine decisions.
+	 *
+	 * Critical: when the rescan was triggered by the step-4 execute button
+	 * (pendingExecute), the checkboxes are NOT rebuilt from the step-3
+	 * selection — rebuilding would resurrect transactions the user just
+	 * unchecked (decideScanDone initSqlChecked:false).
+	 */
+	async function advanceAfterScanDone() {
 		await refreshTransactions();
-		if (mode === 'sql') {
-			// 自动进步骤 4（SQL 已随第一次扫描到齐）
-			initSqlChecked();
-			step = 4;
-			return;
-		}
-		// selected 模式
-		if (rescanning) {
+		const d = decideScanDone(scanMode, rescanning, pendingExecute);
+		if (d.initSqlChecked) initSqlChecked();
+		if (d.advanceStep) {
 			rescanning = false;
-			initSqlChecked();
 			step = 4;
-			if (pendingExecute) {
-				pendingExecute = false;
-				void startExecute();
-			}
-			return;
 		}
-		// 第一次扫描完成 → 停留在步骤 3，等待勾选事务
+		if (d.continueExecute) {
+			pendingExecute = false;
+			void startExecute();
+		}
 	}
 
 	function initSqlChecked() {
@@ -360,7 +396,7 @@
 				break;
 			}
 			case 'scan_done':
-				await handleScanDone();
+				await advanceAfterScanDone();
 				break;
 			case 'progress': {
 				const p = data as ProgressPayload;
@@ -431,10 +467,27 @@
 
 	// ---------- execute (step 4 → 5) ----------
 
-	function sameSelection(a: string[], b: string[]): boolean {
-		if (a.length !== b.length) return false;
-		const key = (xs: string[]) => [...xs].sort().join('|');
-		return key(a) === key(b);
+	/**
+	 * executeOp failed (network blip / 5xx / 409). The POST may or may not have
+	 * reached the server — reload the authoritative status: if the operation
+	 * actually started executing (or already finished), move to step 5 and let
+	 * the SSE stream drive the view; otherwise stay on step 4, where the
+	 * execute button remains enabled for a retry. (Minor: without this, a
+	 * response lost after the server started executing stranded the wizard on
+	 * step 4 forever.)
+	 */
+	async function reconcileAfterExecuteFailure() {
+		if (!opId) return;
+		try {
+			const st = await getStatus(opId);
+			opStatus = st.status;
+			if (st.status === 'executing' || st.status === 'paused' || isTerminalState(st.status)) {
+				step = 5;
+				flowError = null;
+			}
+		} catch {
+			// status unreachable — stay on step 4; the retry stays available
+		}
 	}
 
 	async function startExecute() {
@@ -448,7 +501,7 @@
 		flowError = null;
 		try {
 			// 所选事务与已持久化的选择一致时直接执行；否则先 select。
-			if (lastSelected === null || !sameSelection(lastSelected, txIds)) {
+			if (selectionChanged(lastSelected, txIds)) {
 				const sel = await selectTx(opId, txIds);
 				lastSelected = [...txIds];
 				if (sel.rescan) {
@@ -465,6 +518,7 @@
 			step = 5;
 		} catch (e) {
 			flowError = e instanceof Error ? e.message : String(e);
+			await reconcileAfterExecuteFailure();
 		} finally {
 			startingExec = false;
 		}
