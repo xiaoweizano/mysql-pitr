@@ -29,6 +29,18 @@ func TestFileCheckpointStore_LoadMissing(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestFileCheckpointStore_RejectsEmptyOperationID(t *testing.T) {
+	dir := t.TempDir()
+	s := NewFileCheckpointStore(dir)
+	err := s.Save(Checkpoint{LastCompletedStatement: 1, Total: 10})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "OperationID required")
+	// 目录内不得写入 `<dir>/.json`（空 ID 的残留文件）
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Empty(t, entries)
+}
+
 func TestFileCheckpointStore_AtomicWrite(t *testing.T) {
 	// 写入后目录里只有 <op>.json，无 .tmp 残留
 	dir := t.TempDir()

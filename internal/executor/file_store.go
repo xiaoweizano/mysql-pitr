@@ -30,6 +30,9 @@ func (s *FileCheckpointStore) Load(operationID string) (*Checkpoint, error) {
 }
 
 func (s *FileCheckpointStore) Save(c Checkpoint) error {
+	if c.OperationID == "" {
+		return fmt.Errorf("executor: checkpoint.OperationID required")
+	}
 	data, err := json.Marshal(c)
 	if err != nil {
 		return fmt.Errorf("executor: marshal checkpoint: %w", err)

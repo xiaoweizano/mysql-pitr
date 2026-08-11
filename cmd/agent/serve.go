@@ -49,6 +49,7 @@ type serveDaemon struct {
 	client  *wsagent.Client
 	started time.Time
 
+	loopMu sync.Mutex       // 保护 loop 字段（startArchiveLoop 写 / loopState 读）
 	loop   *collector.Loop  // 归档循环（startArchiveLoop 启动）
 	daemon *daemon.Daemon   // scan/execute/resume/cancel/archive_status 命令处理层
 
@@ -92,10 +93,13 @@ func (d *serveDaemon) archiveDir() string {
 
 // loopState 是 daemon.ArchiveStatus 的状态源：循环未启动时返回零值状态。
 func (d *serveDaemon) loopState() collector.State {
-	if d.loop == nil {
+	d.loopMu.Lock()
+	l := d.loop
+	d.loopMu.Unlock()
+	if l == nil {
 		return collector.State{}
 	}
-	return d.loop.State()
+	return l.State()
 }
 
 // newExecutor 构造 Phase 2 的执行器。DBConnFactory 用 agent 自身的 MySQL 连接
@@ -418,7 +422,9 @@ func (d *serveDaemon) startArchiveLoop(ctx context.Context) error {
 			ServerID: d.cfg.Archive.ServerID,
 		}),
 	}, archive.NewWriter(d.cfg.Archive.Dir))
+	d.loopMu.Lock()
 	d.loop = loop
+	d.loopMu.Unlock()
 	go func() {
 		if err := loop.Run(ctx); err != nil && ctx.Err() == nil {
 			d.logger().Error("archive loop exited", "err", err)
