@@ -3,20 +3,26 @@ package connector
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
 	"time"
 
+	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-sql-driver/mysql"
 
+	"github.com/a-shan/mysql-pitr/internal/archive"
 	"github.com/a-shan/mysql-pitr/internal/binlog"
+	"github.com/a-shan/mysql-pitr/internal/collector"
 	"github.com/a-shan/mysql-pitr/internal/executor"
 )
 
-// compile-time checks that MySQLConnector satisfies Connector and executor.DB.
+// compile-time checks that MySQLConnector satisfies Connector, executor.DB and
+// collector.MySQLInfo (归档循环的 MySQL 交互抽象).
 var _ Connector = (*MySQLConnector)(nil)
 var _ executor.DB = (*MySQLConnector)(nil)
+var _ collector.MySQLInfo = (*MySQLConnector)(nil)
 
 // MySQLConnector implements the Connector interface for MySQL 8.0+ databases.
 type MySQLConnector struct {
@@ -161,6 +167,46 @@ func (m *MySQLConnector) GetBinlogFiles(ctx context.Context) ([]BinlogFile, erro
 	}
 
 	return files, nil
+}
+
+// ---------------------------------------------------------------------------
+// collector.MySQLInfo adapter
+// ---------------------------------------------------------------------------
+
+// ListBinlogs 适配 GetBinlogFiles 到 collector.MySQLInfo 的 ListBinlogs 契约
+// （SHOW BINARY LOGS → archive.ManifestFile 列表）。
+func (m *MySQLConnector) ListBinlogs(ctx context.Context) ([]archive.ManifestFile, error) {
+	files, err := m.GetBinlogFiles(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]archive.ManifestFile, 0, len(files))
+	for _, f := range files {
+		out = append(out, archive.ManifestFile{Name: f.Name, Size: f.Size})
+	}
+	return out, nil
+}
+
+// MasterPosition 查询 SHOW MASTER STATUS 返回当前 binlog 文件名与位置
+// （归档循环的续拉起点）。binlog 未启用时 SHOW MASTER STATUS 返回空结果集
+// （sql.ErrNoRows），转成可读错误。
+func (m *MySQLConnector) MasterPosition(ctx context.Context) (gomysql.Position, error) {
+	if m.db == nil {
+		return gomysql.Position{}, fmt.Errorf("connector: not connected")
+	}
+	var name string
+	var pos uint32
+	err := m.db.QueryRowContext(ctx, "SHOW MASTER STATUS").Scan(&name, &pos)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return gomysql.Position{}, fmt.Errorf("connector: SHOW MASTER STATUS returned no rows (binary logging may be disabled)")
+		}
+		return gomysql.Position{}, fmt.Errorf("connector: SHOW MASTER STATUS: %w", err)
+	}
+	if name == "" {
+		return gomysql.Position{}, fmt.Errorf("connector: SHOW MASTER STATUS returned empty binlog file name")
+	}
+	return gomysql.Position{Name: name, Pos: pos}, nil
 }
 
 // ---------------------------------------------------------------------------

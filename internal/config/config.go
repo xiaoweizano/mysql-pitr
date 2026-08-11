@@ -78,12 +78,23 @@ type ServerConfig struct {
 	CAFile   string `json:"ca_file"`
 }
 
+// ArchiveConfig 归档采集配置（agent serve 的归档循环使用）。
+type ArchiveConfig struct {
+	Dir           string `json:"dir"`                      // 归档目录（必填）
+	ServerID      uint32 `json:"server_id"`                // syncer server id（必填，须 > 0）
+	RetentionDays int    `json:"retention_days,omitempty"` // 0 = 不清理
+}
+
 // Config represents the full agent configuration file, typically stored encrypted
 // on disk and decrypted at startup with a user-supplied passphrase.
 type Config struct {
 	MySQL   MySQLConfig  `json:"mysql"`
 	Server  ServerConfig `json:"server,omitempty"`
 	DataDir string       `json:"data_dir"`
+
+	// Archive 归档采集配置（binlog 归档循环的目录、syncer id、保留天数）。
+	// 指针使未配置时序列化省略整个 archive 段。
+	Archive *ArchiveConfig `json:"archive,omitempty"`
 
 	// BinlogDir overrides the binlog directory discovered from the MySQL
 	// server variable log_bin_basename.

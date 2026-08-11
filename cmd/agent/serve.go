@@ -4,12 +4,15 @@ import (
 	"context"
 	"crypto/x509"
 	"database/sql"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -18,11 +21,14 @@ import (
 	"github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
-	"github.com/a-shan/mysql-pitr/internal/checkpoint"
+	"github.com/a-shan/mysql-pitr/internal/archive"
+	"github.com/a-shan/mysql-pitr/internal/binlog"
+	"github.com/a-shan/mysql-pitr/internal/collector"
 	"github.com/a-shan/mysql-pitr/internal/config"
 	"github.com/a-shan/mysql-pitr/internal/connector"
-	"github.com/a-shan/mysql-pitr/internal/parser"
-	"github.com/a-shan/mysql-pitr/internal/rollback"
+	"github.com/a-shan/mysql-pitr/internal/daemon"
+	"github.com/a-shan/mysql-pitr/internal/executor"
+	"github.com/a-shan/mysql-pitr/internal/stream"
 	"github.com/a-shan/mysql-pitr/internal/ws"
 	wsagent "github.com/a-shan/mysql-pitr/internal/ws/agent"
 )
@@ -34,7 +40,7 @@ type ServeOptions struct {
 	AgentID    string
 }
 
-// serveDaemon holds shared state for the agent daemon command handlers.
+// serveDaemon 持有 agent daemon 的共享状态：归档循环、命令处理层与 WS 客户端。
 type serveDaemon struct {
 	cfg     *config.Config
 	agentID string
@@ -43,10 +49,8 @@ type serveDaemon struct {
 	client  *wsagent.Client
 	started time.Time
 
-	// cancels maps operationId to the cancel func of the in-flight handler
-	// for that operation (used by pitr_cancel).
-	cancelMu sync.Mutex
-	cancels  map[string]context.CancelFunc
+	loop   *collector.Loop  // 归档循环（startArchiveLoop 启动）
+	daemon *daemon.Daemon   // scan/execute/resume/cancel/archive_status 命令处理层
 
 	rootCtx    context.Context
 	rootCancel context.CancelFunc
@@ -56,19 +60,132 @@ type serveDaemon struct {
 
 func newServeDaemon(cfg *config.Config, agentID string) *serveDaemon {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &serveDaemon{
+	d := &serveDaemon{
 		cfg:        cfg,
 		agentID:    agentID,
 		connCfg:    cfg.MySQL.BuildConnConfig(),
 		started:    time.Now(),
-		cancels:    make(map[string]context.CancelFunc),
 		rootCtx:    ctx,
 		rootCancel: cancel,
 		stopCh:     make(chan struct{}),
 	}
+	d.daemon = daemon.NewDaemon(
+		daemon.ScanDeps{
+			ArchiveDir:    d.archiveDir(),
+			SchemaFetcher: d.newSchemaFetcher(),
+			Logger:        d.logger(),
+		},
+		d.newExecutor(),
+		d.loopState,
+		d, // serveDaemon 实现 daemon.EventSink（Send 方法）
+	)
+	return d
 }
 
+// archiveDir 返回归档目录（cfg.Archive 未配置时为 ""）。
+func (d *serveDaemon) archiveDir() string {
+	if d.cfg.Archive == nil {
+		return ""
+	}
+	return d.cfg.Archive.Dir
+}
+
+// loopState 是 daemon.ArchiveStatus 的状态源：循环未启动时返回零值状态。
+func (d *serveDaemon) loopState() collector.State {
+	if d.loop == nil {
+		return collector.State{}
+	}
+	return d.loop.State()
+}
+
+// newExecutor 构造 Phase 2 的执行器。DBConnFactory 用 agent 自身的 MySQL 连接
+// 配置打开连接（executor.Plan.DSN 在 Phase 2 为空；Phase 3 由 server 层注入
+// DSN 后替换）。data_dir 未配置时不启用执行（Execute/Resume 返回错误）。
+func (d *serveDaemon) newExecutor() executor.Executor {
+	if d.cfg.DataDir == "" {
+		return nil
+	}
+	cpDir := filepath.Join(d.cfg.DataDir, "checkpoints")
+	_ = os.MkdirAll(cpDir, 0o755) // FileCheckpointStore 不自动建目录
+	return executor.NewExecutor(
+		func(plan executor.Plan) (executor.DB, error) {
+			db, err := sql.Open("mysql", d.cfg.MySQL.BuildDSN())
+			if err != nil {
+				return nil, fmt.Errorf("open mysql: %w", err)
+			}
+			return connector.NewMySQLConnectorWithDB(db), nil
+		},
+		executor.NewFileCheckpointStore(cpDir),
+	)
+}
+
+// logger 返回归档循环与命令层共用的结构化日志器（stderr 文本格式）。
+func (d *serveDaemon) logger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(os.Stderr, nil))
+}
+
+// streamEventType 是 daemon 流事件推送的 wire 命令类型。
+const streamEventType = "stream_event"
+
+// streamEventCommand 把 StreamEvent 包装成单向推送的 ws.Command。信封约定
+// （Phase 3 server 按此解包）：
+//
+//	{ "cmd": "ev-<opId>", "type": "stream_event",
+//	  "params": { "id": "<opId>", "kind": "<event kind>", "data": <原始 JSON> } }
+//
+// kind 取值见 ws.EvTxMeta/EvSQL/EvScanDone/EvProgress/EvOpDone/EvOpError；
+// data 是 StreamEvent.Data 的原始 JSON（json.RawMessage，序列化时保持原样）。
+func streamEventCommand(ev ws.StreamEvent) ws.Command {
+	return ws.Command{
+		Cmd:  "ev-" + ev.ID,
+		Type: streamEventType,
+		Params: map[string]interface{}{
+			"id":   ev.ID,
+			"kind": ev.Kind,
+			"data": json.RawMessage(ev.Data),
+		},
+	}
+}
+
+// Send 实现 daemon.EventSink：把 StreamEvent 经 client 推给 server（单向推送，
+// 不等响应）。客户端未连接时静默丢弃——daemon 调用方不处理 Send 错误。
+func (d *serveDaemon) Send(ev ws.StreamEvent) error {
+	if d.client == nil {
+		return nil
+	}
+	return d.client.Send(streamEventCommand(ev))
+}
+
+// mysqlSchemaFetcher 实现 binlog.SchemaFetcher：惰性建立并复用 MySQL 连接，
+// 委托 connector.FetchSchema。一次扫描内的 schema 缓存由 scan.Stream 负责
+// （每个 (schema,table) 只拉一次）。
+type mysqlSchemaFetcher struct {
+	connCfg connector.ConnConfig
+
+	mu   sync.Mutex
+	conn *connector.MySQLConnector
+}
+
+func (d *serveDaemon) newSchemaFetcher() binlog.SchemaFetcher {
+	return &mysqlSchemaFetcher{connCfg: d.connCfg}
+}
+
+func (f *mysqlSchemaFetcher) FetchSchema(ctx context.Context, schema, table string) (binlog.TableSchema, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.conn == nil {
+		conn := connector.NewMySQLConnector()
+		if err := conn.Connect(f.connCfg); err != nil {
+			return binlog.TableSchema{}, friendlyConnError(f.connCfg, err)
+		}
+		f.conn = conn
+	}
+	return f.conn.FetchSchema(ctx, schema, table)
+}
+
+// ---------------------------------------------------------------------------
 // commandResponse helpers
+// ---------------------------------------------------------------------------
 
 func okResp(cmd ws.Command, result interface{}) *ws.Response {
 	return &ws.Response{Cmd: cmd.Cmd, Status: ws.StatusOK, Result: result}
@@ -78,48 +195,26 @@ func errResp(cmd ws.Command, format string, args ...interface{}) *ws.Response {
 	return &ws.Response{Cmd: cmd.Cmd, Status: ws.StatusError, Error: fmt.Sprintf(format, args...)}
 }
 
-// paramString / paramUint32 read typed values from a command's params map.
+// paramString 从命令的 params map 读字符串值（trim 后返回）。
 func paramString(params map[string]interface{}, key string) string {
 	s, _ := params[key].(string)
 	return strings.TrimSpace(s)
 }
 
-func paramUint32(params map[string]interface{}, key string) uint32 {
-	f, ok := params[key].(float64)
-	if !ok || f <= 0 {
-		return 0
+// decodeParams 把命令 params（map[string]interface{}）JSON 往返解码到目标
+// 结构（ws.ScanRequest / ws.ExecuteRequest）。空 params 视为零值目标。
+func decodeParams(cmd ws.Command, v interface{}) error {
+	if len(cmd.Params) == 0 {
+		return nil
 	}
-	return uint32(f)
-}
-
-// buildBinlogParseOpts maps command params onto a binlogParseOpts, applying
-// the agent config's mysqlbinlog path override. Returns an error for
-// malformed time params or a missing target table.
-func buildBinlogParseOpts(params map[string]interface{}, cfg *config.Config) (binlogParseOpts, error) {
-	opts := binlogParseOpts{
-		TargetTable:     paramString(params, "targetTable"),
-		MySQLBinlogPath: cfg.MySQLBinlogPath,
+	data, err := json.Marshal(cmd.Params)
+	if err != nil {
+		return fmt.Errorf("marshal params: %w", err)
 	}
-	if opts.TargetTable == "" {
-		return opts, fmt.Errorf("missing required param 'targetTable'")
+	if err := json.Unmarshal(data, v); err != nil {
+		return fmt.Errorf("parse params: %w", err)
 	}
-	if s := paramString(params, "startTime"); s != "" {
-		t, err := time.Parse(time.RFC3339, s)
-		if err != nil {
-			return opts, fmt.Errorf("invalid startTime %q: expected RFC3339", s)
-		}
-		opts.StartTime = &t
-	}
-	if s := paramString(params, "endTime"); s != "" {
-		t, err := time.Parse(time.RFC3339, s)
-		if err != nil {
-			return opts, fmt.Errorf("invalid endTime %q: expected RFC3339", s)
-		}
-		opts.EndTime = &t
-	}
-	opts.StartPos = paramUint32(params, "startPos")
-	opts.StopPos = paramUint32(params, "stopPos")
-	return opts, nil
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -168,7 +263,7 @@ func (d *serveDaemon) checkMySQL(ctx context.Context) map[string]interface{} {
 }
 
 // handleShutdown stops the daemon gracefully. The response is flushed before
-// the connection is closed.
+// the connection is closed. 归档循环随 rootCtx 取消而停止。
 func (d *serveDaemon) handleShutdown(ctx context.Context, cmd ws.Command) *ws.Response {
 	d.stopOnce.Do(func() {
 		close(d.stopCh)
@@ -220,256 +315,131 @@ func (d *serveDaemon) handlePreflight(ctx context.Context, cmd ws.Command) *ws.R
 	})
 }
 
-// handlePITRParse parses local binlog files via mysqlbinlog honouring the
-// targeted parse parameters supplied by the platform and returns the reverse
-// SQL batch (full list plus a preview capped at 1000 entries).
-func (d *serveDaemon) handlePITRParse(ctx context.Context, cmd ws.Command) *ws.Response {
-	params := cmd.Params
-	opID := paramString(params, "operationId")
-
-	opts, err := buildBinlogParseOpts(params, d.cfg)
-	if err != nil {
-		return errResp(cmd, "%v", err)
+// handleScan 解析 scan 请求并交给 daemon 异步执行；接受后立即响应。
+// 流式结果（tx_meta/sql/scan_done/op_error）经 EventSink 推送。
+func (d *serveDaemon) handleScan(ctx context.Context, cmd ws.Command) *ws.Response {
+	var req ws.ScanRequest
+	if err := decodeParams(cmd, &req); err != nil {
+		return errResp(cmd, "scan: %v", err)
 	}
-
-	// Resolve the binlog files to parse: the requested subset, or all files.
-	var selected []string
-	if raw, ok := params["binlogFiles"].([]interface{}); ok && len(raw) > 0 {
-		for _, f := range raw {
-			if s, ok := f.(string); ok && s != "" {
-				selected = append(selected, s)
-			}
-		}
+	if err := d.daemon.Scan(ctx, cmd.Cmd, req); err != nil {
+		return errResp(cmd, "scan: %v", err)
 	}
-	if len(selected) == 0 {
-		conn := connector.NewMySQLConnector()
-		if err := conn.Connect(d.connCfg); err != nil {
-			return errResp(cmd, "connect to MySQL: %v", friendlyConnError(d.connCfg, err))
-		}
-		binlogs, err := conn.GetBinlogFiles(ctx)
-		_ = conn.Close()
-		if err != nil {
-			return errResp(cmd, "list binlog files: %v", err)
-		}
-		for _, bf := range binlogs {
-			selected = append(selected, bf.Name)
-		}
-	}
-	if len(selected) == 0 {
-		return errResp(cmd, "no binlog files to parse")
-	}
-
-	dataDir := d.cfg.BinlogDir
-	if dataDir == "" {
-		dir, err := resolveDataDir(d.connCfg)
-		if err != nil {
-			return errResp(cmd, "resolve binlog directory: %v", err)
-		}
-		dataDir = dir
-	}
-	paths := binlogPaths(dataDir, selected)
-
-	parseRes, err := parseBinlogWithMySQLBinlog(d.connCfg, paths, opts)
-	if err != nil {
-		return errResp(cmd, "parse binlogs: %v", err)
-	}
-	if len(parseRes.Events) == 0 {
-		return okResp(cmd, map[string]interface{}{
-			"operationId": opID,
-			"totalRows":   0,
-			"reverseSql":  []string{},
-			"preview":     []interface{}{},
-			"sqlSample":   "",
-		})
-	}
-
-	sqls, err := parser.ReverseSQLBatch(parseRes.Events, nil)
-	if err != nil {
-		return errResp(cmd, "generate reverse SQL: %v", err)
-	}
-
-	maxEntries := len(sqls)
-	if maxEntries > 1000 {
-		maxEntries = 1000
-	}
-	preview := make([]map[string]interface{}, 0, maxEntries)
-	for i := 0; i < maxEntries; i++ {
-		ev := parseRes.Events[i]
-		// ReverseSQLBatch emits statements newest-first, so the reverse SQL for
-		// Events[i] lives at the mirrored index in the reversed batch.
-		revIdx := len(sqls) - 1 - i
-		revSQL := ""
-		if revIdx >= 0 && revIdx < len(sqls) {
-			revSQL = sqls[revIdx]
-		}
-		preview = append(preview, map[string]interface{}{
-			"sequence":     i + 1,
-			"sqlType":      string(ev.Type),
-			"tableName":    ev.Table,
-			"originalSql":  "",
-			"reverseSql":   revSQL,
-			"rowsAffected": 1,
-		})
-	}
-	sqlSample := ""
-	if len(sqls) > 0 {
-		sqlSample = sqls[0]
-	}
-
-	return okResp(cmd, map[string]interface{}{
-		"operationId": opID,
-		"totalRows":   len(parseRes.Events),
-		"reverseSql":  sqls,
-		"preview":     preview,
-		"sqlSample":   sqlSample,
-	})
+	return okResp(cmd, map[string]interface{}{"accepted": true, "operationId": cmd.Cmd})
 }
 
-// handlePITRExecute runs the reverse SQL batch on the agent's local MySQL
-// connection, pushing progress updates and persisting checkpoints as it goes.
-// A pitr_cancel command for the same operationId cancels the remaining work.
-func (d *serveDaemon) handlePITRExecute(ctx context.Context, cmd ws.Command) *ws.Response {
-	params := cmd.Params
-	opID := paramString(params, "operationId")
-	if opID == "" {
-		return errResp(cmd, "missing required param 'operationId'")
+// handleExecute 解析执行请求并交给 daemon 异步执行（进度/完成事件流推送）。
+func (d *serveDaemon) handleExecute(ctx context.Context, cmd ws.Command) *ws.Response {
+	var req ws.ExecuteRequest
+	if err := decodeParams(cmd, &req); err != nil {
+		return errResp(cmd, "execute: %v", err)
 	}
-
-	var sqls []string
-	if raw, ok := params["sql"].([]interface{}); ok {
-		for _, s := range raw {
-			if ss, ok := s.(string); ok && ss != "" {
-				sqls = append(sqls, ss)
-			}
-		}
+	if err := d.daemon.Execute(ctx, cmd.Cmd, req); err != nil {
+		return errResp(cmd, "execute: %v", err)
 	}
-	if len(sqls) == 0 {
-		return errResp(cmd, "missing required param 'sql'")
-	}
-
-	batchSize := 100
-	if f, ok := params["batchSize"].(float64); ok && f > 0 {
-		batchSize = int(f)
-	}
-
-	// Per-operation cancelable context so pitr_cancel can abort execution
-	// between batches.
-	opCtx, opCancel := context.WithCancel(d.rootCtx)
-	d.cancelMu.Lock()
-	d.cancels[opID] = opCancel
-	d.cancelMu.Unlock()
-	defer func() {
-		d.cancelMu.Lock()
-		delete(d.cancels, opID)
-		d.cancelMu.Unlock()
-		opCancel()
-	}()
-
-	db, err := sql.Open("mysql", d.cfg.MySQL.BuildDSN())
-	if err != nil {
-		return errResp(cmd, "open MySQL: %v", err)
-	}
-	defer db.Close()
-
-	executor := rollback.NewExecutor(db)
-	cpManager := checkpoint.NewManager(d.cfg.DataDir)
-
-	estTotal := (len(sqls) + batchSize - 1) / batchSize
-	plan := checkpoint.CheckpointPlan{
-		RecoveryID:   opID,
-		TableName:    paramString(params, "targetTable"),
-		TotalBatches: estTotal,
-	}
-	if s := paramString(params, "recoveryTime"); s != "" {
-		if t, err := time.Parse(time.RFC3339, s); err == nil {
-			plan.RecoveryTime = t
-		}
-	}
-	if _, err := cpManager.CreateCheckpoint(opCtx, plan); err != nil {
-		log.Printf("agent: checkpoint create failed for %s: %v", opID, err)
-	}
-
-	var rowsAffected int64
-	execStart := time.Now()
-	result, err := executor.Execute(opCtx, sqls, rollback.ExecOptions{
-		BatchSize: batchSize,
-		OnBatch: func(b rollback.BatchResult) {
-			rowsAffected += b.RowsAffected
-			completed := b.BatchNum
-			if b.Error == nil {
-				completed = b.BatchNum + 1
-			}
-			_ = cpManager.UpdateBatch(opCtx, opID, completed)
-			estimatedRemaining := "calculating..."
-			if completed > 0 {
-				perBatch := time.Since(execStart) / time.Duration(completed)
-				estimatedRemaining = (perBatch * time.Duration(estTotal-completed)).Round(time.Second).String()
-			}
-			d.pushProgress(map[string]interface{}{
-				"operationId":        opID,
-				"batchesComplete":    completed,
-				"batchesTotal":       estTotal,
-				"rowsRestored":       rowsAffected,
-				"estimatedRemaining": estimatedRemaining,
-			})
-		},
-	})
-	if err != nil && opCtx.Err() == nil {
-		return errResp(cmd, "execute rollback: %v", err)
-	}
-
-	// Mark the checkpoint complete unless the operation was cancelled.
-	if opCtx.Err() == nil {
-		if err := cpManager.Complete(opCtx, opID); err != nil {
-			log.Printf("agent: checkpoint complete failed for %s: %v", opID, err)
-		}
-	}
-
-	errors := make([]map[string]interface{}, 0, len(result.Errors))
-	for _, e := range result.Errors {
-		errors = append(errors, map[string]interface{}{
-			"batchNum": e.BatchNum,
-			"sql":      e.SQL,
-			"error":    e.Error,
-		})
-	}
-
-	return okResp(cmd, map[string]interface{}{
-		"operationId":      opID,
-		"cancelled":        opCtx.Err() != nil,
-		"rowsAffected":     result.RowsAffected,
-		"batchesCompleted": result.BatchesComplete,
-		"batchesTotal":     result.BatchesTotal,
-		"errors":           errors,
-	})
+	return okResp(cmd, map[string]interface{}{"accepted": true, "operationId": req.OperationID})
 }
 
-// handlePITRCancel cancels the in-flight handler for the given operation.
-func (d *serveDaemon) handlePITRCancel(ctx context.Context, cmd ws.Command) *ws.Response {
+// handleResume 与 handleExecute 同一路径（Phase 2 语义：从零重跑；Phase 3 由
+// server 重发持久化 Plan 续跑）。
+func (d *serveDaemon) handleResume(ctx context.Context, cmd ws.Command) *ws.Response {
+	var req ws.ExecuteRequest
+	if err := decodeParams(cmd, &req); err != nil {
+		return errResp(cmd, "resume: %v", err)
+	}
+	if err := d.daemon.Resume(ctx, cmd.Cmd, req); err != nil {
+		return errResp(cmd, "resume: %v", err)
+	}
+	return okResp(cmd, map[string]interface{}{"accepted": true, "operationId": req.OperationID})
+}
+
+// handleCancel 取消一次运行中的 scan/execute。operationId 参数是启动命令的
+// 命令 ID（daemon op 注册表的键）。
+func (d *serveDaemon) handleCancel(ctx context.Context, cmd ws.Command) *ws.Response {
 	opID := paramString(cmd.Params, "operationId")
-	d.cancelMu.Lock()
-	cancel, ok := d.cancels[opID]
-	d.cancelMu.Unlock()
-	if ok {
-		cancel()
+	if opID == "" {
+		return errResp(cmd, "cancel: missing required param 'operationId'")
 	}
-	return okResp(cmd, map[string]interface{}{
-		"operationId": opID,
-		"cancelled":   ok,
-	})
+	if err := d.daemon.CancelOp(opID); err != nil {
+		return errResp(cmd, "cancel: %v", err)
+	}
+	return okResp(cmd, map[string]interface{}{"cancelled": true, "operationId": opID})
 }
 
-// pushProgress sends a best-effort pitr_progress notification to the platform.
-func (d *serveDaemon) pushProgress(params map[string]interface{}) {
-	if d.client == nil {
-		return
-	}
-	_ = d.client.Send(ws.Command{
-		Cmd:    fmt.Sprintf("progress-%s", params["operationId"]),
-		Type:   ws.CmdPITRProgress,
-		Params: params,
-	})
+// handleArchiveStatus 返回归档循环的当前状态（collector.State；循环未启动时
+// 为零值状态）。
+func (d *serveDaemon) handleArchiveStatus(ctx context.Context, cmd ws.Command) *ws.Response {
+	return okResp(cmd, d.daemon.ArchiveStatus())
 }
+
+// ---------------------------------------------------------------------------
+// Archive loop
+// ---------------------------------------------------------------------------
+
+// startArchiveLoop 校验归档配置、连接 MySQL 并启动 collector 归档循环。
+// 循环在后台 goroutine 运行；fatal 退出只记日志（archive_status 反映循环
+// 状态，平台可据此诊断）。启动失败（配置缺失/连不上 MySQL/无法解析 binlog
+// 目录）同步返回错误。
+func (d *serveDaemon) startArchiveLoop(ctx context.Context) error {
+	if d.cfg.Archive == nil || d.cfg.Archive.Dir == "" {
+		return fmt.Errorf("serve: config field archive.dir is required")
+	}
+	if d.cfg.Archive.ServerID == 0 {
+		return fmt.Errorf("serve: config field archive.server_id is required")
+	}
+	if err := os.MkdirAll(d.cfg.Archive.Dir, 0o755); err != nil {
+		return fmt.Errorf("serve: create archive dir %s: %w", d.cfg.Archive.Dir, err)
+	}
+	binlogDir, err := d.binlogDir()
+	if err != nil {
+		return err
+	}
+	conn := connector.NewMySQLConnector()
+	if err := conn.Connect(d.connCfg); err != nil {
+		return friendlyConnError(d.connCfg, err)
+	}
+	loop := collector.NewLoop(collector.Config{
+		MySQL:         conn, // connector 实现 collector.MySQLInfo
+		BinlogDir:     binlogDir,
+		ArchiveDir:    d.cfg.Archive.Dir,
+		ServerID:      d.cfg.Archive.ServerID,
+		RetentionDays: d.cfg.Archive.RetentionDays,
+		Logger:        d.logger(),
+		// SourceFactory 必须显式传完整连接配置：nil 回退是 localhost:3306
+		// 空凭据（T5 carry-in）。
+		SourceFactory: collector.DefaultSourceFactory(stream.Config{
+			Host:     d.connCfg.Host,
+			Port:     d.connCfg.Port,
+			User:     d.connCfg.User,
+			Password: d.connCfg.Password,
+			ServerID: d.cfg.Archive.ServerID,
+		}),
+	}, archive.NewWriter(d.cfg.Archive.Dir))
+	d.loop = loop
+	go func() {
+		if err := loop.Run(ctx); err != nil && ctx.Err() == nil {
+			d.logger().Error("archive loop exited", "err", err)
+		}
+	}()
+	return nil
+}
+
+// binlogDir 返回 MySQL 侧 binlog 目录：优先 cfg.BinlogDir，否则查
+// log_bin_basename（reconcile 回填的复制源目录）。
+func (d *serveDaemon) binlogDir() (string, error) {
+	if d.cfg.BinlogDir != "" {
+		return d.cfg.BinlogDir, nil
+	}
+	dir, err := resolveDataDir(d.connCfg)
+	if err != nil {
+		return "", fmt.Errorf("serve: resolve binlog directory (set config binlog_dir to override): %w", err)
+	}
+	return dir, nil
+}
+
+// ---------------------------------------------------------------------------
+// Serve command
+// ---------------------------------------------------------------------------
 
 // certCNFromFile extracts the CommonName from the first certificate in a PEM
 // file. Used to derive the agent ID from the client certificate.
@@ -501,13 +471,12 @@ func NewServeCommand() *cobra.Command {
 		Use:   "serve",
 		Short: "Run the agent as a persistent daemon connected to the platform",
 		Long: `Run the agent as a persistent daemon that maintains a long-lived mTLS
-WebSocket connection to the mysql-pitr-server and serves binlog parse,
-preflight, and rollback-execution commands for the platform.
+WebSocket connection to the mysql-pitr-server and serves binlog archive,
+scan, execute, resume, cancel, preflight and status commands for the platform.
 
-The daemon reads the local binlog directory on this host and parses binlog
-files with mysqlbinlog. Targeted parsing parameters (binlog files, target
-table, time range, position range) are supplied by the platform with each
-pitr_parse command.
+The daemon runs a binlog archive loop (config section "archive": dir,
+server_id, retention_days) that mirrors the MySQL binlog stream into the
+archive directory, then serves scan/execute against the archived binlogs.
 
 The agent ID is taken from the --agent-id flag, or derived from the
 CommonName of the mTLS client certificate when the flag is omitted.`,
@@ -554,14 +523,22 @@ CommonName of the mTLS client certificate when the flag is omitted.`,
 			dispatcher.RegisterHandler(ws.CmdStatus, d.handleStatus)
 			dispatcher.RegisterHandler(ws.CmdShutdown, d.handleShutdown)
 			dispatcher.RegisterHandler(ws.CmdPreflight, d.handlePreflight)
-			dispatcher.RegisterHandler(ws.CmdPITRParse, d.handlePITRParse)
-			dispatcher.RegisterHandler(ws.CmdPITRExecute, d.handlePITRExecute)
-			dispatcher.RegisterHandler(ws.CmdPITRCancel, d.handlePITRCancel)
+			dispatcher.RegisterHandler(ws.CmdScan, d.handleScan)
+			dispatcher.RegisterHandler(ws.CmdExecute, d.handleExecute)
+			dispatcher.RegisterHandler(ws.CmdResume, d.handleResume)
+			dispatcher.RegisterHandler(ws.CmdCancel, d.handleCancel)
+			dispatcher.RegisterHandler(ws.CmdArchiveStatus, d.handleArchiveStatus)
 			client.SetDispatcher(dispatcher)
 
 			log.Printf("agent %s starting (platform %s, mysql %s:%d)", agentID, cfg.Server.URL, d.connCfg.Host, d.connCfg.Port)
 			if err := client.Connect(cmd.Context()); err != nil {
 				return fmt.Errorf("serve: connect to platform: %w", err)
+			}
+
+			// 归档循环启动失败即 fatal；运行中退出只记日志。
+			if err := d.startArchiveLoop(d.rootCtx); err != nil {
+				_ = client.Close()
+				return err
 			}
 
 			// Certificates are renewed automatically when nearing expiry.

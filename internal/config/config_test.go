@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -157,6 +158,49 @@ func TestLoadSaveConfig_RoundTrip(t *testing.T) {
 	assert.Equal(t, original.Server.URL, loaded.Server.URL)
 	assert.Equal(t, original.Server.CertFile, loaded.Server.CertFile)
 	assert.Equal(t, original.DataDir, loaded.DataDir)
+}
+
+func TestArchiveConfig_RoundTrip(t *testing.T) {
+	t.Parallel()
+
+	original := &Config{
+		MySQL: MySQLConfig{User: "root", Password: "secret", Database: "mydb"},
+		Archive: &ArchiveConfig{
+			Dir:           "/var/lib/mysql-pitr/archive",
+			ServerID:      1001,
+			RetentionDays: 7,
+		},
+	}
+
+	// 序列化断言：archive 段带 dir/server_id/retention_days 键。
+	data, err := json.Marshal(original)
+	require.NoError(t, err)
+	var raw map[string]interface{}
+	require.NoError(t, json.Unmarshal(data, &raw))
+	arc, ok := raw["archive"].(map[string]interface{})
+	require.True(t, ok, "config JSON must include an archive section")
+	assert.Equal(t, "/var/lib/mysql-pitr/archive", arc["dir"])
+	assert.Equal(t, float64(1001), arc["server_id"])
+	assert.Equal(t, float64(7), arc["retention_days"])
+
+	// 加密存取往返。
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "agent.conf")
+	require.NoError(t, SaveConfig(cfgPath, "passphrase", original))
+	loaded, err := LoadConfig(cfgPath, "passphrase")
+	require.NoError(t, err)
+	require.NotNil(t, loaded.Archive, "archive section must survive the roundtrip")
+	assert.Equal(t, *original.Archive, *loaded.Archive)
+}
+
+func TestArchiveConfig_ZeroOmitted(t *testing.T) {
+	t.Parallel()
+
+	data, err := json.Marshal(&Config{
+		MySQL: MySQLConfig{User: "u", Password: "p", Database: "d"},
+	})
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), "archive", "zero archive config must be omitted")
 }
 
 func TestLoadConfig_WrongPassphrase(t *testing.T) {

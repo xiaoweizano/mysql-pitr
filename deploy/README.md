@@ -199,7 +199,12 @@ Plaintext shape:
   },
   "data_dir": "/var/lib/mysql-pitr",
   "binlog_dir": "",
-  "mysqlbinlog_path": ""
+  "mysqlbinlog_path": "",
+  "archive": {
+    "dir": "/var/lib/mysql-pitr/archive",
+    "server_id": 1001,
+    "retention_days": 7
+  }
 }
 ```
 
@@ -212,6 +217,9 @@ Plaintext shape:
 | `data_dir` | Where rollback checkpoints are persisted |
 | `binlog_dir` | Optional override for the binlog directory (default: `log_bin_basename`) |
 | `mysqlbinlog_path` | Optional override for the `mysqlbinlog` binary |
+| `archive.dir` | Archive directory for the binlog archive loop (required for `serve`) |
+| `archive.server_id` | Replication server id for the archive loop's binlog syncer (required for `serve`, must be unique per agent) |
+| `archive.retention_days` | Delete archived binlogs older than N days (0 = never clean up) |
 
 The MySQL user needs the privileges checked by preflight (SELECT on the
 target schema, `REPLICATION SLAVE`, `REPLICATION CLIENT`).

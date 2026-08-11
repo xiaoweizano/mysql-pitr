@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -865,3 +866,88 @@ func TestPreflight_PrivilegesNoGrants(t *testing.T) {
 	assert.Contains(t, result.Checks[3].Message, "missing")
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
+
+// ---------------------------------------------------------------------------
+// MasterPosition (collector.MySQLInfo)
+// ---------------------------------------------------------------------------
+
+func TestMasterPosition_NotConnected(t *testing.T) {
+	c := NewMySQLConnector()
+	_, err := c.MasterPosition(context.Background())
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "not connected")
+}
+
+func TestMasterPosition_Success(t *testing.T) {
+	c, mock := newMockConnector(t)
+
+	mock.ExpectQuery(regexp.QuoteMeta("SHOW MASTER STATUS")).
+		WillReturnRows(sqlmock.NewRows([]string{"File", "Position"}).
+			AddRow("mysql-bin.000003", 154))
+
+	pos, err := c.MasterPosition(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "mysql-bin.000003", pos.Name)
+	assert.Equal(t, uint32(154), pos.Pos)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestMasterPosition_NoRows(t *testing.T) {
+	// 未启用 binlog 时 SHOW MASTER STATUS 返回空结果集 → sql.ErrNoRows。
+	c, mock := newMockConnector(t)
+
+	mock.ExpectQuery(regexp.QuoteMeta("SHOW MASTER STATUS")).
+		WillReturnRows(sqlmock.NewRows([]string{"File", "Position"}))
+
+	_, err := c.MasterPosition(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no rows")
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestMasterPosition_QueryError(t *testing.T) {
+	c, mock := newMockConnector(t)
+
+	mock.ExpectQuery(regexp.QuoteMeta("SHOW MASTER STATUS")).
+		WillReturnError(errors.New("syntax error"))
+
+	_, err := c.MasterPosition(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "SHOW MASTER STATUS")
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// ---------------------------------------------------------------------------
+// ListBinlogs (collector.MySQLInfo adapter over GetBinlogFiles)
+// ---------------------------------------------------------------------------
+
+func TestListBinlogs_NotConnected(t *testing.T) {
+	c := NewMySQLConnector()
+	_, err := c.ListBinlogs(context.Background())
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "not connected")
+}
+
+func TestListBinlogs_ConvertsToManifestFiles(t *testing.T) {
+	c, mock := newMockConnector(t)
+
+	mock.ExpectQuery(regexp.QuoteMeta("SHOW BINARY LOGS")).
+		WillReturnRows(sqlmock.NewRows([]string{"Log_name", "File_size"}).
+			AddRow("mysql-bin.000001", 512).
+			AddRow("mysql-bin.000002", 1024))
+
+	files, err := c.ListBinlogs(context.Background())
+	require.NoError(t, err)
+	require.Len(t, files, 2)
+	assert.Equal(t, "mysql-bin.000001", files[0].Name)
+	assert.Equal(t, int64(512), files[0].Size)
+	assert.Equal(t, "mysql-bin.000002", files[1].Name)
+	assert.Equal(t, int64(1024), files[1].Size)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// ---------------------------------------------------------------------------
+// Preflight regression: archive.MasterPosition compile-time interface check
+// ---------------------------------------------------------------------------
+
+var _ = gomysql.Position{Name: "mysql-bin.000001", Pos: 4}
