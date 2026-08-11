@@ -19,7 +19,13 @@ const (
 	ActionDelete
 )
 
-type TableRef struct{ Schema, Table string }
+// TableRef identifies a table by schema and table name. The json tags keep the
+// wire form (tx_meta events, persisted filters) on lowercase keys, matching
+// ws.TableRefJSON and the handler's txMetaWire parsing convention.
+type TableRef struct {
+	Schema string `json:"schema"`
+	Table  string `json:"table"`
+}
 
 type TimeRange struct{ Start, End time.Time }
 

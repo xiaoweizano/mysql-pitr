@@ -558,6 +558,12 @@ func TestTransactions_ReturnsPreview(t *testing.T) {
 	require.Len(t, resp.Transactions[0].SQL, 1)
 	assert.Equal(t, "DELETE FROM shop.orders WHERE id=1", resp.Transactions[0].SQL[0].SQL)
 	assert.Empty(t, resp.Transactions[1].SQL)
+
+	// The tx_meta wire uses lowercase table keys (TableRef json tags): the
+	// preview must carry the tables field, not drop it.
+	require.Len(t, resp.Transactions[0].Tables, 1)
+	assert.Equal(t, "shop", resp.Transactions[0].Tables[0].Schema)
+	assert.Equal(t, "orders", resp.Transactions[0].Tables[0].Table)
 }
 
 func TestTransactions_EmptyPreview(t *testing.T) {
@@ -688,7 +694,7 @@ func TestStreamEvent_OpDone_Done(t *testing.T) {
 	agentID := f.createAgent(t, orgID)
 	op := f.createOp(t, "op_done", orgID, agentID, StateExecuting)
 
-	f.injectStreamEvent(t, agentID, op.ID, ws.EvOpDone, map[string]interface{}{"done": 2, "total": 2})
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvOpDone, map[string]interface{}{"done": 2, "total": 2, "paused": false})
 
 	got, err := f.opStore.Get(op.ID)
 	require.NoError(t, err)
@@ -732,6 +738,111 @@ func TestStreamEvent_OpDone_InvalidTransitionIgnored(t *testing.T) {
 	got, err := f.opStore.Get(op.ID)
 	require.NoError(t, err)
 	assert.Equal(t, StateCancelled, got.Status, "a terminal operation must not move on a late event")
+
+	// A rejected transition must not write an audit either.
+	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
+	require.NoError(t, err)
+	assert.Empty(t, entries, "no audit entry for a rejected late op_done")
+}
+
+func TestStreamEvent_OpDone_Paused_Confirmation(t *testing.T) {
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	op := f.createOp(t, "op_paused", orgID, agentID, StatePaused)
+
+	// The agent's executor answers the pause cancel with a FinalReport carrying
+	// paused=true: this is the pause confirmation, not a terminal completion.
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvOpDone, map[string]interface{}{"done": 1, "total": 2, "paused": true})
+
+	got, err := f.opStore.Get(op.ID)
+	require.NoError(t, err)
+	assert.Equal(t, StatePaused, got.Status, "a paused op must stay paused (resumable), not done")
+
+	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "paused", entries[0].Status, "audit records the pause confirmation")
+	assert.Equal(t, "agent", entries[0].Operator)
+}
+
+func TestStreamEvent_OpDone_Paused_WhileExecuting_TransitionsToPaused(t *testing.T) {
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	op := f.createOp(t, "op_exec", orgID, agentID, StateExecuting)
+
+	// Pause acknowledgement racing the HTTP pause handler: the valid
+	// executing -> paused transition is applied instead of a bogus done.
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvOpDone, map[string]interface{}{"done": 3, "total": 5, "paused": true})
+
+	got, err := f.opStore.Get(op.ID)
+	require.NoError(t, err)
+	assert.Equal(t, StatePaused, got.Status)
+
+	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "paused", entries[0].Status)
+}
+
+func TestStreamEvent_OpDone_Paused_OnCancelled_Ignored(t *testing.T) {
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	op := f.createOp(t, "op_term", orgID, agentID, StateCancelled)
+
+	// A stale pause acknowledgement for an already-cancelled op is ignored.
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvOpDone, map[string]interface{}{"done": 1, "total": 2, "paused": true})
+
+	got, err := f.opStore.Get(op.ID)
+	require.NoError(t, err)
+	assert.Equal(t, StateCancelled, got.Status)
+
+	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
+	require.NoError(t, err)
+	assert.Empty(t, entries, "no audit entry for a stale pause confirmation")
+}
+
+func TestStreamEvent_OpError_AfterCancel_NoAudit(t *testing.T) {
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	op := f.createOp(t, "op_cancelled", orgID, agentID, StateCancelled)
+
+	// High-frequency path: the operator cancels a scanning operation and the
+	// agent's scan goroutine exits with context.Canceled pushing op_error.
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvOpError, "context canceled")
+
+	got, err := f.opStore.Get(op.ID)
+	require.NoError(t, err)
+	assert.Equal(t, StateCancelled, got.Status, "a terminal operation must not move to failed")
+
+	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
+	require.NoError(t, err)
+	assert.Empty(t, entries, "no failed audit for a rejected late op_error")
+}
+
+func TestStreamEvent_ScanDone_AfterCancel_NoAudit(t *testing.T) {
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	op := f.createOp(t, "op_cancelled", orgID, agentID, StateCancelled)
+
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvScanDone, map[string]interface{}{})
+
+	got, err := f.opStore.Get(op.ID)
+	require.NoError(t, err)
+	assert.Equal(t, StateCancelled, got.Status)
+
+	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
+	require.NoError(t, err)
+	assert.Empty(t, entries, "no ready audit for a rejected late scan_done")
 }
 
 // ---------- Select ----------
@@ -1268,6 +1379,40 @@ func TestEvents_ClosesOnTerminal(t *testing.T) {
 	require.Never(t, func() bool {
 		return strings.Count(rec.String(), "event:") > 1
 	}, 200*time.Millisecond, 20*time.Millisecond)
+}
+
+func TestEvents_StaysOpenOnPausedOpDone(t *testing.T) {
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	op := f.createOp(t, "op_sse", orgID, agentID, StatePaused)
+
+	rec, done, cancel := f.runEvents(t, op.ID, userID, true)
+	defer cancel()
+
+	// A pause confirmation (op_done with paused=true) is not a terminal event:
+	// no op_done frame is emitted and the stream stays open.
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvOpDone, map[string]interface{}{"done": 1, "total": 2, "paused": true})
+
+	require.Never(t, func() bool {
+		select {
+		case <-done:
+			return true
+		default:
+			return false
+		}
+	}, 400*time.Millisecond, 25*time.Millisecond)
+	assert.Empty(t, rec.String(), "no terminal frame for a pause confirmation")
+
+	// The operation stays paused (resumable), audited as a pause confirmation.
+	got, err := f.opStore.Get(op.ID)
+	require.NoError(t, err)
+	assert.Equal(t, StatePaused, got.Status)
+	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "paused", entries[0].Status)
 }
 
 func TestEvents_TerminalAtSubscribe(t *testing.T) {

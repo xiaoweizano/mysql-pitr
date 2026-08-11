@@ -137,6 +137,11 @@ func TestScan_StreamsTxMetaAndScanDone(t *testing.T) {
 	for _, m := range metas {
 		require.NotEmpty(t, m.TxID)
 		require.Greater(t, m.RowCount, 0)
+		// TableRef json tags 回归：tables 必须落在小写键 wire（txMetaWire 按
+		// schema/table 解析），否则这里会解析为空。
+		require.Len(t, m.Tables, 1, "fixture 全部事务落在 shop.orders")
+		require.Equal(t, "shop", m.Tables[0].Schema)
+		require.Equal(t, "orders", m.Tables[0].Table)
 	}
 	require.Equal(t, ws.EvScanDone, evs[len(evs)-1].Kind, "scan_done 是最后一个事件")
 	require.False(t, sink.hasKind(ws.EvSQL), "meta 模式不产出 SQL 事件")

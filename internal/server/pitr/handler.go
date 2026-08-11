@@ -482,8 +482,12 @@ func (h *Handler) HandleStreamEvent(agentID string, cmd ws.Command) {
 		h.bus.Publish(opID, ev)
 
 	case ws.EvScanDone:
+		// Audit and publish only on a successful transition: a late scan_done
+		// (e.g. after the operator cancelled the scan) must not write a ready
+		// audit or move the terminal state.
 		if err := h.transitionTo(op, StateReady); err != nil {
 			log.Printf("pitr: op %s: scan_done: %v", opID, err)
+			return
 		}
 		h.appendAudit(op, StateReady, "agent", "")
 		h.bus.Publish(opID, ev)
@@ -494,16 +498,32 @@ func (h *Handler) HandleStreamEvent(agentID string, cmd ws.Command) {
 		h.bus.Publish(opID, ev)
 
 	case ws.EvOpDone:
+		// The agent's op_done carries an executor.FinalReport payload
+		// ({"done":..,"total":..,"paused":true|false}). paused=true is the
+		// executor answering a cancel (the pause path): a pause confirmation,
+		// not a terminal completion — no done audit, no terminal SSE close.
+		var report opDonePayload
+		if err := json.Unmarshal(raw, &report); err == nil && report.Paused {
+			h.confirmPause(op, opID, report)
+			return
+		}
+		// Non-paused completion: audit and publish only when the transition is
+		// applied; a late op_done for a terminal operation is ignored.
 		if err := h.transitionTo(op, StateDone); err != nil {
 			log.Printf("pitr: op %s: op_done: %v", opID, err)
+			return
 		}
 		h.appendAudit(op, StateDone, "agent", "")
 		h.forgetPreview(opID)
 		h.bus.Publish(opID, ev)
 
 	case ws.EvOpError:
+		// A late op_error for a terminal operation (e.g. the scan goroutine
+		// exiting with context.Canceled after a cancel) must not write a failed
+		// audit or move the terminal state.
 		if err := h.transitionTo(op, StateFailed); err != nil {
 			log.Printf("pitr: op %s: op_error: %v", opID, err)
+			return
 		}
 		h.appendAudit(op, StateFailed, "agent", errorDetailsFromEvent(raw))
 		h.forgetPreview(opID)
@@ -512,6 +532,42 @@ func (h *Handler) HandleStreamEvent(agentID string, cmd ws.Command) {
 	default:
 		log.Printf("pitr: op %s: unknown stream event kind %q — ignoring", opID, kind)
 	}
+}
+
+// opDonePayload is the subset of the agent's executor.FinalReport that the
+// server needs from an op_done event: the paused flag distinguishes a
+// cancel/pause acknowledgement from a completed run.
+type opDonePayload struct {
+	Done   int  `json:"done"`
+	Total  int  `json:"total"`
+	Paused bool `json:"paused"`
+}
+
+// confirmPause handles an op_done event whose FinalReport carries Paused=true:
+// the agent's executor stopped on the pause cancel. When the operation is
+// paused, or still executing while the pause transition lands, this is the
+// pause acknowledgement: the operation stays resumable — a paused audit is
+// recorded, no done audit is written, and no terminal event is published so
+// SSE subscribers keep their stream open (the op is not terminal; clients
+// observe the pause via /status). The preview is kept for resume. A pause
+// acknowledgement for an operation in any other state is stale and ignored.
+func (h *Handler) confirmPause(op *Operation, opID string, report opDonePayload) {
+	switch op.Status {
+	case StatePaused:
+		// already paused locally — the agent's acknowledgement confirms it.
+	case StateExecuting:
+		// The pause transition has not landed yet (HTTP pause handler in
+		// flight): apply the valid executing → paused transition.
+		if err := h.transitionTo(op, StatePaused); err != nil {
+			log.Printf("pitr: op %s: pause confirmation: %v", opID, err)
+			return
+		}
+	default:
+		log.Printf("pitr: op %s: pause confirmation for op in state %q — ignoring", opID, op.Status)
+		return
+	}
+	h.appendAudit(op, StatePaused, "agent", "")
+	log.Printf("pitr: op %s: agent confirmed pause (done=%d total=%d)", opID, report.Done, report.Total)
 }
 
 // errorDetailsFromEvent extracts the error message from an op_error payload
