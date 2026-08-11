@@ -1016,7 +1016,15 @@ func (h *Handler) Pause(w http.ResponseWriter, r *http.Request) {
 		},
 	})
 	if err != nil {
-		h.failOperation(op, err.Error())
+		// Transport failure: CmdCancel never reached the agent, which is still
+		// executing. Failing the operation here would desync server and agent
+		// state — the agent keeps running and its later op_done would be
+		// rejected as a late event for a terminal operation. (Execute has the
+		// same property, where the state machine already rejects ready ->
+		// failed; executing -> failed is valid, so it must be suppressed
+		// explicitly.) Keep the current state — executing, or paused if a
+		// pause acknowledgement raced in — and answer 502 so the caller can
+		// retry the pause.
 		writeError(w, http.StatusBadGateway, fmt.Sprintf("send pause: %v", err))
 		return
 	}

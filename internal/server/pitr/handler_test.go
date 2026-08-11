@@ -1124,6 +1124,42 @@ func TestPause_NotExecuting(t *testing.T) {
 	assert.Equal(t, http.StatusConflict, w.Code)
 }
 
+func TestPause_SendError_StaysExecuting(t *testing.T) {
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	op := f.createOp(t, "op_pause", orgID, agentID, StateExecuting)
+	f.commander.sendErr = fmt.Errorf("hub: agent disconnected while awaiting response")
+
+	req := f.authenticatedRouteRequest(t, http.MethodPost, "/api/pitr/op_pause/pause", "op_pause", nil, userID)
+	w := httptest.NewRecorder()
+	f.handler.Pause(w, req)
+	assert.Equal(t, http.StatusBadGateway, w.Code)
+
+	// A pause transport failure must not fail the operation: CmdCancel never
+	// reached the agent, which is still executing, so the op stays executing
+	// (retryable) — the agent's later op_done must still be accepted.
+	got, err := f.opStore.Get(op.ID)
+	require.NoError(t, err)
+	assert.Equal(t, StateExecuting, got.Status)
+
+	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
+	require.NoError(t, err)
+	assert.Empty(t, entries, "no audit entry for a pause transport failure")
+
+	// The failure is retryable: once the transport recovers, the same pause
+	// request pauses the operation normally.
+	f.commander.sendErr = nil
+	req = f.authenticatedRouteRequest(t, http.MethodPost, "/api/pitr/op_pause/pause", "op_pause", nil, userID)
+	w = httptest.NewRecorder()
+	f.handler.Pause(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	got, err = f.opStore.Get(op.ID)
+	require.NoError(t, err)
+	assert.Equal(t, StatePaused, got.Status)
+}
+
 func TestResume_ResendsExecute(t *testing.T) {
 	f := setupTest(t)
 	userID := f.createUser(t)

@@ -1,8 +1,10 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 )
 
 // schemaVersion is the latest schema version, tracked via PRAGMA user_version.
@@ -96,8 +98,11 @@ var migrations = map[int]string{
 }
 
 // Migrate idempotently brings db up to the current schema version: applied
-// versions are skipped via PRAGMA user_version, and every statement uses
-// CREATE TABLE IF NOT EXISTS. Safe to call repeatedly.
+// versions are skipped via PRAGMA user_version. Each version's script runs
+// inside a single transaction (see applyVersion), so a mid-script failure
+// rolls back the whole version — partial DDL and the user_version bump
+// included — and the database is left cleanly at the previous version, ready
+// for a re-run after the conflict is resolved. Safe to call repeatedly.
 func Migrate(db *sql.DB) error {
 	var current int
 	if err := db.QueryRow("PRAGMA user_version").Scan(&current); err != nil {
@@ -108,12 +113,39 @@ func Migrate(db *sql.DB) error {
 		if !ok {
 			return fmt.Errorf("store: no migration for schema version %d", v)
 		}
-		if _, err := db.Exec(ddl); err != nil {
-			return fmt.Errorf("store: apply schema version %d: %w", v, err)
+		if err := applyVersion(db, v, ddl); err != nil {
+			return err
 		}
-		if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", v)); err != nil {
-			return fmt.Errorf("store: set schema version %d: %w", v, err)
-		}
+	}
+	return nil
+}
+
+// applyVersion runs one version's upgrade script as a single all-or-nothing
+// transaction on a pinned connection:
+//
+//	BEGIN; <ddl>; PRAGMA user_version = v; COMMIT;
+//
+// SQLite DDL is transactional, so on failure the driver stops at the failing
+// statement and the explicit ROLLBACK reverts every statement of the script
+// plus the version bump. Two details matter: the modernc driver does not roll
+// back an open transaction by itself, and the ROLLBACK must run on the same
+// connection that executed the script, so the connection is pinned via
+// db.Conn rather than going through the pool.
+func applyVersion(db *sql.DB, v int, ddl string) error {
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("store: apply schema version %d: %w", v, err)
+	}
+	defer conn.Close()
+
+	script := "BEGIN;\n" + ddl + "\nPRAGMA user_version = " + strconv.Itoa(v) + ";\nCOMMIT;"
+	if _, err := conn.ExecContext(ctx, script); err != nil {
+		// The transaction started by BEGIN is still open: the driver stops at
+		// the failing statement, so clean it up before the connection returns
+		// to the pool.
+		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		return fmt.Errorf("store: apply schema version %d: %w", v, err)
 	}
 	return nil
 }
