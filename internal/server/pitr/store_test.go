@@ -243,6 +243,43 @@ func TestFilter_EmptyFilterRoundTrip(t *testing.T) {
 	assert.Equal(t, mysql.Position{}, got.Filter.StartPos)
 }
 
+func TestUpdateIfStatus_CAS(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	op := &Operation{ID: "op_cas", OrgID: "org_a", AgentID: "agent_1", Type: "pitr", Mode: "sql", Status: StateReady, CreatedBy: "user_1", CreatedAt: now, UpdatedAt: now}
+	require.NoError(t, s.Create(op))
+
+	// First CAS wins: ready -> executing.
+	op.Status = StateExecuting
+	op.UpdatedAt = now.Add(time.Minute)
+	applied, err := s.UpdateIfStatus(op, StateReady)
+	require.NoError(t, err)
+	assert.True(t, applied, "CAS from the current status must apply")
+
+	got, err := s.Get("op_cas")
+	require.NoError(t, err)
+	assert.Equal(t, StateExecuting, got.Status)
+
+	// A second CAS with a stale `from` (still ready) must fail: RowsAffected
+	// 0, no error, and the target status must not overwrite the persisted one.
+	op.Status = StateDone
+	applied, err = s.UpdateIfStatus(op, StateReady)
+	require.NoError(t, err)
+	assert.False(t, applied, "CAS from a stale status must not apply")
+
+	got, err = s.Get("op_cas")
+	require.NoError(t, err)
+	assert.Equal(t, StateExecuting, got.Status, "a lost CAS must not overwrite the persisted status")
+
+	// A CAS from the actual current status still applies afterwards.
+	applied, err = s.UpdateIfStatus(op, StateExecuting)
+	require.NoError(t, err)
+	assert.True(t, applied, "CAS from the updated status must apply")
+	got, err = s.Get("op_cas")
+	require.NoError(t, err)
+	assert.Equal(t, StateDone, got.Status)
+}
+
 func TestUpdate_StatusMigrationPersists(t *testing.T) {
 	s := newTestStore(t)
 	op := &Operation{ID: "op_migrate", OrgID: "org_a", AgentID: "agent_1", Type: "pitr", Mode: "sql"}

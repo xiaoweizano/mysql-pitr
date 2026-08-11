@@ -141,6 +141,31 @@ func (s *SQLiteOperationStore) Update(op *Operation) error {
 	return nil
 }
 
+// UpdateIfStatus is the compare-and-swap form of a state transition: it
+// updates the operation's status (and updated_at) only while the persisted
+// status still equals `from`, closing the read-modify-write window of
+// Get-then-Update. It reports whether the update applied (RowsAffected==1);
+// a false result with no error means another actor moved the operation first
+// and the caller must treat the transition as lost. Unlike Update it touches
+// only status and updated_at, so a transition cannot clobber concurrent field
+// writes.
+func (s *SQLiteOperationStore) UpdateIfStatus(op *Operation, from OperationState) (bool, error) {
+	if op.UpdatedAt.IsZero() {
+		op.UpdatedAt = time.Now()
+	}
+	res, err := s.db.Exec(
+		"UPDATE operations SET status = ?, updated_at = ? WHERE id = ? AND status = ?",
+		string(op.Status), formatStoreTime(op.UpdatedAt), op.ID, string(from))
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // ListByOrg returns all operations of an organisation (statement rows not
 // included; use Get for the full record).
 func (s *SQLiteOperationStore) ListByOrg(orgID string) ([]*Operation, error) {

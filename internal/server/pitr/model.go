@@ -54,6 +54,12 @@ type OperationStore interface {
 	Get(id string) (*Operation, error)
 	// Update persists the whole operation record (state/field update).
 	Update(op *Operation) error
+	// UpdateIfStatus is a compare-and-swap state transition: it applies
+	// `op.Status` only while the persisted status still equals `from`, so a
+	// concurrent transition can never be silently overwritten. It reports
+	// whether the update was applied (RowsAffected==1); false means another
+	// actor already moved the operation.
+	UpdateIfStatus(op *Operation, from OperationState) (bool, error)
 	ListByOrg(orgID string) ([]*Operation, error)
 	ListByAgent(agentID string) ([]*Operation, error)
 	// SaveStatements replaces all stored statements of an operation with the

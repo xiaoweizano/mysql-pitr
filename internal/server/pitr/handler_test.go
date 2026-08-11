@@ -814,6 +814,51 @@ func TestStreamEvent_OpError_Failed(t *testing.T) {
 	assert.Equal(t, "mysql connection lost", entries[0].ErrorDetails)
 }
 
+func TestOpDone_ArrivesBeforeExecutePersisted(t *testing.T) {
+	// Phase 3 race root cause: the execute handler sends CmdExecute and the
+	// agent finishes before the ready -> executing transition is persisted.
+	// op_done must treat the ready op as executing (idempotent fallback: the
+	// data was restored, so the op must land in done), exactly one audit.
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	op := f.createOp(t, "op_race", orgID, agentID, StateReady)
+
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvOpDone,
+		map[string]interface{}{"done": 2, "total": 2, "paused": false})
+
+	got, err := f.opStore.Get(op.ID)
+	require.NoError(t, err)
+	assert.Equal(t, StateDone, got.Status, "op_done to a ready op must fall back to executing then done")
+
+	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "exactly one done audit")
+	assert.Equal(t, "done", entries[0].Status)
+}
+
+func TestOpDone_OnCancelled_Unchanged(t *testing.T) {
+	// A late op_done for an already-cancelled op leaves it cancelled with no
+	// audit — the transition is rejected under CAS just as before (T6 case).
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	f.createOp(t, "op_cancelled", orgID, agentID, StateCancelled)
+
+	f.injectStreamEvent(t, agentID, "op_cancelled", ws.EvOpDone,
+		map[string]interface{}{"done": 1, "total": 1, "paused": false})
+
+	got, err := f.opStore.Get("op_cancelled")
+	require.NoError(t, err)
+	assert.Equal(t, StateCancelled, got.Status, "a terminal operation must not move on a late op_done")
+
+	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
+	require.NoError(t, err)
+	assert.Empty(t, entries, "no audit entry for a rejected late op_done")
+}
+
 func TestStreamEvent_OpDone_InvalidTransitionIgnored(t *testing.T) {
 	f := setupTest(t)
 	userID := f.createUser(t)

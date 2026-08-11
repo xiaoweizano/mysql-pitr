@@ -311,16 +311,35 @@ func statementsToWire(stmts []Statement) []ws.StatementWire {
 }
 
 // transitionTo applies the state machine transition from the operation's
-// current status to `to` and persists it. Invalid transitions (e.g. a late
-// op_done arriving after the operation was cancelled locally) are rejected and
-// reported, never applied.
-func (h *Handler) transitionTo(op *Operation, to OperationState) error {
-	if err := TryTransitionErr(op.Status, to); err != nil {
-		return err
+// current status to `to` and persists it with a conditional update (CAS): the
+// row is only touched while its persisted status still equals the status this
+// call was made against. A concurrent transition therefore cannot be silently
+// overwritten — the CAS either wins (ok=true, op.Status == to) or loses
+// (ok=false, op.Status rolled back to the pre-call status), in which case the
+// caller must treat the operation as already advanced by another actor and
+// must not audit or publish. Invalid transitions (e.g. a late op_done arriving
+// after the operation was cancelled locally) are rejected and reported, never
+// applied.
+func (h *Handler) transitionTo(op *Operation, to OperationState) (bool, error) {
+	from := op.Status
+	if err := TryTransitionErr(from, to); err != nil {
+		return false, err
 	}
 	op.Status = to
 	op.UpdatedAt = time.Now()
-	return h.opStore.Update(op)
+	ok, err := h.opStore.UpdateIfStatus(op, from)
+	if err != nil {
+		op.Status = from
+		return false, err
+	}
+	if !ok {
+		// Another actor won the CAS: roll the in-memory record back to the
+		// status it was read with so callers that log or report op.Status stay
+		// truthful about the failed attempt.
+		op.Status = from
+		return false, nil
+	}
+	return true, nil
 }
 
 // appendAudit records an audit entry for an operation state change. Stream
@@ -339,18 +358,22 @@ func (h *Handler) appendAudit(op *Operation, state OperationState, operator, err
 
 // failOperation marks an operation failed after a command transport or agent
 // rejection. The transition is only applied where the state machine allows it
-// (created/scanning/executing); operations in stable, retryable states (ready,
-// paused) are left untouched so the operator can retry or cancel.
+// (created/scanning/executing), under CAS so a racing terminal event (e.g.
+// op_done landing as done while the failure is in flight) wins cleanly;
+// operations in stable, retryable states (ready, paused) are left untouched so
+// the operator can retry or cancel.
 func (h *Handler) failOperation(op *Operation, details string) {
-	if err := TryTransitionErr(op.Status, StateFailed); err != nil {
+	ok, err := h.transitionTo(op, StateFailed)
+	if err != nil {
 		log.Printf("pitr: op %s: agent failure %q left operation in state %q (retryable)", op.ID, details, op.Status)
 		return
 	}
-	op.Status = StateFailed
-	op.UpdatedAt = time.Now()
-	if err := h.opStore.Update(op); err == nil {
-		h.appendAudit(op, StateFailed, "agent", details)
+	if !ok {
+		log.Printf("pitr: op %s: agent failure %q raced a concurrent transition — no failed audit (state %q)", op.ID, details, op.Status)
+		h.forgetPreview(op.ID)
+		return
 	}
+	h.appendAudit(op, StateFailed, "agent", details)
 	h.forgetPreview(op.ID)
 }
 
@@ -485,9 +508,15 @@ func (h *Handler) HandleStreamEvent(agentID string, cmd ws.Command) {
 	case ws.EvScanDone:
 		// Audit and publish only on a successful transition: a late scan_done
 		// (e.g. after the operator cancelled the scan) must not write a ready
-		// audit or move the terminal state.
-		if err := h.transitionTo(op, StateReady); err != nil {
+		// audit or move the terminal state. CAS failure means a concurrent actor
+		// already advanced the operation — no audit.
+		ok, err := h.transitionTo(op, StateReady)
+		if err != nil {
 			log.Printf("pitr: op %s: scan_done: %v", opID, err)
+			return
+		}
+		if !ok {
+			log.Printf("pitr: op %s: scan_done ignored — operation advanced concurrently", opID)
 			return
 		}
 		h.appendAudit(op, StateReady, "agent", "")
@@ -530,8 +559,34 @@ func (h *Handler) HandleStreamEvent(agentID string, cmd ws.Command) {
 		// applied; a late op_done for a terminal operation is ignored. Statement
 		// errors recorded by the executor surface in the audit detail (the SSE
 		// payload passes the raw errors through to the front-end verbatim).
-		if err := h.transitionTo(op, StateDone); err != nil {
+		//
+		// Idempotent fallback for the execute transition race: the agent can
+		// finish (op_done arrives) before the execute handler persists the
+		// ready -> executing transition, leaving the op on disk as ready even
+		// though the restore ran. A ready op is treated as executing: the
+		// fallback CAS persists executing (false only when a concurrent actor
+		// already advanced the state), then the executing -> done migration
+		// below is CAS-authoritative either way — a lost fallback never writes
+		// a bogus done.
+		if op.Status == StateReady {
+			op.Status = StateExecuting
+			op.UpdatedAt = time.Now()
+			applied, ferr := h.opStore.UpdateIfStatus(op, StateReady)
+			if ferr != nil {
+				log.Printf("pitr: op %s: op_done fallback: %v", opID, ferr)
+				return
+			}
+			if !applied {
+				log.Printf("pitr: op %s: op_done fallback lost — operation advanced concurrently", opID)
+			}
+		}
+		ok, err := h.transitionTo(op, StateDone)
+		if err != nil {
 			log.Printf("pitr: op %s: op_done: %v", opID, err)
+			return
+		}
+		if !ok {
+			log.Printf("pitr: op %s: op_done ignored — operation advanced concurrently", opID)
 			return
 		}
 		h.appendAudit(op, StateDone, "agent", errorSummary(report.Errors))
@@ -541,9 +596,15 @@ func (h *Handler) HandleStreamEvent(agentID string, cmd ws.Command) {
 	case ws.EvOpError:
 		// A late op_error for a terminal operation (e.g. the scan goroutine
 		// exiting with context.Canceled after a cancel) must not write a failed
-		// audit or move the terminal state.
-		if err := h.transitionTo(op, StateFailed); err != nil {
+		// audit or move the terminal state. CAS failure means a concurrent actor
+		// already advanced the operation — no audit.
+		ok, err := h.transitionTo(op, StateFailed)
+		if err != nil {
 			log.Printf("pitr: op %s: op_error: %v", opID, err)
+			return
+		}
+		if !ok {
+			log.Printf("pitr: op %s: op_error ignored — operation advanced concurrently", opID)
 			return
 		}
 		h.appendAudit(op, StateFailed, "agent", errorDetailsFromEvent(raw))
@@ -602,9 +663,16 @@ func (h *Handler) confirmPause(op *Operation, opID string, report opDonePayload)
 		// already paused locally — the agent's acknowledgement confirms it.
 	case StateExecuting:
 		// The pause transition has not landed yet (HTTP pause handler in
-		// flight): apply the valid executing → paused transition.
-		if err := h.transitionTo(op, StatePaused); err != nil {
+		// flight): apply the valid executing → paused transition under CAS. A
+		// CAS loss means a concurrent actor (e.g. the non-paused op_done)
+		// already advanced the operation — no paused audit.
+		ok, err := h.transitionTo(op, StatePaused)
+		if err != nil {
 			log.Printf("pitr: op %s: pause confirmation: %v", opID, err)
+			return
+		}
+		if !ok {
+			log.Printf("pitr: op %s: pause confirmation lost to a concurrent transition", opID)
 			return
 		}
 	default:
@@ -796,8 +864,11 @@ func (h *Handler) Start(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.transitionTo(op, StateScanning); err != nil {
+	if ok, err := h.transitionTo(op, StateScanning); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	} else if !ok {
+		writeError(w, http.StatusConflict, "operation state changed concurrently — reload and retry")
 		return
 	}
 
@@ -1026,8 +1097,13 @@ func (h *Handler) sendExecute(w http.ResponseWriter, r *http.Request, op *Operat
 		return
 	}
 
-	if err := h.transitionTo(op, to); err != nil {
+	if ok, err := h.transitionTo(op, to); err != nil {
 		writeError(w, http.StatusConflict, err.Error())
+		return
+	} else if !ok {
+		// The CAS lost to a concurrent transition (e.g. op_done landed as done
+		// while this command was in flight): answer 409 so the client reloads.
+		writeError(w, http.StatusConflict, "operation state changed concurrently — reload and retry")
 		return
 	}
 
@@ -1079,8 +1155,11 @@ func (h *Handler) Pause(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.transitionTo(op, StatePaused); err != nil {
+	if ok, err := h.transitionTo(op, StatePaused); err != nil {
 		writeError(w, http.StatusConflict, err.Error())
+		return
+	} else if !ok {
+		writeError(w, http.StatusConflict, "operation state changed concurrently — reload and retry")
 		return
 	}
 
@@ -1115,8 +1194,11 @@ func (h *Handler) Cancel(w http.ResponseWriter, r *http.Request) {
 		},
 	})
 
-	if err := h.transitionTo(op, StateCancelled); err != nil {
+	if ok, err := h.transitionTo(op, StateCancelled); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	} else if !ok {
+		writeError(w, http.StatusConflict, "operation state changed concurrently — reload and retry")
 		return
 	}
 	h.forgetPreview(op.ID)
