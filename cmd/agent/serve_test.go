@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +20,7 @@ import (
 	"github.com/a-shan/mysql-pitr/internal/connector"
 	"github.com/a-shan/mysql-pitr/internal/daemon"
 	"github.com/a-shan/mysql-pitr/internal/executor"
+	"github.com/a-shan/mysql-pitr/internal/reverse"
 	"github.com/a-shan/mysql-pitr/internal/ws"
 )
 
@@ -34,16 +38,21 @@ func testServeDaemon(t *testing.T) *serveDaemon {
 
 // withFailingExec 把 daemon 换成「exec 工厂永远失败」的版本，让 execute/resume
 // 的接受测试不触碰真 MySQL（handler 返回 accepted 时 goroutine 才异步失败）。
-func (d *serveDaemon) withFailingExec(t *testing.T) *serveDaemon {
+// 返回的 *int32 在工厂被调用时 +1（工厂调用发生在检查点文件落盘之后、goroutine
+// 结束之前）——接受测试用它等待异步 goroutine 收尾，避免测试返回时后台 goroutine
+// 仍在向 t.TempDir 写检查点文件（Windows 上会与 TempDir 清理竞争）。
+func (d *serveDaemon) withFailingExec(t *testing.T) (*serveDaemon, *int32) {
 	t.Helper()
+	var calls int32
 	d.daemon = daemon.NewDaemon(
 		daemon.ScanDeps{ArchiveDir: t.TempDir(), Logger: d.logger()},
 		executor.NewExecutor(func(plan executor.Plan) (executor.DB, error) {
+			atomic.AddInt32(&calls, 1)
 			return nil, errors.New("test: db factory disabled")
 		}, executor.NewFileCheckpointStore(t.TempDir())),
 		d.loopState, d,
 	)
-	return d
+	return d, &calls
 }
 
 // ---------------------------------------------------------------------------
@@ -54,6 +63,54 @@ func TestNewServeDaemon_WiresDaemon(t *testing.T) {
 	d := testServeDaemon(t)
 	require.NotNil(t, d.daemon, "daemon command layer must be wired")
 	require.Nil(t, d.loop, "loop stays nil until startArchiveLoop")
+}
+
+// TestNewServeDaemon_ExecutorWired 验证 executor 构造接线：archive.dir 配置时
+// executor 非 nil（检查点目录派生自归档目录的兄弟目录）；未配置 archive 时
+// executor 返回 nil（Execute/Resume 报 "executor not configured"，且不会把
+// checkpoints 落到进程 cwd）。
+func TestNewServeDaemon_ExecutorWired(t *testing.T) {
+	cfg := &config.Config{
+		MySQL: config.MySQLConfig{
+			Host: "127.0.0.1", Port: 3306, User: "u", Password: "p", Database: "d",
+		},
+		Archive: &config.ArchiveConfig{Dir: filepath.Join(t.TempDir(), "archive"), ServerID: 1},
+	}
+	d := newServeDaemon(cfg, "agent-1")
+	require.NotNil(t, d.daemon, "daemon command layer must be wired")
+	require.NotNil(t, d.newExecutor(), "archive.dir 配置时 executor 必须构造")
+
+	// testServeDaemon 的 cfg 未配置 archive：executor 应禁用（不启用执行）。
+	d2 := testServeDaemon(t)
+	require.Nil(t, d2.newExecutor(), "未配置 archive 时不启用执行")
+}
+
+// TestNewServeDaemon_ExecutorFactoryBindsLocalMySQL 验证 executor 工厂绑定 agent
+// 本地 MySQL 配置而非 Plan.DSN：cfg 指向一个不监听的高端口（3399），Run 时工厂
+// 必须按本地配置发起连接——错误须来自 connector.Connect 的主动 ping 且含该端口。
+// 单测环境无真实 MySQL，以「按本地 cfg 尝试连接并失败」反证工厂绑定正确。
+func TestNewServeDaemon_ExecutorFactoryBindsLocalMySQL(t *testing.T) {
+	const bindPort = 3399
+	cfg := &config.Config{
+		MySQL: config.MySQLConfig{
+			Host: "127.0.0.1", Port: bindPort, User: "u", Password: "p", Database: "d",
+		},
+		Archive: &config.ArchiveConfig{Dir: filepath.Join(t.TempDir(), "archive"), ServerID: 1},
+	}
+	d := newServeDaemon(cfg, "agent-1")
+	exec := d.newExecutor()
+	require.NotNil(t, exec)
+
+	// Plan.DSN 为空；工厂必须忽略它并按本地 MySQL 配置（127.0.0.1:3399）连接。
+	_, err := exec.Run(context.Background(), executor.Plan{
+		OperationID: "op-factory-bind",
+		Statements:  []reverse.Statement{{SQL: "SELECT 1"}},
+	}, nil)
+	require.Error(t, err, "本环境无 MySQL 监听 3399，Run 必须失败")
+	assert.True(t, strings.Contains(err.Error(), "3399"),
+		"工厂应按 agent 本地 MySQL 配置（端口 %d）连接而非 Plan.DSN；err=%v", bindPort, err)
+	assert.Contains(t, err.Error(), "connector: ping failed",
+		"连接错误应来自 connector.Connect 的主动 ping（工厂时点即失败）")
 }
 
 // ---------------------------------------------------------------------------
@@ -126,7 +183,7 @@ func TestHandleScan_UnknownMode(t *testing.T) {
 }
 
 func TestHandleExecute_Accepted(t *testing.T) {
-	d := testServeDaemon(t).withFailingExec(t)
+	d, factoryCalls := testServeDaemon(t).withFailingExec(t)
 	resp := d.handleExecute(context.Background(), ws.Command{
 		Cmd: "exec-1", Type: ws.CmdExecute,
 		Params: map[string]interface{}{
@@ -149,6 +206,11 @@ func TestHandleExecute_Accepted(t *testing.T) {
 	// op 注册表以命令 ID 为键，server 须把该值原样发给 cancel。请求里的
 	// operationId 是检查点文件名（另一命名空间），不得混用。
 	assert.Equal(t, "exec-1", result["operationId"])
+
+	// 等异步执行 goroutine 到达工厂（检查点已落盘、不再写临时目录）再返回，
+	// 避免测试 teardown 与后台写入竞争（Windows TempDir 清理竞态）。
+	require.Eventually(t, func() bool { return atomic.LoadInt32(factoryCalls) > 0 },
+		2*time.Second, 5*time.Millisecond, "execute goroutine should reach the db factory")
 }
 
 func TestHandleExecute_MissingOperationID(t *testing.T) {
@@ -163,7 +225,7 @@ func TestHandleExecute_MissingOperationID(t *testing.T) {
 }
 
 func TestHandleResume_Accepted(t *testing.T) {
-	d := testServeDaemon(t).withFailingExec(t)
+	d, factoryCalls := testServeDaemon(t).withFailingExec(t)
 	resp := d.handleResume(context.Background(), ws.Command{
 		Cmd: "resume-1", Type: ws.CmdResume,
 		Params: map[string]interface{}{
@@ -183,6 +245,10 @@ func TestHandleResume_Accepted(t *testing.T) {
 	require.True(t, ok)
 	// 与 execute 同一契约：operationId 回显命令 ID（cmd.Cmd）。
 	assert.Equal(t, "resume-1", result["operationId"])
+
+	// 同 TestHandleExecute_Accepted：等异步 goroutine 到达工厂再返回。
+	require.Eventually(t, func() bool { return atomic.LoadInt32(factoryCalls) > 0 },
+		2*time.Second, 5*time.Millisecond, "resume goroutine should reach the db factory")
 }
 
 func TestHandleCancel_NoSuchOp(t *testing.T) {

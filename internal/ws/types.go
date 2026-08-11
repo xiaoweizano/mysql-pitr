@@ -50,6 +50,9 @@ const (
 	CmdResume        = "resume"
 	CmdCancel        = "cancel"
 	CmdArchiveStatus = "archive_status"
+	// CmdStreamEvent 是 agent→server 单向流推送（scan tx/sql、执行进度）的
+	// wire 命令类型（envelope type；见 StreamEvent）。
+	CmdStreamEvent = "stream_event"
 )
 
 // ScanRequest is the scan command params (wire form, mirrors binlog.Filter).

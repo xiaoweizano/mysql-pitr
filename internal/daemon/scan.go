@@ -55,7 +55,19 @@ func (d *Daemon) Scan(ctx context.Context, id string, req ws.ScanRequest) error 
 				d.sink.Send(ws.StreamEvent{ID: id, Kind: ws.EvTxMeta, Data: data})
 			}
 			if len(r.SQL) > 0 {
-				if data, err := json.Marshal(r.SQL); err == nil {
+				// wire 归一化：reverse.Statement 是内部表示（大写键 + SourceRow
+				// 行镜像），server 只需执行面信息，推送 []ws.StatementWire
+				// （小写驼峰、无 SourceRow）。
+				wire := make([]ws.StatementWire, 0, len(r.SQL))
+				for _, s := range r.SQL {
+					wire = append(wire, ws.StatementWire{
+						SQL:      s.SQL,
+						TxID:     s.TxID,
+						TxOrder:  s.TxOrder,
+						Warnings: s.Warnings,
+					})
+				}
+				if data, err := json.Marshal(wire); err == nil {
 					d.sink.Send(ws.StreamEvent{ID: id, Kind: ws.EvSQL, Data: data})
 				}
 			}

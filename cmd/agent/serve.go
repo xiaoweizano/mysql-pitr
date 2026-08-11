@@ -102,22 +102,26 @@ func (d *serveDaemon) loopState() collector.State {
 	return l.State()
 }
 
-// newExecutor 构造 Phase 2 的执行器。DBConnFactory 用 agent 自身的 MySQL 连接
-// 配置打开连接（executor.Plan.DSN 在 Phase 2 为空；Phase 3 由 server 层注入
-// DSN 后替换）。data_dir 未配置时不启用执行（Execute/Resume 返回错误）。
+// newExecutor 构造执行器。DBConnFactory 用 agent 自身的本地 MySQL 连接配置打开
+// 连接——executor.Plan.DSN 在 Phase 3 由 server 层注入前为空，工厂忽略 Plan 的
+// DSN，一律按 agent 本地配置执行；连接生命周期由 executor 的 DB 接口管理
+// （Run 结束 Close）。检查点目录放在归档目录旁（archive.dir 的兄弟目录
+// checkpoints/）；archive 未配置时返回 nil（Execute/Resume 报 "executor not
+// configured"）。
 func (d *serveDaemon) newExecutor() executor.Executor {
-	if d.cfg.DataDir == "" {
+	archiveDir := d.archiveDir()
+	if archiveDir == "" {
 		return nil
 	}
-	cpDir := filepath.Join(d.cfg.DataDir, "checkpoints")
+	cpDir := filepath.Join(filepath.Dir(archiveDir), "checkpoints")
 	_ = os.MkdirAll(cpDir, 0o755) // FileCheckpointStore 不自动建目录
 	return executor.NewExecutor(
-		func(plan executor.Plan) (executor.DB, error) {
-			db, err := sql.Open("mysql", d.cfg.MySQL.BuildDSN())
-			if err != nil {
-				return nil, fmt.Errorf("open mysql: %w", err)
+		func(executor.Plan) (executor.DB, error) {
+			conn := connector.NewMySQLConnector()
+			if err := conn.Connect(d.connCfg); err != nil {
+				return nil, friendlyConnError(d.connCfg, err)
 			}
-			return connector.NewMySQLConnectorWithDB(db), nil
+			return conn.AsDB(), nil
 		},
 		executor.NewFileCheckpointStore(cpDir),
 	)
@@ -128,8 +132,8 @@ func (d *serveDaemon) logger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, nil))
 }
 
-// streamEventType 是 daemon 流事件推送的 wire 命令类型。
-const streamEventType = "stream_event"
+// streamEventType 是 daemon 流事件推送的 wire 命令类型（单一来源在 ws 包）。
+const streamEventType = ws.CmdStreamEvent
 
 // streamEventCommand 把 StreamEvent 包装成单向推送的 ws.Command。信封约定
 // （Phase 3 server 按此解包）：

@@ -198,6 +198,12 @@ func TestCommandTypeConstants(t *testing.T) {
 	}
 }
 
+func TestCmdStreamEventConstant(t *testing.T) {
+	if CmdStreamEvent != "stream_event" {
+		t.Fatalf("CmdStreamEvent = %q, want %q", CmdStreamEvent, "stream_event")
+	}
+}
+
 func TestStreamEventKindConstants(t *testing.T) {
 	expected := map[string]string{
 		"EvTxMeta":   EvTxMeta,

@@ -240,6 +240,88 @@ func TestScan_SelectedSQLModeGeneratesStatements(t *testing.T) {
 	require.Equal(t, 1, txMetaN, "selected 模式只命中一个事务")
 }
 
+// TestScan_SelectedSQLModeEmitsStatementWire 验证 selected 模式的 EvSQL 事件 Data
+// 是归一化的 []ws.StatementWire：字段为小写驼峰键（sql/txId/txOrder/warnings）、
+// 无 SourceRow、无 reverse.Statement 大写键泄漏。
+func TestScan_SelectedSQLModeEmitsStatementWire(t *testing.T) {
+	ctx := context.Background()
+	dir := fixtureDir(t)
+
+	// 第一遍：meta 扫拿 TxID
+	sink1 := &fakeSink{}
+	d1 := daemon.NewDaemon(daemon.ScanDeps{
+		ArchiveDir:    dir,
+		SchemaFetcher: fixtureSchema,
+	}, nil, nil, sink1)
+	require.NoError(t, d1.Scan(ctx, "scan-wire-meta", ws.ScanRequest{
+		Filter: ws.ScanFilter{}, Mode: "meta",
+	}))
+	require.Eventually(t, func() bool { return sink1.hasKind(ws.EvScanDone) },
+		5*time.Second, 10*time.Millisecond)
+
+	var selTxID string
+	for _, ev := range sink1.eventsCopy() {
+		if ev.Kind == ws.EvTxMeta {
+			var m txMetaWire
+			require.NoError(t, json.Unmarshal(ev.Data, &m))
+			selTxID = m.TxID
+			break
+		}
+	}
+	require.NotEmpty(t, selTxID)
+
+	// 第二遍：selected 定向二次扫描
+	sink2 := &fakeSink{}
+	d2 := daemon.NewDaemon(daemon.ScanDeps{
+		ArchiveDir:    dir,
+		SchemaFetcher: fixtureSchema,
+	}, nil, nil, sink2)
+	require.NoError(t, d2.Scan(ctx, "scan-wire-sel", ws.ScanRequest{
+		Filter: ws.ScanFilter{SelectedTxIDs: []string{selTxID}},
+		Mode:   "selected",
+	}))
+	require.Eventually(t, func() bool { return sink2.hasKind(ws.EvScanDone) },
+		5*time.Second, 10*time.Millisecond)
+
+	var sqlEvs []ws.StreamEvent
+	for _, ev := range sink2.eventsCopy() {
+		if ev.Kind == ws.EvSQL {
+			sqlEvs = append(sqlEvs, ev)
+		}
+	}
+	require.NotEmpty(t, sqlEvs, "selected 扫描必须产出 SQL 事件")
+
+	for _, ev := range sqlEvs {
+		// 归一化反序列化：Data 必须能解析为 []ws.StatementWire
+		var wires []ws.StatementWire
+		require.NoError(t, json.Unmarshal(ev.Data, &wires))
+		require.NotEmpty(t, wires, "SQL 事件 data 是 statement 数组")
+		for _, w := range wires {
+			require.NotEmpty(t, w.SQL, "每条 wire statement 都有 sql")
+			require.Equal(t, selTxID, w.TxID, "wire statement 的 txId 命中被选事务")
+			require.GreaterOrEqual(t, w.TxOrder, 0)
+		}
+
+		// 原始键检查：小写驼峰白名单，杜绝 SourceRow / reverse.Statement
+		// 大写键（SQL/TxID/TxOrder/Warnings）泄漏上 wire
+		var raw []map[string]interface{}
+		require.NoError(t, json.Unmarshal(ev.Data, &raw))
+		require.NotEmpty(t, raw)
+		for _, stmt := range raw {
+			for k := range stmt {
+				switch k {
+				case "sql", "txId", "txOrder", "warnings":
+				default:
+					t.Fatalf("EvSQL wire 泄漏非归一化键 %q（SourceRow/大写键不应上 wire）", k)
+				}
+			}
+			require.Contains(t, stmt, "sql", "wire 键为小写驼峰 sql")
+			require.Contains(t, stmt, "txId", "wire 键为小写驼峰 txId")
+			require.Contains(t, stmt, "txOrder", "wire 键为小写驼峰 txOrder")
+		}
+	}
+}
+
 // runMetaScan 对 fixture 目录跑一次 meta 扫描，等 scan_done 后返回全部事件。
 func runMetaScan(t *testing.T, id string, filter ws.ScanFilter) []ws.StreamEvent {
 	t.Helper()
