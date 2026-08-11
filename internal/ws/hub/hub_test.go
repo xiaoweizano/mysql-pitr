@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"reflect"
 	"testing"
 	"time"
 
@@ -349,6 +350,82 @@ func TestPITRProgressDelivery(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("progress handler was not invoked")
+	}
+}
+
+// TestStreamEventDelivery verifies that an agent-pushed stream_event envelope
+// is routed to the registered stream event handler with agentID and the raw
+// command (params id/kind/data preserved as sent).
+func TestStreamEventDelivery(t *testing.T) {
+	bundle := generateTestCerts(t, "stream-agent")
+	hub := NewHub("")
+
+	type delivery struct {
+		agentID string
+		cmd     ws.Command
+	}
+	received := make(chan delivery, 1)
+	hub.SetStreamEventHandler(func(agentID string, cmd ws.Command) {
+		received <- delivery{agentID: agentID, cmd: cmd}
+	})
+
+	serverURL := newTestTLSServer(t, hub, bundle)
+	conn := dialTestAgent(t, serverURL, bundle, "stream-agent")
+	defer conn.Close()
+
+	time.Sleep(200 * time.Millisecond)
+
+	// The agent pushes a stream_event envelope. On the wire, params carry the
+	// id/kind/data of a ws.StreamEvent; data is raw JSON that round-trips to a
+	// generic decoded value.
+	ev := ws.StreamEvent{
+		ID:   "scan-1",
+		Kind: ws.EvTxMeta,
+		Data: json.RawMessage(`{"txId":"00000001-0000-0000-0000-000000000001:1","rows":3}`),
+	}
+	var dataVal interface{}
+	if err := json.Unmarshal(ev.Data, &dataVal); err != nil {
+		t.Fatalf("unmarshal event data: %v", err)
+	}
+	envelope := ws.Command{
+		Cmd:  ev.ID,
+		Type: ws.CmdStreamEvent,
+		Params: map[string]interface{}{
+			"id":   ev.ID,
+			"kind": ev.Kind,
+			"data": dataVal,
+		},
+	}
+	wire, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	if err := conn.WriteMessage(gorilla.TextMessage, wire); err != nil {
+		t.Fatalf("write stream event: %v", err)
+	}
+
+	select {
+	case got := <-received:
+		if got.agentID != "stream-agent" {
+			t.Errorf("expected agentID stream-agent, got %q", got.agentID)
+		}
+		if got.cmd.Type != ws.CmdStreamEvent {
+			t.Errorf("expected type stream_event, got %q", got.cmd.Type)
+		}
+		if got.cmd.Cmd != ev.ID {
+			t.Errorf("expected cmd %q, got %q", ev.ID, got.cmd.Cmd)
+		}
+		if got.cmd.Params["id"] != ev.ID {
+			t.Errorf("expected params.id %q, got %v", ev.ID, got.cmd.Params["id"])
+		}
+		if got.cmd.Params["kind"] != ev.Kind {
+			t.Errorf("expected params.kind %q, got %v", ev.Kind, got.cmd.Params["kind"])
+		}
+		if !reflect.DeepEqual(got.cmd.Params["data"], dataVal) {
+			t.Errorf("params.data not preserved intact:\n got=%v\nwant=%v", got.cmd.Params["data"], dataVal)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("stream event handler was not invoked")
 	}
 }
 

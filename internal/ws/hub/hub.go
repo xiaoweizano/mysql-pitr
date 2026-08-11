@@ -60,6 +60,10 @@ type Hub struct {
 	// progressHandler receives pitr_progress notifications from agents.
 	progressHandler ProgressHandler
 
+	// streamHandler receives agent→server stream_event envelopes (scan
+	// tx/SQL, execution progress, operation completion).
+	streamHandler StreamEventHandler
+
 	// lifecycle hooks for agent connect/disconnect events.
 	hooks LifecycleHooks
 }
@@ -83,6 +87,12 @@ func (h *Hub) SetCSRHandler(csr CSRHandler) {
 // notifications.
 func (h *Hub) SetProgressHandler(fn ProgressHandler) {
 	h.progressHandler = fn
+}
+
+// SetStreamEventHandler registers a handler for agent-pushed stream_event
+// envelopes (scan tx/SQL, execution progress, operation completion).
+func (h *Hub) SetStreamEventHandler(fn StreamEventHandler) {
+	h.streamHandler = fn
 }
 
 // SetLifecycleHooks registers connect/disconnect callbacks.
@@ -220,6 +230,15 @@ func (h *Hub) readPump(ac *agentConn) {
 		if err := json.Unmarshal(message, &cmd); err == nil && cmd.Type == ws.CmdPITRProgress {
 			if h.progressHandler != nil {
 				go h.progressHandler(agentID, cmd)
+			}
+			continue
+		}
+
+		// Route agent-pushed stream events (scan tx/SQL, execution progress,
+		// operation completion) to the registered handler.
+		if err := json.Unmarshal(message, &cmd); err == nil && cmd.Type == ws.CmdStreamEvent {
+			if h.streamHandler != nil {
+				go h.streamHandler(agentID, cmd)
 			}
 			continue
 		}
