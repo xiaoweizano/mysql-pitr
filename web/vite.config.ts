@@ -1,15 +1,10 @@
-import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
+import { sveltekit } from '@sveltejs/kit/vite';
+import tailwindcss from '@tailwindcss/vite';
+import { defineConfig } from 'vite';
 
-// https://vite.dev/config/
+// No SvelteKit options are passed here — all Kit config (adapter, etc.)
+// lives in svelte.config.js. Passing options to `sveltekit()` would cause
+// svelte.config.js to be ignored entirely (SvelteKit >= 2.62).
 export default defineConfig({
-  plugins: [react()],
-  server: {
-    proxy: {
-      '/api': {
-        target: 'http://localhost:8080',
-        changeOrigin: true,
-      },
-    },
-  },
-})
+	plugins: [sveltekit(), tailwindcss()]
+});

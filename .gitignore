@@ -10,6 +10,13 @@ bin/
 coverage.out
 coverage.html
 
+# --- Web (SvelteKit) ---
+web/node_modules/
+web/build/
+web/.svelte-kit/
+web/static/node_modules/
+web/static/build/
+
 # --- gstack tool ---
 .gstack/
 
