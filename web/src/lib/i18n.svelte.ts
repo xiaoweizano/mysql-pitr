@@ -17,9 +17,16 @@ export const locale = $state<{ value: Locale }>({ value: 'zh-CN' });
 /**
  * Translate a key. Falls back to the key itself when missing,
  * so new UI strings degrade gracefully before translations land.
+ *
+ * Optional `params` enables `{name}` interpolation in the message —
+ * e.g. `t('pitr.sql.checkedSummary', { checked: '2', total: '5', sql: '9' })`.
  */
-export function t(key: string): string {
-	return messages[locale.value][key] ?? key;
+export function t(key: string, params?: Record<string, string | number>): string {
+	const msg = messages[locale.value][key] ?? key;
+	if (!params) return msg;
+	return msg.replace(/\{(\w+)\}/g, (m, name: string) =>
+		params[name] !== undefined ? String(params[name]) : m
+	);
 }
 
 export function setLocale(next: Locale) {
