@@ -19,14 +19,14 @@ const (
 )
 
 type TxMeta struct {
-	TxID       string
-	GTID       string
-	XID        uint64
-	CommitTime time.Time
-	Schema     string
-	Tables     []binlog.TableRef
-	RowCount   int
-	Truncated  bool
+	TxID       string            `json:"txId"`
+	GTID       string            `json:"gtid,omitempty"`
+	XID        uint64            `json:"xid,omitempty"`
+	CommitTime time.Time         `json:"commitTime"`
+	Schema     string            `json:"schema,omitempty"`
+	Tables     []binlog.TableRef `json:"tables,omitempty"`
+	RowCount   int               `json:"rowCount"`
+	Truncated  bool              `json:"truncated,omitempty"`
 }
 
 type Result struct {

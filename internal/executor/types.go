@@ -8,9 +8,9 @@ import (
 
 // ExecError 是单条 SQL 执行失败时的错误记录。
 type ExecError struct {
-	Statement int // Plan.Statements 内的 index
-	SQL       string
-	Err       string
+	Statement int    `json:"statement"`     // Plan.Statements 内的 index
+	SQL       string `json:"sql,omitempty"` // 失败的 SQL（statement 序号即可定位，SQL 为冗余信息）
+	Err       string `json:"err"`           // 错误信息
 }
 
 // Plan 描述一次执行。
@@ -23,19 +23,19 @@ type Plan struct {
 
 // Progress 是 callback 上报的进度快照。
 type Progress struct {
-	Done     int
-	Total    int
-	LastTxID string
-	LastSQL  string
-	Errors   []ExecError
+	Done     int         `json:"done"`
+	Total    int         `json:"total"`
+	LastTxID string      `json:"lastTxId,omitempty"`
+	LastSQL  string      `json:"lastSql,omitempty"`
+	Errors   []ExecError `json:"errors,omitempty"`
 }
 
 // FinalReport 是 Run/Resume 的返回值。
 type FinalReport struct {
-	Done   int
-	Total  int
-	Errors []ExecError
-	Paused bool // true = ctx 取消导致暂停；false = 正常完成或失败
+	Done   int         `json:"done"`
+	Total  int         `json:"total"`
+	Errors []ExecError `json:"errors,omitempty"`
+	Paused bool        `json:"paused"` // true = ctx 取消导致暂停；false = 正常完成或失败
 }
 
 // ProgressCallback 由调用方提供，每条 SQL 执行后调用。
