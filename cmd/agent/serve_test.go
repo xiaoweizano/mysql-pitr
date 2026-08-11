@@ -145,7 +145,10 @@ func TestHandleExecute_Accepted(t *testing.T) {
 
 	result, ok := resp.Result.(map[string]interface{})
 	require.True(t, ok)
-	assert.Equal(t, "op-1", result["operationId"])
+	// cancel 契约：accepted 响应的 operationId 回显命令 ID（cmd.Cmd）——daemon
+	// op 注册表以命令 ID 为键，server 须把该值原样发给 cancel。请求里的
+	// operationId 是检查点文件名（另一命名空间），不得混用。
+	assert.Equal(t, "exec-1", result["operationId"])
 }
 
 func TestHandleExecute_MissingOperationID(t *testing.T) {
@@ -175,6 +178,11 @@ func TestHandleResume_Accepted(t *testing.T) {
 	})
 	require.NotNil(t, resp)
 	assert.Equal(t, ws.StatusOK, resp.Status)
+
+	result, ok := resp.Result.(map[string]interface{})
+	require.True(t, ok)
+	// 与 execute 同一契约：operationId 回显命令 ID（cmd.Cmd）。
+	assert.Equal(t, "resume-1", result["operationId"])
 }
 
 func TestHandleCancel_NoSuchOp(t *testing.T) {

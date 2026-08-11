@@ -881,9 +881,14 @@ func TestMasterPosition_NotConnected(t *testing.T) {
 func TestMasterPosition_Success(t *testing.T) {
 	c, mock := newMockConnector(t)
 
+	// 真实 MySQL 5.7/8.0/8.4 的 SHOW MASTER STATUS 返回 5 列：
+	// File, Position, Binlog_Do_DB, Binlog_Ignore_DB, Executed_Gtid_Set。
+	// 测试必须 mock 5 列，否则无法捕捉"Scan 目标数 < 列数"的回归
+	// （database/sql 会报 "expected 5 destination arguments in Scan, not 2"）。
 	mock.ExpectQuery(regexp.QuoteMeta("SHOW MASTER STATUS")).
-		WillReturnRows(sqlmock.NewRows([]string{"File", "Position"}).
-			AddRow("mysql-bin.000003", 154))
+		WillReturnRows(sqlmock.NewRows([]string{
+			"File", "Position", "Binlog_Do_DB", "Binlog_Ignore_DB", "Executed_Gtid_Set",
+		}).AddRow("mysql-bin.000003", 154, "", "", ""))
 
 	pos, err := c.MasterPosition(context.Background())
 	require.NoError(t, err)
@@ -894,10 +899,13 @@ func TestMasterPosition_Success(t *testing.T) {
 
 func TestMasterPosition_NoRows(t *testing.T) {
 	// 未启用 binlog 时 SHOW MASTER STATUS 返回空结果集 → sql.ErrNoRows。
+	// 列形状同样按真实 5 列 mock。
 	c, mock := newMockConnector(t)
 
 	mock.ExpectQuery(regexp.QuoteMeta("SHOW MASTER STATUS")).
-		WillReturnRows(sqlmock.NewRows([]string{"File", "Position"}))
+		WillReturnRows(sqlmock.NewRows([]string{
+			"File", "Position", "Binlog_Do_DB", "Binlog_Ignore_DB", "Executed_Gtid_Set",
+		}))
 
 	_, err := c.MasterPosition(context.Background())
 	require.Error(t, err)

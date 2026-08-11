@@ -190,13 +190,29 @@ func (m *MySQLConnector) ListBinlogs(ctx context.Context) ([]archive.ManifestFil
 // MasterPosition 查询 SHOW MASTER STATUS 返回当前 binlog 文件名与位置
 // （归档循环的续拉起点）。binlog 未启用时 SHOW MASTER STATUS 返回空结果集
 // （sql.ErrNoRows），转成可读错误。
+//
+// SHOW MASTER STATUS 的真实列形状（5 列，MySQL 5.7 / 8.0 / 8.4 一致）：
+//
+//	File, Position, Binlog_Do_DB, Binlog_Ignore_DB, Executed_Gtid_Set
+//
+// （MariaDB 只返回前 4 列，无 Executed_Gtid_Set。）database/sql 要求 Scan 的
+// 目标数量与结果列数严格一致——只扫 File/Position 两列会在真实 MySQL 上报
+// "sql: expected 5 destination arguments in Scan, not 2"。因此必须把额外 3 列
+// 扫进 sql.NullString 丢弃。本项目 preflight 强制 MySQL 8.0+，按 5 列形状扫描；
+// 若需兼容 MariaDB，须先 rows.Columns() 探测列数再决定 Scan 目标数。
 func (m *MySQLConnector) MasterPosition(ctx context.Context) (gomysql.Position, error) {
 	if m.db == nil {
 		return gomysql.Position{}, fmt.Errorf("connector: not connected")
 	}
-	var name string
-	var pos uint32
-	err := m.db.QueryRowContext(ctx, "SHOW MASTER STATUS").Scan(&name, &pos)
+	var (
+		name            string
+		pos             uint32
+		binlogDoDB      sql.NullString // Binlog_Do_DB（丢弃）
+		binlogIgnoreDB  sql.NullString // Binlog_Ignore_DB（丢弃）
+		executedGtidSet sql.NullString // Executed_Gtid_Set（丢弃）
+	)
+	err := m.db.QueryRowContext(ctx, "SHOW MASTER STATUS").
+		Scan(&name, &pos, &binlogDoDB, &binlogIgnoreDB, &executedGtidSet)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return gomysql.Position{}, fmt.Errorf("connector: SHOW MASTER STATUS returned no rows (binary logging may be disabled)")

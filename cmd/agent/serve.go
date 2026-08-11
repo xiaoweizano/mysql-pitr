@@ -337,7 +337,9 @@ func (d *serveDaemon) handleExecute(ctx context.Context, cmd ws.Command) *ws.Res
 	if err := d.daemon.Execute(ctx, cmd.Cmd, req); err != nil {
 		return errResp(cmd, "execute: %v", err)
 	}
-	return okResp(cmd, map[string]interface{}{"accepted": true, "operationId": req.OperationID})
+	// operationId 回显命令 ID（cmd.Cmd）：daemon op 注册表以它为键，
+	// server 侧拿到 accepted 响应后须用同一值发 cancel（与 handleScan 一致）。
+	return okResp(cmd, map[string]interface{}{"accepted": true, "operationId": cmd.Cmd})
 }
 
 // handleResume 与 handleExecute 同一路径（Phase 2 语义：从零重跑；Phase 3 由
@@ -350,7 +352,8 @@ func (d *serveDaemon) handleResume(ctx context.Context, cmd ws.Command) *ws.Resp
 	if err := d.daemon.Resume(ctx, cmd.Cmd, req); err != nil {
 		return errResp(cmd, "resume: %v", err)
 	}
-	return okResp(cmd, map[string]interface{}{"accepted": true, "operationId": req.OperationID})
+	// operationId 回显命令 ID（cmd.Cmd），与 handleScan/handleExecute 统一。
+	return okResp(cmd, map[string]interface{}{"accepted": true, "operationId": cmd.Cmd})
 }
 
 // handleCancel 取消一次运行中的 scan/execute。operationId 参数是启动命令的
