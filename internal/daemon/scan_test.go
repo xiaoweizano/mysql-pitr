@@ -240,6 +240,74 @@ func TestScan_SelectedSQLModeGeneratesStatements(t *testing.T) {
 	require.Equal(t, 1, txMetaN, "selected 模式只命中一个事务")
 }
 
+// runMetaScan 对 fixture 目录跑一次 meta 扫描，等 scan_done 后返回全部事件。
+func runMetaScan(t *testing.T, id string, filter ws.ScanFilter) []ws.StreamEvent {
+	t.Helper()
+	ctx := context.Background()
+	sink := &fakeSink{}
+	d := daemon.NewDaemon(daemon.ScanDeps{
+		ArchiveDir:    fixtureDir(t),
+		SchemaFetcher: fixtureSchema,
+	}, nil, nil, sink)
+
+	require.NoError(t, d.Scan(ctx, id, ws.ScanRequest{Filter: filter, Mode: "meta"}))
+	require.Eventually(t, func() bool { return sink.hasKind(ws.EvScanDone) },
+		5*time.Second, 10*time.Millisecond, "scan_done should arrive")
+	return sink.eventsCopy()
+}
+
+// txMetaCount 统计事件列表里的 tx_meta 数。
+func txMetaCount(evs []ws.StreamEvent) int {
+	n := 0
+	for _, ev := range evs {
+		if ev.Kind == ws.EvTxMeta {
+			n++
+		}
+	}
+	return n
+}
+
+// hasKind 检查事件列表是否含指定 kind。
+func hasKind(evs []ws.StreamEvent, k string) bool {
+	for _, ev := range evs {
+		if ev.Kind == k {
+			return true
+		}
+	}
+	return false
+}
+
+// TestScan_TimeStartOnlyMatchesAll 回归：只设 TimeStart（2020，远早于 fixture
+// 提交时间 2025-06-15）时必须返回全部事务。修复前缺 End 留 zero，引擎
+// After(zero) 恒 true → 静默零结果（无错误）。
+func TestScan_TimeStartOnlyMatchesAll(t *testing.T) {
+	evs := runMetaScan(t, "scan-ts-only", ws.ScanFilter{TimeStart: "2020-01-01T00:00:00Z"})
+
+	require.Equal(t, 3, txMetaCount(evs), "TimeStart-only 必须返回 fixture 全部 3 个事务")
+	require.False(t, hasKind(evs, ws.EvOpError), "正常完成不产出 op_error")
+	require.Equal(t, ws.EvScanDone, evs[len(evs)-1].Kind, "scan_done 收尾")
+}
+
+// TestScan_TimeEndOnlyMatchesAll 回归：只设 TimeEnd（2030，远晚于 fixture
+// 提交时间）时必须返回全部事务（该场景修复前恰好能工作，补测防止回归）。
+func TestScan_TimeEndOnlyMatchesAll(t *testing.T) {
+	evs := runMetaScan(t, "scan-te-only", ws.ScanFilter{TimeEnd: "2030-01-01T00:00:00Z"})
+
+	require.Equal(t, 3, txMetaCount(evs), "TimeEnd-only 必须返回 fixture 全部 3 个事务")
+	require.False(t, hasKind(evs, ws.EvOpError), "正常完成不产出 op_error")
+	require.Equal(t, ws.EvScanDone, evs[len(evs)-1].Kind, "scan_done 收尾")
+}
+
+// TestScan_FarFutureTimeStartEmptyNoError 验证 TimeStart 远晚于全部事务提交
+// 时间（2100）时结果为空但不报错：scan_done 收尾、零 tx_meta、无 op_error。
+func TestScan_FarFutureTimeStartEmptyNoError(t *testing.T) {
+	evs := runMetaScan(t, "scan-ts-far", ws.ScanFilter{TimeStart: "2100-01-01T00:00:00Z"})
+
+	require.Equal(t, 0, txMetaCount(evs), "提交时间均早于 2100，应零命中")
+	require.False(t, hasKind(evs, ws.EvOpError), "零命中不是错误")
+	require.Equal(t, ws.EvScanDone, evs[len(evs)-1].Kind, "scan_done 收尾")
+}
+
 // TestArchiveStatus 验证 ArchiveStatus 返回注入的 stateFn 结果。
 func TestArchiveStatus(t *testing.T) {
 	st := collector.State{LastFile: "mysql-bin.000003", LastPos: 42, LastGTID: "x-1:1"}

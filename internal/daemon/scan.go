@@ -85,9 +85,16 @@ func scanMode(m string) (scan.Mode, error) {
 	}
 }
 
+// timeRangeFarFuture 是 TimeRange.End 缺省时的上界哨兵。引擎 matchesFilter
+// 用 tx.CommitTime.After(End) 拒绝（engine.go），End=zero（公元 1 年）会对一切
+// 真实提交时间恒为 true，静默拒绝全部事务；远未来哨兵等价于无上界。
+var timeRangeFarFuture = time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
+
 // wsFilterToBinlog 把线格式的 ScanFilter 转成 binlog.Filter：
 //   - Tables 直传；
-//   - TimeStart/TimeEnd 按 RFC3339 解析（缺一侧则只设该侧边界）；
+//   - TimeStart/TimeEnd 按 RFC3339 解析，单侧缺省时钳制为无界
+//     （缺 End → timeRangeFarFuture；缺 Start → 保持 zero，引擎
+//     Before(zero) 恒 false 即无下界）；两侧都缺 → TimeRange=nil；
 //   - GTIDSet 用 binlog.ParseGTIDSet("mysql", ...) 解析；
 //   - StartFile/StartPos、EndFile/EndPos 组 mysql.Position；
 //   - MaxRowsPerTx、SelectedTxIDs 直传。
@@ -107,12 +114,16 @@ func wsFilterToBinlog(f ws.ScanFilter) (binlog.Filter, error) {
 			}
 			tr.Start = t
 		}
+		// 缺 End 时钳制为远未来哨兵，而不是留 zero：zero 会被引擎
+		// After(zero) 恒 true 拒绝全部事务（静默零结果）。
 		if f.TimeEnd != "" {
 			t, err := time.Parse(time.RFC3339, f.TimeEnd)
 			if err != nil {
 				return out, fmt.Errorf("daemon: parse timeEnd %q: %w", f.TimeEnd, err)
 			}
 			tr.End = t
+		} else {
+			tr.End = timeRangeFarFuture
 		}
 		out.TimeRange = tr
 	}
