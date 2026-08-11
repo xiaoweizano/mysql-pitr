@@ -36,8 +36,12 @@ const (
 //	created   -> {scanning, blocked, failed}
 //	scanning  -> {ready, failed, cancelled, blocked}
 //	ready     -> {executing, cancelled}
-//	executing <-> paused; executing -> {done, failed}
+//	executing <-> paused; executing -> {done, failed, blocked}
 //	paused    -> {executing, cancelled}
+//
+// executing -> blocked: the operation's agent died mid-execution and can no
+// longer make progress; the operation is blocked (terminal) and the operator
+// starts a new attempt after the agent reconnects.
 //
 // Terminal states (done, failed, cancelled, blocked) are not included as
 // sources since no transition is valid from them.
@@ -45,7 +49,7 @@ var validTransitions = map[OperationState][]OperationState{
 	StateCreated:  {StateScanning, StateBlocked, StateFailed},
 	StateScanning: {StateReady, StateFailed, StateCancelled, StateBlocked},
 	StateReady:    {StateExecuting, StateCancelled},
-	StateExecuting: {StatePaused, StateDone, StateFailed},
+	StateExecuting: {StatePaused, StateDone, StateFailed, StateBlocked},
 	StatePaused:   {StateExecuting, StateCancelled},
 }
 

@@ -377,6 +377,73 @@ func (h *Handler) failOperation(op *Operation, details string) {
 	h.forgetPreview(op.ID)
 }
 
+// blockOperation moves an in-flight operation to blocked (terminal) under CAS:
+// the transition applies only while the persisted status still equals the
+// status the op was read with, so a racing terminal event (op_done / op_error)
+// wins cleanly and is never overwritten. The blocked audit is written only on
+// a successful transition; an invalid or lost transition is logged and the
+// operation left as-is. blocked is terminal, so the in-memory preview is
+// dropped — the operator starts a new attempt after the agent reconnects.
+func (h *Handler) blockOperation(op *Operation, details string) {
+	ok, err := h.transitionTo(op, StateBlocked)
+	if err != nil {
+		log.Printf("pitr: op %s: block: %v", op.ID, err)
+		return
+	}
+	if !ok {
+		log.Printf("pitr: op %s: block lost to a concurrent transition — no blocked audit (state %q)", op.ID, op.Status)
+		return
+	}
+	h.appendAudit(op, StateBlocked, "system", details)
+	h.forgetPreview(op.ID)
+}
+
+// HandleAgentDisconnect blocks every operation of the disconnected agent that
+// is mid-flight (scanning or executing): the agent is gone, so neither can
+// make progress, and the operation must not linger in a non-terminal state.
+// Operations of other agents, and operations the agent already advanced (done
+// / failed / cancelled / blocked), are never touched; blocked is terminal, so
+// repeated disconnects write no duplicate audits. The hub invokes this from
+// its OnDisconnect lifecycle hook after the agent store status has been
+// updated.
+func (h *Handler) HandleAgentDisconnect(agentID string) {
+	for _, status := range []OperationState{StateScanning, StateExecuting} {
+		ops, err := h.opStore.ListByStatus(status)
+		if err != nil {
+			log.Printf("pitr: agent %s disconnected: list %s operations: %v", agentID, status, err)
+			continue
+		}
+		for _, op := range ops {
+			if op.AgentID != agentID {
+				continue
+			}
+			h.blockOperation(op, "agent disconnected")
+		}
+	}
+}
+
+// ReconcileOnStartup blocks every in-flight operation left over from a
+// previous server run. At startup every agent is offline by definition, so a
+// scanning or executing operation cannot make progress; blocking it makes the
+// state truthful and lets the operator start a fresh attempt (or resume, for
+// a reconnected agent) instead of waiting on a ghost operation. Operations in
+// stable states (ready, paused) and terminal states are left untouched.
+// A list failure returns an error (the caller logs it — startup must not fail
+// because of historical operations); per-operation transition failures are
+// logged and skipped.
+func (h *Handler) ReconcileOnStartup() error {
+	for _, status := range []OperationState{StateScanning, StateExecuting} {
+		ops, err := h.opStore.ListByStatus(status)
+		if err != nil {
+			return fmt.Errorf("pitr: startup reconcile: list %s operations: %w", status, err)
+		}
+		for _, op := range ops {
+			h.blockOperation(op, "server restart — operation blocked; retry after the agent reconnects")
+		}
+	}
+	return nil
+}
+
 // ---------- preview (in-memory scan state) ----------
 
 // preview returns the operation's preview, or nil when none exists.

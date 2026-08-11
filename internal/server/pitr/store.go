@@ -178,6 +178,14 @@ func (s *SQLiteOperationStore) ListByAgent(agentID string) ([]*Operation, error)
 	return s.list("WHERE agent_id = ? ORDER BY rowid", agentID)
 }
 
+// ListByStatus returns all operations currently in the given state (statement
+// rows not included; use Get for the full record). It is the basis for the
+// disconnect handler and startup reconcile, which enumerate in-flight
+// (scanning/executing) operations.
+func (s *SQLiteOperationStore) ListByStatus(status OperationState) ([]*Operation, error) {
+	return s.list("WHERE status = ? ORDER BY rowid", string(status))
+}
+
 func (s *SQLiteOperationStore) list(where string, arg string) ([]*Operation, error) {
 	rows, err := s.db.Query("SELECT "+opColumns+" FROM operations "+where, arg)
 	if err != nil {

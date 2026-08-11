@@ -143,6 +143,9 @@ func newServer(dataDir string, commander pitr.AgentCommander) (*Server, error) {
 				rec.LastSeen = time.Now()
 				_ = agentStore.Update(rec)
 			}
+			// The agent is gone: any operation it was scanning or executing
+			// cannot make progress, so block it (terminal) with an audit.
+			pitrHandler.HandleAgentDisconnect(agentID)
 		},
 	})
 
@@ -186,6 +189,15 @@ func newServer(dataDir string, commander pitr.AgentCommander) (*Server, error) {
 		_ = agentHub.Close()
 		_ = db.Close()
 	}
+
+	// Startup reconcile: every agent is offline at boot, so scanning /
+	// executing operations left over from a previous run are blocked (terminal
+	// + audit). Failures are logged, never fatal — the server must start even
+	// when historical operations are in a bad state.
+	if err := pitrHandler.ReconcileOnStartup(); err != nil {
+		log.Printf("server: pitr startup reconcile: %v", err)
+	}
+
 	return srv, nil
 }
 

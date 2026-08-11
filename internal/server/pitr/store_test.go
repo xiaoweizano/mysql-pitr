@@ -183,6 +183,40 @@ func TestListByAgent_Filters(t *testing.T) {
 	assert.Len(t, empty, 0)
 }
 
+func TestListByStatus_Filters(t *testing.T) {
+	s := newTestStore(t)
+	for _, op := range []*Operation{
+		{ID: "op_scan", OrgID: "org_a", AgentID: "agent_1", Type: "pitr", Mode: "sql", Status: StateScanning},
+		{ID: "op_exec1", OrgID: "org_a", AgentID: "agent_1", Type: "pitr", Mode: "sql", Status: StateExecuting},
+		{ID: "op_exec2", OrgID: "org_b", AgentID: "agent_2", Type: "pitr", Mode: "meta", Status: StateExecuting},
+		{ID: "op_done", OrgID: "org_a", AgentID: "agent_1", Type: "pitr", Mode: "sql", Status: StateDone},
+	} {
+		require.NoError(t, s.Create(op))
+	}
+
+	scanning, err := s.ListByStatus(StateScanning)
+	require.NoError(t, err)
+	require.Len(t, scanning, 1)
+	assert.Equal(t, "op_scan", scanning[0].ID)
+
+	executing, err := s.ListByStatus(StateExecuting)
+	require.NoError(t, err)
+	require.Len(t, executing, 2)
+	ids := map[string]bool{}
+	for _, op := range executing {
+		ids[op.ID] = true
+		assert.Equal(t, StateExecuting, op.Status)
+	}
+	assert.True(t, ids["op_exec1"], "op_exec1 listed")
+	assert.True(t, ids["op_exec2"], "op_exec2 listed")
+
+	// A status with no operations yields an empty (non-nil) slice.
+	none, err := s.ListByStatus(StatePaused)
+	require.NoError(t, err)
+	assert.NotNil(t, none)
+	assert.Len(t, none, 0)
+}
+
 func TestSaveLoadStatements_RoundTrip(t *testing.T) {
 	s := newTestStore(t)
 	op := &Operation{ID: "op_stmts", OrgID: "org_a", AgentID: "agent_1", Type: "pitr", Mode: "selected", Status: StateReady}

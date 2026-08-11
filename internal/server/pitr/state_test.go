@@ -32,9 +32,10 @@ func TestTransitionValid_ValidTransitions(t *testing.T) {
 		// executing <-> paused
 		{StateExecuting, StatePaused, true},
 		{StatePaused, StateExecuting, true},
-		// executing -> {done, failed}
+		// executing -> {done, failed, blocked}
 		{StateExecuting, StateDone, true},
 		{StateExecuting, StateFailed, true},
+		{StateExecuting, StateBlocked, true},
 		// paused -> {executing, cancelled}
 		{StatePaused, StateCancelled, true},
 
@@ -114,6 +115,7 @@ func TestTryTransitionErr_Valid(t *testing.T) {
 		{StateExecuting, StatePaused},
 		{StatePaused, StateExecuting},
 		{StateExecuting, StateDone},
+		{StateExecuting, StateBlocked},
 		{StateScanning, StateCancelled},
 		{StatePaused, StateCancelled},
 	}

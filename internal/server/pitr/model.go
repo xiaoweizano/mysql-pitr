@@ -62,6 +62,10 @@ type OperationStore interface {
 	UpdateIfStatus(op *Operation, from OperationState) (bool, error)
 	ListByOrg(orgID string) ([]*Operation, error)
 	ListByAgent(agentID string) ([]*Operation, error)
+	// ListByStatus returns all operations currently in the given state
+	// (statement rows not included; use Get for the full record). Used by the
+	// disconnect handler and startup reconcile to find in-flight operations.
+	ListByStatus(status OperationState) ([]*Operation, error)
 	// SaveStatements replaces all stored statements of an operation with the
 	// given set (selection re-runs overwrite previous selections).
 	SaveStatements(opID string, stmts []Statement) error

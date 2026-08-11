@@ -1406,6 +1406,155 @@ func TestCancel_NoAuth(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
+// ---------- agent disconnect handling ----------
+
+func TestHandleAgentDisconnect_ExecutingBecomesBlocked(t *testing.T) {
+	// An executing operation's agent dies: the op cannot make progress, so it
+	// is blocked (terminal) with an audit entry.
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	op := f.createOp(t, "op_exec", orgID, agentID, StateExecuting)
+
+	f.handler.HandleAgentDisconnect(agentID)
+
+	got, err := f.opStore.Get(op.ID)
+	require.NoError(t, err)
+	assert.Equal(t, StateBlocked, got.Status)
+
+	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "blocked", entries[0].Status)
+	assert.Equal(t, op.ID, entries[0].OperationID)
+	assert.Equal(t, "system", entries[0].Operator)
+	assert.Contains(t, entries[0].ErrorDetails, "disconnect")
+}
+
+func TestHandleAgentDisconnect_ScanningBecomesBlocked(t *testing.T) {
+	// A scan in progress is equally stranded when its agent dies.
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	op := f.createOp(t, "op_scan", orgID, agentID, StateScanning)
+
+	f.handler.HandleAgentDisconnect(agentID)
+
+	got, err := f.opStore.Get(op.ID)
+	require.NoError(t, err)
+	assert.Equal(t, StateBlocked, got.Status)
+
+	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "blocked", entries[0].Status)
+}
+
+func TestHandleAgentDisconnect_OnlyMatchingAgent(t *testing.T) {
+	// A disconnect only touches the disconnected agent's operations: another
+	// agent's in-flight ops stay put, and no audit is written for them.
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentA := f.createAgent(t, orgID)
+	agentB := f.createAgent(t, orgID)
+	f.createOp(t, "op_a_exec", orgID, agentA, StateExecuting)
+	f.createOp(t, "op_b_exec", orgID, agentB, StateExecuting)
+	f.createOp(t, "op_b_scan", orgID, agentB, StateScanning)
+
+	f.handler.HandleAgentDisconnect(agentA)
+
+	got, err := f.opStore.Get("op_a_exec")
+	require.NoError(t, err)
+	assert.Equal(t, StateBlocked, got.Status)
+
+	got, err = f.opStore.Get("op_b_exec")
+	require.NoError(t, err)
+	assert.Equal(t, StateExecuting, got.Status, "another agent's executing op is untouched")
+
+	got, err = f.opStore.Get("op_b_scan")
+	require.NoError(t, err)
+	assert.Equal(t, StateScanning, got.Status, "another agent's scanning op is untouched")
+
+	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "only the disconnected agent's op is audited")
+	assert.Equal(t, "op_a_exec", entries[0].OperationID)
+}
+
+func TestHandleAgentDisconnect_Idempotent(t *testing.T) {
+	// Terminal operations are never listed, so a disconnect leaves them alone,
+	// and a repeated disconnect for the same agent writes no extra audits.
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	exec := f.createOp(t, "op_exec", orgID, agentID, StateExecuting)
+	f.createOp(t, "op_done", orgID, agentID, StateDone)
+
+	f.handler.HandleAgentDisconnect(agentID)
+	f.handler.HandleAgentDisconnect(agentID)
+
+	got, err := f.opStore.Get(exec.ID)
+	require.NoError(t, err)
+	assert.Equal(t, StateBlocked, got.Status)
+
+	got, err = f.opStore.Get("op_done")
+	require.NoError(t, err)
+	assert.Equal(t, StateDone, got.Status, "a done op is unaffected by a disconnect")
+
+	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "the second disconnect must not duplicate the blocked audit")
+	assert.Equal(t, "blocked", entries[0].Status)
+	assert.Equal(t, exec.ID, entries[0].OperationID)
+}
+
+func TestReconcileOnStartup_NonTerminalBlocked(t *testing.T) {
+	// On startup every agent is offline: in-flight operations (scanning /
+	// executing) are blocked so they cannot linger; stable states (ready /
+	// paused) and terminal states are left untouched.
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	f.createOp(t, "op_scan", orgID, agentID, StateScanning)
+	f.createOp(t, "op_exec", orgID, agentID, StateExecuting)
+	f.createOp(t, "op_ready", orgID, agentID, StateReady)
+	f.createOp(t, "op_paused", orgID, agentID, StatePaused)
+	f.createOp(t, "op_done", orgID, agentID, StateDone)
+
+	require.NoError(t, f.handler.ReconcileOnStartup())
+
+	for _, id := range []string{"op_scan", "op_exec"} {
+		got, err := f.opStore.Get(id)
+		require.NoError(t, err)
+		assert.Equal(t, StateBlocked, got.Status, "%s should be blocked at startup", id)
+	}
+	for _, tc := range []struct {
+		id     string
+		status OperationState
+	}{
+		{"op_ready", StateReady},
+		{"op_paused", StatePaused},
+		{"op_done", StateDone},
+	} {
+		got, err := f.opStore.Get(tc.id)
+		require.NoError(t, err)
+		assert.Equal(t, tc.status, got.Status, "%s must not be touched by startup reconcile", tc.id)
+	}
+
+	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+	for _, e := range entries {
+		assert.Equal(t, "blocked", e.Status)
+		assert.Equal(t, "system", e.Operator)
+	}
+}
+
 // ---------- SSE ----------
 
 // sseRecorder is a thread-safe http.ResponseWriter for SSE handler tests: the

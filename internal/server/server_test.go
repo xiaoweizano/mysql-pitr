@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/a-shan/mysql-pitr/internal/server/pitr"
+	"github.com/a-shan/mysql-pitr/internal/server/store"
 	"github.com/a-shan/mysql-pitr/internal/ws"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -85,6 +87,34 @@ func TestNewBootstrapError(t *testing.T) {
 
 	_, err := New()
 	require.Error(t, err)
+}
+
+// TestNewServer_ReconcilesStaleOps asserts the startup reconcile wiring: an
+// in-flight operation persisted by a previous server run (left mid-scan) is
+// blocked when the new server boots, because every agent is offline at
+// startup.
+func TestNewServer_ReconcilesStaleOps(t *testing.T) {
+	dataDir := t.TempDir()
+
+	// Simulate a previous server run: an operation left mid-scan.
+	db, err := store.Open(filepath.Join(dataDir, "app.db"))
+	require.NoError(t, err)
+	require.NoError(t, store.Migrate(db))
+	prevStore := pitr.NewSQLiteOperationStore(db)
+	op := &pitr.Operation{ID: "op_stale", OrgID: "org_a", AgentID: "agent_1", Type: "pitr", Mode: "sql", Status: pitr.StateScanning}
+	require.NoError(t, prevStore.Create(op))
+	require.NoError(t, db.Close())
+
+	srv, err := newServer(dataDir, fakeCommander{})
+	require.NoError(t, err)
+	t.Cleanup(srv.Close)
+
+	db2, err := store.Open(filepath.Join(dataDir, "app.db"))
+	require.NoError(t, err)
+	defer func() { _ = db2.Close() }()
+	got, err := pitr.NewSQLiteOperationStore(db2).Get("op_stale")
+	require.NoError(t, err)
+	assert.Equal(t, pitr.StateBlocked, got.Status, "stale in-flight op must be blocked at startup")
 }
 
 // TestPITRFlowSmoke drives the full HTTP workflow against newServer with an
