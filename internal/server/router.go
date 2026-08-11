@@ -103,6 +103,13 @@ func newWebRouter(
 	// Phase 4 replaces the stub with the real SvelteKit build (web/).
 	fileServer := http.FileServer(http.FS(stubFS))
 	r.Get("/*", func(w http.ResponseWriter, r *http.Request) {
+		// Unknown /api routes are 404, not SPA fallback: a typo'd API path must
+		// not be answered with the front-end index page. Known API routes are
+		// matched by the routes above and never reach this catch-all.
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			http.NotFound(w, r)
+			return
+		}
 		name := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
 		if name != "" && name != "." {
 			if f, err := stubFS.Open(name); err == nil {

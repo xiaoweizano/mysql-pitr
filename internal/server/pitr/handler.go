@@ -778,10 +778,11 @@ func errorSummary(errs []executor.ExecError) string {
 // the agent's executor stopped on the pause cancel. When the operation is
 // paused, or still executing while the pause transition lands, this is the
 // pause acknowledgement: the operation stays resumable — a paused audit is
-// recorded, no done audit is written, and no terminal event is published so
-// SSE subscribers keep their stream open (the op is not terminal; clients
-// observe the pause via /status). The preview is kept for resume. A pause
-// acknowledgement for an operation in any other state is stale and ignored.
+// recorded, no done audit is written, and an op_paused event is published so
+// SSE subscribers can show the paused state without polling /status. The
+// stream itself stays open (op_paused is not a terminal kind; the op is not
+// terminal). The preview is kept for resume. A pause acknowledgement for an
+// operation in any other state is stale and ignored.
 func (h *Handler) confirmPause(op *Operation, opID string, report opDonePayload) {
 	switch op.Status {
 	case StatePaused:
@@ -805,6 +806,12 @@ func (h *Handler) confirmPause(op *Operation, opID string, report opDonePayload)
 		return
 	}
 	h.appendAudit(op, StatePaused, "agent", "")
+	data, _ := json.Marshal(map[string]interface{}{
+		"status": string(op.Status),
+		"done":   report.Done,
+		"total":  report.Total,
+	})
+	h.bus.Publish(opID, ws.StreamEvent{ID: opID, Kind: ws.EvOpPaused, Data: data})
 	log.Printf("pitr: op %s: agent confirmed pause (done=%d total=%d)", opID, report.Done, report.Total)
 }
 
@@ -871,7 +878,11 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 		}
-		filtered = append(filtered, operationView{Operation: op, AgentConnected: h.agentConnected(op.AgentID)})
+		filtered = append(filtered, operationView{
+			Operation:      op,
+			Filter:         binlogFilterToWire(op.Filter),
+			AgentConnected: h.agentConnected(op.AgentID),
+		})
 	}
 	if filtered == nil {
 		filtered = []operationView{}
@@ -881,10 +892,15 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 }
 
 // operationView decorates an operation with live agent-connection state for
-// the list API.
+// the list API. Filter is projected to the wire ScanFilter shape (lowercase
+// keys, GTID set as a string) so the wizard can be repopulated from a List
+// response — the embedded Operation.Filter (the internal binlog.Filter shape)
+// never reaches the JSON payload.
 type operationView struct {
 	*Operation
-	AgentConnected bool `json:"agentConnected"`
+	// Filter shadows the embedded Operation.Filter with the front-end DTO.
+	Filter         ws.ScanFilter `json:"filter"`
+	AgentConnected bool          `json:"agentConnected"`
 }
 
 // Start creates an operation record and launches the agent scan. On success
@@ -910,6 +926,13 @@ func (h *Handler) Start(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Type == "" {
 		req.Type = "pitr"
+	}
+	switch req.Type {
+	case "flashback", "update_rollback", "pitr", "tx_rollback":
+	default:
+		writeError(w, http.StatusBadRequest,
+			`type must be one of "flashback", "update_rollback", "pitr", or "tx_rollback"`)
+		return
 	}
 	if req.Mode != "meta" && req.Mode != "sql" && req.Mode != "selected" {
 		writeError(w, http.StatusBadRequest,
@@ -1134,13 +1157,12 @@ func (h *Handler) Select(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := h.opStore.SaveStatements(op.ID, stmts); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
+	// Persist the statements and the selection in one transaction: a failed
+	// selection update rolls the statement writes back, so the store can never
+	// hold statements without the selection that produced them.
 	op.SelectedTxIDs = req.TxIDs
 	op.UpdatedAt = time.Now()
-	if err := h.opStore.Update(op); err != nil {
+	if err := h.opStore.SaveStatementsAndSelect(op.ID, stmts, req.TxIDs); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

@@ -70,6 +70,13 @@ func TestNewBootstrap(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Body.String(), "PITR 平台")
 
+	// Unknown /api routes return 404 instead of the SPA index page: a typo'd
+	// API path must not be answered with the front-end HTML.
+	w = httptest.NewRecorder()
+	srv.Web.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/nonexistent", nil))
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.NotContains(t, w.Body.String(), "PITR 平台")
+
 	// The v3 SSE route exists: unauthenticated requests hit the auth
 	// middleware (401) instead of chi's 404 — proving the route is mounted.
 	w = httptest.NewRecorder()

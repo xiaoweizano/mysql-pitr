@@ -212,6 +212,7 @@ func TestStreamEventKindConstants(t *testing.T) {
 		"EvProgress": EvProgress,
 		"EvOpDone":   EvOpDone,
 		"EvOpError":  EvOpError,
+		"EvOpPaused": EvOpPaused,
 	}
 	wantValues := map[string]string{
 		"EvTxMeta":   "tx_meta",
@@ -220,6 +221,7 @@ func TestStreamEventKindConstants(t *testing.T) {
 		"EvProgress": "progress",
 		"EvOpDone":   "op_done",
 		"EvOpError":  "op_error",
+		"EvOpPaused": "op_paused",
 	}
 	for name, got := range expected {
 		if want := wantValues[name]; got != want {

@@ -99,7 +99,7 @@ type StatementWire struct {
 // progress, operation completion).
 type StreamEvent struct {
 	ID   string          `json:"id"`   // corresponds to the command ID
-	Kind string          `json:"kind"` // "tx_meta" | "sql" | "scan_done" | "progress" | "op_done" | "op_error"
+	Kind string          `json:"kind"` // "tx_meta" | "sql" | "scan_done" | "progress" | "op_done" | "op_error" | "op_paused"
 	Data json.RawMessage `json:"data"`
 }
 
@@ -110,4 +110,8 @@ const (
 	EvProgress = "progress"
 	EvOpDone   = "op_done"
 	EvOpError  = "op_error"
+	// EvOpPaused is published by the server when the agent confirms a pause
+	// (an op_done whose report carries paused=true): the operation is
+	// resumable, not terminal, so the SSE stream stays open.
+	EvOpPaused = "op_paused"
 )

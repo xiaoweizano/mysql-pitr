@@ -20,6 +20,7 @@ import (
 	"github.com/a-shan/mysql-pitr/internal/server/store"
 	"github.com/a-shan/mysql-pitr/internal/ws"
 	"github.com/go-chi/chi/v5"
+	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -347,6 +348,44 @@ func TestStart_InvalidMode(t *testing.T) {
 	}
 }
 
+func TestStart_RejectsUnknownType(t *testing.T) {
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+
+	body := startBody(agentID)
+	body["type"] = "bogus"
+	req := f.authenticatedRequest(t, http.MethodPost, "/api/pitr/start", body, userID)
+	w := httptest.NewRecorder()
+	f.handler.Start(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code, "an unknown operation type must be rejected with 400")
+	assert.Empty(t, f.commander.commands(), "no scan command for a rejected start")
+}
+
+func TestStart_AcceptsAllTypes(t *testing.T) {
+	// The type whitelist covers the four documented operation kinds; each is
+	// persisted verbatim on the operation record.
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+
+	for _, typ := range []string{"flashback", "update_rollback", "pitr", "tx_rollback"} {
+		body := startBody(agentID)
+		body["type"] = typ
+		req := f.authenticatedRequest(t, http.MethodPost, "/api/pitr/start", body, userID)
+		w := httptest.NewRecorder()
+		f.handler.Start(w, req)
+		assert.Equal(t, http.StatusCreated, w.Code, "type %q must be accepted", typ)
+
+		resp := startResponseBody(t, w)
+		op, err := f.opStore.Get(resp.OperationID)
+		require.NoError(t, err)
+		assert.Equal(t, typ, op.Type)
+	}
+}
+
 func TestStart_InvalidFilterTime(t *testing.T) {
 	f := setupTest(t)
 	userID := f.createUser(t)
@@ -476,6 +515,94 @@ func TestList_NoAuth(t *testing.T) {
 	w := httptest.NewRecorder()
 	f.handler.List(w, req)
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+func TestList_FilterDTO_Shape(t *testing.T) {
+	// Phase 3 final-review I3: the list response used to leak the internal
+	// binlog.Filter shape (capitalized keys, GTIDSet as a struct), which the
+	// wizard could not repopulate. The filter must be a DTO with lowercase keys
+	// and the GTID set as a string, reversible back to the persisted filter.
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+
+	start := time.Date(2026, 7, 8, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 7, 8, 23, 59, 59, 0, time.UTC)
+	gtid, err := mysql.ParseGTIDSet("mysql", "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5")
+	require.NoError(t, err)
+	op := &Operation{
+		ID: "op_filter", OrgID: orgID, AgentID: agentID,
+		Type: "pitr", Mode: "sql", Status: StateReady, CreatedBy: userID,
+		Filter: binlog.Filter{
+			Tables:       []binlog.TableRef{{Schema: "shop", Table: "orders"}},
+			TimeRange:    &binlog.TimeRange{Start: start, End: end},
+			GTIDSet:      gtid,
+			MaxRowsPerTx: 500,
+		},
+	}
+	require.NoError(t, f.opStore.Create(op))
+
+	req := f.authenticatedRequest(t, http.MethodGet, "/api/pitr?org_id="+orgID, nil, userID)
+	w := httptest.NewRecorder()
+	f.handler.List(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+
+	// Raw JSON shape: the filter is an object with lowercase keys only — no
+	// capitalized binlog.Filter field names, no GTIDSet struct shape.
+	var raw struct {
+		Operations []struct {
+			Filter json.RawMessage `json:"filter"`
+		} `json:"operations"`
+	}
+	require.NoError(t, json.NewDecoder(strings.NewReader(body)).Decode(&raw))
+	require.Len(t, raw.Operations, 1)
+	require.NotEmpty(t, raw.Operations[0].Filter, "filter must be present in the list response")
+
+	var filterMap map[string]interface{}
+	require.NoError(t, json.Unmarshal(raw.Operations[0].Filter, &filterMap))
+	for key := range filterMap {
+		assert.False(t, key[0] >= 'A' && key[0] <= 'Z',
+			"filter key %q must be lowercase — the internal binlog.Filter shape must not leak", key)
+	}
+	require.Contains(t, filterMap, "tables")
+	assert.Equal(t, "shop", filterMap["tables"].([]interface{})[0].(map[string]interface{})["schema"])
+	assert.Equal(t, "orders", filterMap["tables"].([]interface{})[0].(map[string]interface{})["table"])
+	assert.Equal(t, "2026-07-08T00:00:00Z", filterMap["timeStart"])
+	assert.Equal(t, "2026-07-08T23:59:59Z", filterMap["timeEnd"])
+	gtidStr, ok := filterMap["gtidSet"].(string)
+	require.True(t, ok, "gtidSet must be a string (not a struct) so the wizard can repopulate it")
+	assert.Equal(t, op.Filter.GTIDSet.String(), gtidStr)
+	assert.Equal(t, float64(500), filterMap["maxRowsPerTx"])
+
+	// Reversible: the DTO maps back to the persisted filter (scanFilterToBinlog)
+	// and round-trips through the storage projection (marshalFilter).
+	var typed struct {
+		Operations []operationView `json:"operations"`
+	}
+	require.NoError(t, json.NewDecoder(strings.NewReader(body)).Decode(&typed))
+	require.Len(t, typed.Operations, 1)
+	dto := typed.Operations[0].Filter
+	roundTrip := scanFilterToBinlog(dto)
+	assert.Equal(t, op.Filter.GTIDSet.String(), roundTrip.GTIDSet.String())
+	assert.Equal(t, op.Filter.Tables, roundTrip.Tables)
+	require.NotNil(t, roundTrip.TimeRange)
+	assert.True(t, op.Filter.TimeRange.Start.Equal(roundTrip.TimeRange.Start))
+	assert.True(t, op.Filter.TimeRange.End.Equal(roundTrip.TimeRange.End))
+	assert.Equal(t, op.Filter.MaxRowsPerTx, roundTrip.MaxRowsPerTx)
+
+	marshaled, err := marshalFilter(roundTrip)
+	require.NoError(t, err)
+	unmarshaled, err := unmarshalFilter(marshaled)
+	require.NoError(t, err)
+	assert.Equal(t, op.Filter.GTIDSet.String(), unmarshaled.GTIDSet.String())
+	require.Len(t, unmarshaled.Tables, 1)
+	assert.Equal(t, binlog.TableRef{Schema: "shop", Table: "orders"}, unmarshaled.Tables[0])
+	require.NotNil(t, unmarshaled.TimeRange)
+	assert.True(t, unmarshaled.TimeRange.Start.Equal(start))
+	assert.True(t, unmarshaled.TimeRange.End.Equal(end))
+	assert.Equal(t, 500, unmarshaled.MaxRowsPerTx)
 }
 
 // ---------- Status ----------
@@ -1869,7 +1996,8 @@ func TestEvents_StaysOpenOnPausedOpDone(t *testing.T) {
 	defer cancel()
 
 	// A pause confirmation (op_done with paused=true) is not a terminal event:
-	// no op_done frame is emitted and the stream stays open.
+	// no op_done frame is emitted, the stream stays open, and the client learns
+	// about the pause from an op_paused frame instead.
 	f.injectStreamEvent(t, agentID, op.ID, ws.EvOpDone, map[string]interface{}{"done": 1, "total": 2, "paused": true})
 
 	require.Never(t, func() bool {
@@ -1880,9 +2008,65 @@ func TestEvents_StaysOpenOnPausedOpDone(t *testing.T) {
 			return false
 		}
 	}, 400*time.Millisecond, 25*time.Millisecond)
-	assert.Empty(t, rec.String(), "no terminal frame for a pause confirmation")
+	require.Eventually(t, func() bool {
+		return strings.Contains(rec.String(), "event: "+ws.EvOpPaused)
+	}, time.Second, 10*time.Millisecond)
+	frames := sseFrames(rec.String())
+	require.Len(t, frames, 1, "exactly the op_paused frame — no terminal frame")
+	assert.Equal(t, ws.EvOpPaused, frames[0]["event"])
+	var payload struct {
+		Status string `json:"status"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(frames[0]["data"]), &payload))
+	assert.Equal(t, "paused", payload.Status)
 
 	// The operation stays paused (resumable), audited as a pause confirmation.
+	got, err := f.opStore.Get(op.ID)
+	require.NoError(t, err)
+	assert.Equal(t, StatePaused, got.Status)
+	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "paused", entries[0].Status)
+}
+
+func TestEvents_PauseFrame(t *testing.T) {
+	// A pause confirmation (agent answers the pause cancel with paused=true)
+	// publishes an op_paused event on the operation's bus, so SSE clients can
+	// show the paused state without polling /status.
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	op := f.createOp(t, "op_pause_ev", orgID, agentID, StateExecuting)
+
+	ch := f.bus.Subscribe(op.ID)
+	defer func() {
+		f.bus.Unsubscribe(op.ID, ch)
+		close(ch)
+	}()
+
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvOpDone,
+		map[string]interface{}{"done": 1, "total": 2, "paused": true})
+
+	select {
+	case ev := <-ch:
+		assert.Equal(t, ws.EvOpPaused, ev.Kind)
+		assert.Equal(t, op.ID, ev.ID)
+		var payload struct {
+			Status string `json:"status"`
+			Done   int    `json:"done"`
+			Total  int    `json:"total"`
+		}
+		require.NoError(t, json.Unmarshal(ev.Data, &payload))
+		assert.Equal(t, "paused", payload.Status)
+		assert.Equal(t, 1, payload.Done)
+		assert.Equal(t, 2, payload.Total)
+	case <-time.After(time.Second):
+		t.Fatal("op_paused was not published to the bus after a pause confirmation")
+	}
+
+	// The transitioned operation is paused (resumable), audited once.
 	got, err := f.opStore.Get(op.ID)
 	require.NoError(t, err)
 	assert.Equal(t, StatePaused, got.Status)

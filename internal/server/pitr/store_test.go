@@ -249,6 +249,37 @@ func TestSaveLoadStatements_RoundTrip(t *testing.T) {
 	assert.Equal(t, replacement, got2, "re-save replaces previous statements")
 }
 
+func TestSaveStatementsAndSelect_Atomic(t *testing.T) {
+	// The sql-mode Select path persists statements and the selection in one
+	// transaction: either both land, or neither. A failure of the second step
+	// (the selection update) must roll back the statement writes.
+	s := newTestStore(t)
+	op := &Operation{ID: "op_atomic", OrgID: "org_a", AgentID: "agent_1", Type: "pitr", Mode: "sql", Status: StateReady}
+	require.NoError(t, s.Create(op))
+
+	stmts := []Statement{
+		{TxIndex: 0, StmtIndex: 0, SQL: "DELETE FROM orders WHERE id = 1;", TxID: "tx-1", TxOrder: 1, Status: "pending"},
+		{TxIndex: 0, StmtIndex: 1, SQL: "DELETE FROM orders WHERE id = 2;", TxID: "tx-1", TxOrder: 2, Status: "pending"},
+	}
+
+	// Success: statements and the selection land in the same commit.
+	require.NoError(t, s.SaveStatementsAndSelect("op_atomic", stmts, []string{"tx-1"}))
+	got, err := s.Get("op_atomic")
+	require.NoError(t, err)
+	require.Len(t, got.Statements, 2)
+	assert.Equal(t, []string{"tx-1"}, got.SelectedTxIDs)
+
+	// Failure of the second step (the operations row is missing, so the
+	// selection update fails) rolls back the statement writes: nothing is
+	// persisted, and a previous selection stays intact.
+	err = s.SaveStatementsAndSelect("op_missing", stmts, []string{"tx-1"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "operation not found")
+	none, err := s.LoadStatements("op_missing")
+	require.NoError(t, err)
+	assert.Len(t, none, 0, "statement writes must roll back with the failed selection update")
+}
+
 func TestGet_LoadsPersistedStatements(t *testing.T) {
 	s := newTestStore(t)
 	op := &Operation{ID: "op_full", OrgID: "org_a", AgentID: "agent_1", Type: "pitr", Mode: "selected", Status: StateReady}

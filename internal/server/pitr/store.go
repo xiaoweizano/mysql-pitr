@@ -238,6 +238,55 @@ func (s *SQLiteOperationStore) SaveStatements(opID string, stmts []Statement) er
 	return tx.Commit()
 }
 
+// SaveStatementsAndSelect replaces all persisted statements of an operation
+// and records its SelectedTxIDs in a single transaction. The sql-mode Select
+// path used to call SaveStatements followed by Update, leaving a window where
+// the statements were persisted but the selection was not; both writes now
+// commit (or roll back) together, so a failed selection update can never leave
+// orphaned statements behind.
+func (s *SQLiteOperationStore) SaveStatementsAndSelect(opID string, stmts []Statement, txIDs []string) error {
+	sel, err := json.Marshal(txIDs)
+	if err != nil {
+		return fmt.Errorf("pitr: marshal selected_tx_ids: %w", err)
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.Exec("DELETE FROM statements WHERE op_id = ?", opID); err != nil {
+		return err
+	}
+	for _, st := range stmts {
+		warns, err := json.Marshal(st.Warnings)
+		if err != nil {
+			return fmt.Errorf("pitr: marshal warnings: %w", err)
+		}
+		if _, err := tx.Exec(
+			"INSERT INTO statements (op_id, tx_index, stmt_index, sql, tx_id, tx_order, warnings, status) "+
+				"VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+			opID, st.TxIndex, st.StmtIndex, st.SQL, st.TxID, st.TxOrder,
+			string(warns), st.Status); err != nil {
+			return err
+		}
+	}
+	res, err := tx.Exec(
+		"UPDATE operations SET selected_tx_ids = ?, updated_at = ? WHERE id = ?",
+		string(sel), formatStoreTime(time.Now()), opID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("operation not found: %s", opID)
+	}
+	return tx.Commit()
+}
+
 // LoadStatements returns the persisted statements of an operation ordered by
 // statement index.
 func (s *SQLiteOperationStore) LoadStatements(opID string) ([]Statement, error) {	rows, err := s.db.Query(
