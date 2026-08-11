@@ -1,19 +1,19 @@
 // Package archive 实现 binlog 归档写入：把 binlog.Source 的事件流还原成
-// binlog 文件（先写 .partial，Seal 时解析验证通过才改名为正式文件），
-// 并提供与 manifest（SHOW BINARY LOGS 的抽象）对照的缺口检测。
+// binlog 文件（先写 .partial，Seal 时解析验证通过才追加/改名为正式文件）。
+// 缺口检测（缺失文件回填）由上层归档循环（internal/collector）负责。
 //
 // 依赖约束：只使用标准库 + go-mysql + internal/binlog 的 Source 接口，
 // 不依赖 scan / stream / server 等上层包。
 package archive
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -27,15 +27,10 @@ var binlogMagic = []byte{0xfe, 0x62, 0x69, 0x6e} // "\xfe\x62\x69\x6e"
 // 首个归档文件的默认文件名（无 ROTATE_EVENT 时）。
 const defaultBinlogName = "mysql-bin.000001"
 
-// ManifestFile 是 manifest 中的一个 binlog 文件条目。
+// ManifestFile 是 manifest（SHOW BINARY LOGS）中的一个 binlog 文件条目。
 type ManifestFile struct {
 	Name string
 	Size int64
-}
-
-// Manifest 列出 MySQL 当前持有的 binlog 文件（SHOW BINARY LOGS 的抽象）。
-type Manifest interface {
-	List(ctx context.Context) ([]ManifestFile, error)
 }
 
 // Writer 把事件流写入 dir 下的归档文件。
@@ -107,7 +102,7 @@ func (w *Writer) consume(ctx context.Context, src binlog.Source, fileName string
 			continue
 		}
 		if ev.Header.EventType == replication.ROTATE_EVENT {
-			name, err := rotateNextLogName(ev)
+			name, err := RotateNextLogName(ev)
 			if err != nil {
 				return "", err
 			}
@@ -181,10 +176,10 @@ func validateRotateName(name string) error {
 	return nil
 }
 
-// rotateNextLogName 从 ROTATE_EVENT 提取下一个文件名。
+// RotateNextLogName 从 ROTATE_EVENT 提取下一个文件名。
 // 优先用已解析的 RotateEvent（真实流）；测试 stub 等来源不填 ev.Event，
 // 则从 RawData 解析（19B header + 8B position + name + 4B CRC32）。
-func rotateNextLogName(ev *replication.BinlogEvent) (string, error) {
+func RotateNextLogName(ev *replication.BinlogEvent) (string, error) {
 	if re, ok := ev.Event.(*replication.RotateEvent); ok && len(re.NextLogName) > 0 {
 		return string(re.NextLogName), nil
 	}
@@ -275,6 +270,14 @@ func (w *Writer) SealAppendVerified(partialName string) error {
 		return fmt.Errorf("archive: append seal %s but final %s missing", partialName, filepath.Base(final))
 	}
 
+	// 追加幂等（I1）：若最终文件末尾已含有与 partial 逐字节相同的尾部，
+	// 说明这段尾部此前已成功追加（Seal 成功但 SaveState 失败 / 崩溃窗口后
+	// 从旧位置重拉）——跳过追加、直接清理 partial。final 是连续前缀时
+	// 「末尾 == tail」⟹ tail 的事件已在 final 中，跳过不丢失任何事件。
+	if alreadyAppended(final, tail) {
+		return os.Remove(src)
+	}
+
 	// 组合验证：临时文件 = final 内容（含 magic）+ tail（事件字节），整体解析。
 	// 用流式拷贝而非一次性 ReadFile，避免 1GB 级文件双份内存。
 	tmp := filepath.Join(w.dir, ".verify-"+fmt.Sprint(time.Now().UnixNano()))
@@ -323,6 +326,27 @@ func (w *Writer) SealAppendVerified(partialName string) error {
 	return os.Remove(src)
 }
 
+// alreadyAppended 判断 final 的末尾 len(tail) 字节是否与 tail 逐字节相同
+// （即这段尾部此前已被追加过）。
+func alreadyAppended(final string, tail []byte) bool {
+	if len(tail) == 0 {
+		return false // 空尾部无意义；正常路径不产生空 partial
+	}
+	f, err := os.Open(final)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	if _, err := f.Seek(-int64(len(tail)), io.SeekEnd); err != nil {
+		return false
+	}
+	buf := make([]byte, len(tail))
+	if _, err := io.ReadFull(f, buf); err != nil {
+		return false
+	}
+	return bytes.Equal(buf, tail)
+}
+
 // verifyParseable 用 magic+data 拼临时文件做 ParseFile + SetVerifyChecksum(true)，
 // 验证 data 可以作为 binlog 文件的开头之后（紧跟 magic）完整解析。
 // 调用方传入的内容必须不含 magic（全量重建分支先剥离已写入的 magic）。
@@ -335,22 +359,4 @@ func (w *Writer) verifyParseable(data []byte) error {
 	parser := replication.NewBinlogParser()
 	parser.SetVerifyChecksum(true)
 	return parser.ParseFile(tmp, 0, func(*replication.BinlogEvent) error { return nil })
-}
-
-// Gaps 对比 manifest，找出本地归档中完全缺失的文件（Size 不匹配的
-// 「部分归档」场景由 Phase 2 的 reconcile 处理）。
-func (w *Writer) Gaps(ctx context.Context, m Manifest) ([]string, error) {
-	files, err := m.List(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var missing []string
-	for _, mf := range files {
-		final := filepath.Join(w.dir, mf.Name)
-		if _, err := os.Stat(final); os.IsNotExist(err) {
-			missing = append(missing, mf.Name)
-		}
-	}
-	sort.Strings(missing)
-	return missing, nil
 }

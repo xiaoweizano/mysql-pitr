@@ -34,10 +34,6 @@ func (s *sliceSource) Close() error { return nil }
 
 var _ binlog.Source = (*sliceSource)(nil) // 编译期断言：sliceSource 实现 binlog.Source
 
-type stubManifest []archive.ManifestFile
-
-func (m stubManifest) List(ctx context.Context) ([]archive.ManifestFile, error) { return m, nil }
-
 func TestWriter_ConsumeRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	w := archive.NewWriter(dir)
@@ -74,18 +70,6 @@ func TestWriter_SealCorruptedFails(t *testing.T) {
 	b[20] ^= 0xff
 	os.WriteFile(p, b, 0o644)
 	require.Error(t, w.Seal("mysql-bin.000001.partial"))
-}
-
-func TestWriter_Gaps(t *testing.T) {
-	dir := t.TempDir()
-	w := archive.NewWriter(dir)
-	os.WriteFile(filepath.Join(dir, "mysql-bin.000001"), []byte("x"), 0o644)
-	gaps, err := w.Gaps(context.Background(), stubManifest{
-		{Name: "mysql-bin.000001", Size: 1},
-		{Name: "mysql-bin.000002", Size: 5},
-	})
-	require.NoError(t, err)
-	require.Equal(t, []string{"mysql-bin.000002"}, gaps)
 }
 
 func TestWriter_ConsumeRotateStartsNewFile(t *testing.T) {
@@ -291,4 +275,38 @@ func TestWriter_SealAppendVerified_RejectsTamperedFinal(t *testing.T) {
 	require.Equal(t, b, got)
 	_, err = os.Stat(filepath.Join(dir, "mysql-bin.000001.partial"))
 	require.NoError(t, err, "验证失败后 partial 必须保留，供调用方回退/重试")
+}
+
+// TestWriter_SealAppendVerified_AppendIdempotent 验证追加幂等（I1）：
+// 最终文件末尾已含与 partial 相同的尾部（此前 Seal 成功但状态持久化失败、
+// 崩溃窗口后从旧位置重拉的典型场景）→ SealAppendVerified 必须跳过追加、
+// 清理 partial，而不是再追加一遍（否则归档重复事务）。
+func TestWriter_SealAppendVerified_AppendIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	w := archive.NewWriter(dir)
+	evs := []binlogtest.Event{binlogtest.MustCraft(binlogtest.CraftFDE()), binlogtest.MustCraft(binlogtest.CraftXID(1))}
+	tail := []binlogtest.Event{binlogtest.MustCraft(binlogtest.CraftXID(2))}
+	// 造一个「尾部已被追加过」的最终文件：全量重建 FDE+XID(1)，再手动追加上 XID(2)
+	_, err := w.Consume(context.Background(), &sliceSource{evs: evs})
+	require.NoError(t, err)
+	require.NoError(t, w.Seal("mysql-bin.000001.partial"))
+	finalPath := filepath.Join(dir, "mysql-bin.000001")
+	f, err := os.OpenFile(finalPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.Write(tail[0].Raw)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	// 重拉场景：partial 里又是同一段尾部
+	_, err = w.ConsumeAppend(context.Background(), &sliceSource{evs: tail}, "mysql-bin.000001")
+	require.NoError(t, err)
+	require.NoError(t, w.SealAppendVerified("mysql-bin.000001.partial"))
+
+	// 尾部只出现一次：最终文件 == 原封口 + 一份尾部（无重复）
+	got, err := os.ReadFile(finalPath)
+	require.NoError(t, err)
+	want := append(append([]byte{}, binlogtest.CraftFile(evs)...), tail[0].Raw...)
+	require.Equal(t, want, got)
+	_, err = os.Stat(filepath.Join(dir, "mysql-bin.000001.partial"))
+	require.True(t, os.IsNotExist(err), "幂等跳过后 partial 必须被清理")
 }
