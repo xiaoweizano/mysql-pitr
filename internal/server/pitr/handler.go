@@ -4,17 +4,22 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-mysql-org/go-mysql/mysql"
 
+	"github.com/a-shan/mysql-pitr/internal/binlog"
 	"github.com/a-shan/mysql-pitr/internal/server/agent"
 	"github.com/a-shan/mysql-pitr/internal/server/audit"
 	"github.com/a-shan/mysql-pitr/internal/server/auth"
 	"github.com/a-shan/mysql-pitr/internal/server/org"
 	"github.com/a-shan/mysql-pitr/internal/ws"
-	"github.com/a-shan/mysql-pitr/internal/ws/hub"
 )
 
 // AgentCommander is the subset of the agent hub the PITR flow needs. The
@@ -22,20 +27,13 @@ import (
 type AgentCommander interface {
 	IsConnected(agentID string) bool
 	SendToAgent(ctx context.Context, agentID string, cmd ws.Command) (*ws.Response, error)
-	SetProgressHandler(fn hub.ProgressHandler)
 }
 
-// Handler serves PITR workflow HTTP endpoints.
-//
-// NOTE (Task 4 placeholder): the v2 operation model (preflight/confirmed/
-// parsing/previewed/executing states, per-operation parse/exec results, the
-// InMemory store) was replaced by the v3 model (created/scanning/ready/
-// executing/paused/done/failed/cancelled/blocked states, binlog.Filter,
-// SQLite store). The v2 background pipeline (runOperation/executeOperation)
-// no longer exists. This handler keeps the HTTP surface and the
-// model-independent checks (auth, org membership, agent state) working, and
-// creates/updates operations through the new store; the v3 flow
-// (scanning -> ready -> executing with SSE) is implemented in Task 6.
+// Handler serves the v3 PITR workflow HTTP endpoints: start (create + scan),
+// transactions preview, select, execute, pause/resume/cancel, status, list,
+// and the SSE event stream. Agent stream events (tx_meta/sql/scan_done/
+// progress/op_done/op_error) arrive via HandleStreamEvent from the hub and are
+// fanned out to SSE subscribers through the event bus.
 type Handler struct {
 	opStore    OperationStore
 	agentStore agent.AgentStore
@@ -43,21 +41,30 @@ type Handler struct {
 	auditStore audit.AuditStore
 	jwtSecret  []byte
 
-	// commander is the agent command channel used to route operation phases
-	// to the selected agent. May be nil in tests / minimal setups;
-	// operations are rejected when nil.
+	// bus fans agent stream events out to per-operation SSE subscribers.
+	bus *eventBus
+	// commander is the agent command channel. It may be nil in minimal/dev
+	// setups; operations are rejected as offline when nil.
 	commander AgentCommander
+
+	// previews holds the in-memory scan preview per operation: the ordered
+	// transaction metadata list plus the SQL statements staged from sql events
+	// (persisted only when the operator selects transactions). Populated by the
+	// stream handler (hub read loop goroutine) and read by the HTTP
+	// transactions/select handlers — all access goes through the per-op mutex.
+	previewMu sync.Mutex
+	previews  map[string]*opPreview
 }
 
-// NewHandler creates a PITR Handler. commander may be nil for setups without
-// an agent channel.
+// NewHandler creates a PITR Handler.
 func NewHandler(
 	opStore OperationStore,
 	agentStore agent.AgentStore,
 	orgStore org.OrgStore,
 	auditStore audit.AuditStore,
-	jwtSecret []byte,
+	bus *eventBus,
 	commander AgentCommander,
+	jwtSecret []byte,
 ) *Handler {
 	return &Handler{
 		opStore:    opStore,
@@ -65,21 +72,22 @@ func NewHandler(
 		orgStore:   orgStore,
 		auditStore: auditStore,
 		jwtSecret:  jwtSecret,
+		bus:        bus,
 		commander:  commander,
+		previews:   make(map[string]*opPreview),
 	}
 }
 
 // ---------- request / response types ----------
 
 type startRequest struct {
-	AgentID      string   `json:"agent_id"`
-	TargetTable  string   `json:"target_table"`
-	RecoveryTime string   `json:"recovery_time"`
-	Mode         string   `json:"mode"` // "preview" or "execute"
-	BinlogFiles  []string `json:"binlog_files,omitempty"`
-	StartTime    string   `json:"start_time,omitempty"`
-	StartPos     *uint32  `json:"start_pos,omitempty"`
-	StopPos      *uint32  `json:"stop_pos,omitempty"`
+	AgentID string `json:"agentId"`
+	// Type is the operation kind; defaults to "pitr" when empty.
+	Type string `json:"type"`
+	// Mode selects the scan granularity: "meta" | "sql" | "selected".
+	Mode       string        `json:"mode"`
+	Filter     ws.ScanFilter `json:"filter"`
+	MaxPreview int           `json:"maxPreview"`
 }
 
 type startResponse struct {
@@ -102,6 +110,35 @@ type statusResponse struct {
 type cancelResponse struct {
 	OperationID string         `json:"operationId"`
 	Status      OperationState `json:"status"`
+}
+
+// txMetaWire mirrors the agent's tx_meta event payload (scan.TxMeta). Tables
+// use the ws.TableRefJSON shape (lowercase keys), matching the ScanFilter wire
+// convention.
+type txMetaWire struct {
+	TxID       string          `json:"txId"`
+	GTID       string          `json:"gtid,omitempty"`
+	XID        uint64          `json:"xid,omitempty"`
+	CommitTime time.Time       `json:"commitTime"`
+	Schema     string          `json:"schema,omitempty"`
+	Tables     []ws.TableRefJSON `json:"tables,omitempty"`
+	RowCount   int             `json:"rowCount"`
+	Truncated  bool            `json:"truncated,omitempty"`
+}
+
+// txPreview decorates a scanned transaction with the SQL staged from sql
+// events (populated in sql/selected modes).
+type txPreview struct {
+	txMetaWire
+	SQL []ws.StatementWire `json:"sql,omitempty"`
+}
+
+// opPreview is the in-memory scan result of one operation. Every field is
+// accessed under mu.
+type opPreview struct {
+	mu      sync.Mutex
+	metas   []txMetaWire                  // ordered transaction metadata
+	sqlByTx map[string][]ws.StatementWire // staged SQL per transaction ID
 }
 
 // ---------- helpers ----------
@@ -130,6 +167,361 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
+}
+
+// authorizeOp authenticates the request, resolves the operation by URL id and
+// checks the requesting user is a member of the operation's organisation. On
+// failure it writes the error response and returns ok=false.
+func (h *Handler) authorizeOp(w http.ResponseWriter, r *http.Request) (*Operation, bool) {
+	userID := userIDFromRequest(r)
+	if userID == "" {
+		writeError(w, http.StatusUnauthorized, "not authenticated")
+		return nil, false
+	}
+	opID := chi.URLParam(r, "id")
+	if opID == "" {
+		writeError(w, http.StatusBadRequest, "missing operation id")
+		return nil, false
+	}
+	op, err := h.opStore.Get(opID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return nil, false
+	}
+	members, err := h.orgStore.ListMembers(op.OrgID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "organisation not found")
+		return nil, false
+	}
+	if !orgMemberContains(members, userID) {
+		writeError(w, http.StatusForbidden, "not a member of this organisation")
+		return nil, false
+	}
+	return op, true
+}
+
+func orgMemberContains(members []org.Member, userID string) bool {
+	for _, m := range members {
+		if m.UserID == userID {
+			return true
+		}
+	}
+	return false
+}
+
+// sendCommand routes a command to the agent via the commander. Without a
+// configured commander (minimal/dev router) it fails so callers can degrade
+// gracefully.
+func (h *Handler) sendCommand(ctx context.Context, agentID string, cmd ws.Command) (*ws.Response, error) {
+	if h.commander == nil {
+		return nil, fmt.Errorf("pitr: agent command channel not configured")
+	}
+	return h.commander.SendToAgent(ctx, agentID, cmd)
+}
+
+// agentConnected reports whether the operation's agent currently has a live
+// hub connection.
+func (h *Handler) agentConnected(agentID string) bool {
+	return h.commander != nil && h.commander.IsConnected(agentID)
+}
+
+// paramsFrom round-trips a wire struct (ws.ScanRequest / ws.ExecuteRequest)
+// into a command params map, preserving the struct's json tags exactly as the
+// agent's decodeParams expects.
+func paramsFrom(v interface{}) map[string]interface{} {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return map[string]interface{}{}
+	}
+	var m map[string]interface{}
+	_ = json.Unmarshal(b, &m)
+	return m
+}
+
+// scanFilterToBinlog converts the wire ScanFilter into the persisted
+// binlog.Filter. The mapping mirrors the daemon's wsFilterToBinlog so the
+// operation record reflects what the agent will scan. Callers must validate
+// the filter first (validateScanFilter).
+func scanFilterToBinlog(f ws.ScanFilter) binlog.Filter {
+	var out binlog.Filter
+	for _, t := range f.Tables {
+		out.Tables = append(out.Tables, binlog.TableRef{Schema: t.Schema, Table: t.Table})
+	}
+	if f.TimeStart != "" || f.TimeEnd != "" {
+		tr := &binlog.TimeRange{}
+		if f.TimeStart != "" {
+			tr.Start, _ = time.Parse(time.RFC3339, f.TimeStart)
+		}
+		if f.TimeEnd != "" {
+			tr.End, _ = time.Parse(time.RFC3339, f.TimeEnd)
+		}
+		out.TimeRange = tr
+	}
+	if f.GTIDSet != "" {
+		gs, _ := mysql.ParseGTIDSet("mysql", f.GTIDSet)
+		out.GTIDSet = gs
+	}
+	if f.StartFile != "" {
+		out.StartPos = mysql.Position{Name: f.StartFile, Pos: f.StartPos}
+	}
+	if f.EndFile != "" {
+		out.EndPos = mysql.Position{Name: f.EndFile, Pos: f.EndPos}
+	}
+	out.MaxRowsPerTx = f.MaxRowsPerTx
+	out.SelectedTxIDs = f.SelectedTxIDs
+	return out
+}
+
+// validateScanFilter rejects filters with unparseable time bounds or GTID sets
+// up front, so the agent never receives a scan it would reject.
+func validateScanFilter(f ws.ScanFilter) error {
+	if f.TimeStart != "" {
+		if _, err := time.Parse(time.RFC3339, f.TimeStart); err != nil {
+			return fmt.Errorf("invalid filter.timeStart %q: expected RFC3339", f.TimeStart)
+		}
+	}
+	if f.TimeEnd != "" {
+		if _, err := time.Parse(time.RFC3339, f.TimeEnd); err != nil {
+			return fmt.Errorf("invalid filter.timeEnd %q: expected RFC3339", f.TimeEnd)
+		}
+	}
+	if f.GTIDSet != "" {
+		if _, err := mysql.ParseGTIDSet("mysql", f.GTIDSet); err != nil {
+			if _, err2 := mysql.ParseGTIDSet("mariadb", f.GTIDSet); err2 != nil {
+				return fmt.Errorf("invalid filter.gtidSet %q", f.GTIDSet)
+			}
+		}
+	}
+	return nil
+}
+
+// statementsToWire converts persisted statements to the execute wire format.
+func statementsToWire(stmts []Statement) []ws.StatementWire {
+	wires := make([]ws.StatementWire, 0, len(stmts))
+	for _, s := range stmts {
+		wires = append(wires, ws.StatementWire{
+			SQL:      s.SQL,
+			TxID:     s.TxID,
+			TxOrder:  s.TxOrder,
+			Warnings: s.Warnings,
+		})
+	}
+	return wires
+}
+
+// transitionTo applies the state machine transition from the operation's
+// current status to `to` and persists it. Invalid transitions (e.g. a late
+// op_done arriving after the operation was cancelled locally) are rejected and
+// reported, never applied.
+func (h *Handler) transitionTo(op *Operation, to OperationState) error {
+	if err := TryTransitionErr(op.Status, to); err != nil {
+		return err
+	}
+	op.Status = to
+	op.UpdatedAt = time.Now()
+	return h.opStore.Update(op)
+}
+
+// appendAudit records an audit entry for an operation state change. Stream
+// events record the agent as the operator; HTTP actions record the user.
+func (h *Handler) appendAudit(op *Operation, state OperationState, operator, errorDetails string) {
+	_ = h.auditStore.Append(&audit.AuditEntry{
+		OperationID:  op.ID,
+		Operator:     operator,
+		Timestamp:    time.Now(),
+		OrgID:        op.OrgID,
+		AgentID:      op.AgentID,
+		Status:       string(state),
+		ErrorDetails: errorDetails,
+	})
+}
+
+// failOperation marks an operation failed after a command transport or agent
+// rejection. The transition is only applied where the state machine allows it
+// (created/scanning/executing); operations in stable, retryable states (ready,
+// paused) are left untouched so the operator can retry or cancel.
+func (h *Handler) failOperation(op *Operation, details string) {
+	if err := TryTransitionErr(op.Status, StateFailed); err != nil {
+		log.Printf("pitr: op %s: agent failure %q left operation in state %q (retryable)", op.ID, details, op.Status)
+		return
+	}
+	op.Status = StateFailed
+	op.UpdatedAt = time.Now()
+	if err := h.opStore.Update(op); err == nil {
+		h.appendAudit(op, StateFailed, "agent", details)
+	}
+	h.forgetPreview(op.ID)
+}
+
+// ---------- preview (in-memory scan state) ----------
+
+// preview returns the operation's preview, or nil when none exists.
+func (h *Handler) preview(opID string) *opPreview {
+	h.previewMu.Lock()
+	defer h.previewMu.Unlock()
+	return h.previews[opID]
+}
+
+// previewFor returns the operation's preview, creating it on first use.
+func (h *Handler) previewFor(opID string) *opPreview {
+	h.previewMu.Lock()
+	defer h.previewMu.Unlock()
+	p := h.previews[opID]
+	if p == nil {
+		p = &opPreview{sqlByTx: make(map[string][]ws.StatementWire)}
+		h.previews[opID] = p
+	}
+	return p
+}
+
+// snapshot returns a consistent copy of the operation's preview for HTTP
+// handlers, or nil when no scan has been collected.
+func (h *Handler) snapshot(opID string) *opPreview {
+	p := h.preview(opID)
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	snap := &opPreview{
+		metas:   append([]txMetaWire(nil), p.metas...),
+		sqlByTx: make(map[string][]ws.StatementWire, len(p.sqlByTx)),
+	}
+	for txID, wires := range p.sqlByTx {
+		snap.sqlByTx[txID] = append([]ws.StatementWire(nil), wires...)
+	}
+	return snap
+}
+
+// forgetPreview drops the in-memory preview of an operation once it reaches a
+// terminal state — the preview can be regenerated by a fresh scan.
+func (h *Handler) forgetPreview(opID string) {
+	h.previewMu.Lock()
+	defer h.previewMu.Unlock()
+	delete(h.previews, opID)
+}
+
+// stageTxMeta appends a scanned transaction to the operation's preview.
+func (h *Handler) stageTxMeta(opID string, meta txMetaWire) {
+	p := h.previewFor(opID)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.metas = append(p.metas, meta)
+}
+
+// stageSQL groups sql-event statements by transaction ID in the preview.
+func (h *Handler) stageSQL(opID string, wires []ws.StatementWire) {
+	p := h.previewFor(opID)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, w := range wires {
+		if w.TxID == "" {
+			continue
+		}
+		p.sqlByTx[w.TxID] = append(p.sqlByTx[w.TxID], w)
+	}
+}
+
+// ---------- stream event handling (hub → handler) ----------
+
+// HandleStreamEvent is the hub callback for agent-pushed stream_event
+// envelopes. It is invoked asynchronously from the hub read loop, so it must
+// be safe for concurrent use: preview mutations run under the per-op mutex and
+// store updates are serialised by SQLite.
+//
+// Wire contract (agent side, see cmd/agent/serve.go streamEventCommand):
+//
+//	{ "cmd": "ev-<opId>", "type": "stream_event",
+//	  "params": { "id": "<opId>", "kind": "<kind>", "data": <raw JSON> } }
+func (h *Handler) HandleStreamEvent(agentID string, cmd ws.Command) {
+	opID, _ := cmd.Params["id"].(string)
+	if opID == "" {
+		log.Printf("pitr: stream event without operation id — ignoring")
+		return
+	}
+	kind, _ := cmd.Params["kind"].(string)
+	if kind == "" {
+		log.Printf("pitr: op %s: stream event without kind — ignoring", opID)
+		return
+	}
+	raw, err := json.Marshal(cmd.Params["data"])
+	if err != nil {
+		log.Printf("pitr: op %s: marshal event data: %v", opID, err)
+		return
+	}
+
+	op, err := h.opStore.Get(opID)
+	if err != nil {
+		log.Printf("pitr: op %s: stream event for unknown operation — ignoring", opID)
+		return
+	}
+	if op.AgentID != agentID {
+		log.Printf("pitr: op %s: stream event from agent %s (expected %s) — ignoring", opID, agentID, op.AgentID)
+		return
+	}
+
+	ev := ws.StreamEvent{ID: opID, Kind: kind, Data: raw}
+
+	switch kind {
+	case ws.EvTxMeta:
+		var meta txMetaWire
+		if err := json.Unmarshal(raw, &meta); err != nil {
+			log.Printf("pitr: op %s: parse tx_meta: %v", opID, err)
+			return
+		}
+		h.stageTxMeta(opID, meta)
+		h.bus.Publish(opID, ev)
+
+	case ws.EvSQL:
+		var wires []ws.StatementWire
+		if err := json.Unmarshal(raw, &wires); err != nil {
+			log.Printf("pitr: op %s: parse sql event: %v", opID, err)
+			return
+		}
+		h.stageSQL(opID, wires)
+		h.bus.Publish(opID, ev)
+
+	case ws.EvScanDone:
+		if err := h.transitionTo(op, StateReady); err != nil {
+			log.Printf("pitr: op %s: scan_done: %v", opID, err)
+		}
+		h.appendAudit(op, StateReady, "agent", "")
+		h.bus.Publish(opID, ev)
+
+	case ws.EvProgress:
+		// Checkpoint persistence is intentionally deferred (Task 7): progress
+		// is streamed to SSE subscribers only.
+		h.bus.Publish(opID, ev)
+
+	case ws.EvOpDone:
+		if err := h.transitionTo(op, StateDone); err != nil {
+			log.Printf("pitr: op %s: op_done: %v", opID, err)
+		}
+		h.appendAudit(op, StateDone, "agent", "")
+		h.forgetPreview(opID)
+		h.bus.Publish(opID, ev)
+
+	case ws.EvOpError:
+		if err := h.transitionTo(op, StateFailed); err != nil {
+			log.Printf("pitr: op %s: op_error: %v", opID, err)
+		}
+		h.appendAudit(op, StateFailed, "agent", errorDetailsFromEvent(raw))
+		h.forgetPreview(opID)
+		h.bus.Publish(opID, ev)
+
+	default:
+		log.Printf("pitr: op %s: unknown stream event kind %q — ignoring", opID, kind)
+	}
+}
+
+// errorDetailsFromEvent extracts the error message from an op_error payload
+// (the agent sends a JSON string).
+func errorDetailsFromEvent(raw json.RawMessage) string {
+	var msg string
+	if err := json.Unmarshal(raw, &msg); err == nil {
+		return msg
+	}
+	return string(raw)
 }
 
 // ---------- handlers ----------
@@ -201,12 +593,9 @@ type operationView struct {
 	AgentConnected bool `json:"agentConnected"`
 }
 
-// Start initiates a new PITR recovery operation against an agent.
-//
-// Placeholder (Task 4): creates and persists the v3 operation record
-// (Status: created) after the same auth/agent/org checks as before. The v3
-// pipeline that advances it (created -> scanning -> ready -> executing, with
-// SSE progress) is implemented in Task 6.
+// Start creates an operation record and launches the agent scan. On success
+// the operation is in `scanning`; an offline agent leaves it `blocked`; a
+// command failure leaves it `failed`.
 //
 // POST /api/pitr/start
 func (h *Handler) Start(w http.ResponseWriter, r *http.Request) {
@@ -221,19 +610,20 @@ func (h *Handler) Start(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.AgentID == "" || req.TargetTable == "" || req.RecoveryTime == "" || req.Mode == "" {
-		writeError(w, http.StatusBadRequest,
-			"agent_id, target_table, recovery_time, and mode are required")
+	if req.AgentID == "" {
+		writeError(w, http.StatusBadRequest, "agentId is required")
 		return
 	}
-	if req.Mode != "preview" && req.Mode != "execute" {
-		writeError(w, http.StatusBadRequest, "mode must be \"preview\" or \"execute\"")
+	if req.Type == "" {
+		req.Type = "pitr"
+	}
+	if req.Mode != "meta" && req.Mode != "sql" && req.Mode != "selected" {
+		writeError(w, http.StatusBadRequest,
+			"mode must be one of \"meta\", \"sql\", or \"selected\"")
 		return
 	}
-
-	if _, err := time.Parse(time.RFC3339, req.RecoveryTime); err != nil {
-		writeError(w, http.StatusBadRequest,
-			"invalid recovery_time: expected ISO8601/RFC3339 format")
+	if err := validateScanFilter(req.Filter); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -251,35 +641,61 @@ func (h *Handler) Start(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !orgMemberContains(members, userID) {
-		writeError(w, http.StatusForbidden,
-			"not a member of the agent's organisation")
+		writeError(w, http.StatusForbidden, "not a member of the agent's organisation")
 		return
 	}
 
-	// The agent must be approved and connected — operations run entirely
-	// through the agent's command channel.
 	if !agt.Approved {
 		writeError(w, http.StatusConflict, "agent is not approved")
 		return
 	}
-	if !h.agentConnected(req.AgentID) {
-		writeError(w, http.StatusConflict, "agent is offline — start it with `mysql-pitr-agent serve` first")
-		return
-	}
 
-	// TODO(Task 6): build the v3 Filter from the request and launch the
-	// pipeline. For now the record is created with the default filter and
-	// stays in `created`.
 	op := &Operation{
 		OrgID:     agt.OrgID,
 		AgentID:   req.AgentID,
-		Type:      "pitr",
+		Type:      req.Type,
 		Mode:      req.Mode,
+		Filter:    scanFilterToBinlog(req.Filter),
 		Status:    StateCreated,
 		CreatedBy: userID,
 	}
-
 	if err := h.opStore.Create(op); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// Reserve the preview slot so stream events can populate it.
+	h.previewFor(op.ID)
+
+	if !h.agentConnected(req.AgentID) {
+		op.Status = StateBlocked
+		op.UpdatedAt = time.Now()
+		_ = h.opStore.Update(op)
+		writeError(w, http.StatusConflict,
+			"agent is offline — start it with `mysql-pitr-agent serve` first")
+		return
+	}
+
+	resp, err := h.sendCommand(r.Context(), op.AgentID, ws.Command{
+		Cmd:  op.ID,
+		Type: ws.CmdScan,
+		Params: paramsFrom(ws.ScanRequest{
+			Filter:     req.Filter,
+			Mode:       req.Mode,
+			MaxPreview: req.MaxPreview,
+		}),
+	})
+	if err != nil {
+		h.failOperation(op, err.Error())
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("start scan: %v", err))
+		return
+	}
+	if resp != nil && resp.Status == ws.StatusError {
+		h.failOperation(op, resp.Error)
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("agent rejected scan: %s", resp.Error))
+		return
+	}
+
+	if err := h.transitionTo(op, StateScanning); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -294,33 +710,8 @@ func (h *Handler) Start(w http.ResponseWriter, r *http.Request) {
 //
 // GET /api/pitr/{id}/status
 func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
-	userID := userIDFromRequest(r)
-	if userID == "" {
-		writeError(w, http.StatusUnauthorized, "not authenticated")
-		return
-	}
-
-	opID := chi.URLParam(r, "id")
-	if opID == "" {
-		writeError(w, http.StatusBadRequest, "missing operation id")
-		return
-	}
-
-	op, err := h.opStore.Get(opID)
-	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
-		return
-	}
-
-	// Verify org membership.
-	members, err := h.orgStore.ListMembers(op.OrgID)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "organisation not found")
-		return
-	}
-	if !orgMemberContains(members, userID) {
-		writeError(w, http.StatusForbidden,
-			"not a member of this organisation")
+	op, ok := h.authorizeOp(w, r)
+	if !ok {
 		return
 	}
 
@@ -337,63 +728,290 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Cancel cancels an operation that is in a cancellable state (scanning, ready,
-// or paused under the v3 state machine).
+// Transactions returns the in-memory scan preview of an operation: the ordered
+// transaction metadata list, each decorated with the SQL staged from sql
+// events. Partial results are returned while the scan is still running.
 //
-// POST /api/pitr/{id}/cancel
-func (h *Handler) Cancel(w http.ResponseWriter, r *http.Request) {
-	userID := userIDFromRequest(r)
-	if userID == "" {
-		writeError(w, http.StatusUnauthorized, "not authenticated")
+// GET /api/pitr/{id}/transactions
+func (h *Handler) Transactions(w http.ResponseWriter, r *http.Request) {
+	op, ok := h.authorizeOp(w, r)
+	if !ok {
 		return
 	}
 
-	opID := chi.URLParam(r, "id")
-	if opID == "" {
-		writeError(w, http.StatusBadRequest, "missing operation id")
+	txs := []txPreview{}
+	if snap := h.snapshot(op.ID); snap != nil {
+		for _, m := range snap.metas {
+			txs = append(txs, txPreview{txMetaWire: m, SQL: snap.sqlByTx[m.TxID]})
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"operationId":  op.ID,
+		"status":       op.Status,
+		"transactions": txs,
+	})
+}
+
+// Select persists the statements of the chosen transactions and records the
+// selection on the operation. Only `ready` operations can be selected.
+//
+// POST /api/pitr/{id}/select   {"txIds": ["..."]}
+func (h *Handler) Select(w http.ResponseWriter, r *http.Request) {
+	op, ok := h.authorizeOp(w, r)
+	if !ok {
 		return
 	}
 
-	op, err := h.opStore.Get(opID)
-	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
+	var req struct {
+		TxIDs []string `json:"txIds"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
-	// Verify org membership.
-	members, err := h.orgStore.ListMembers(op.OrgID)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "organisation not found")
+	if len(req.TxIDs) == 0 {
+		writeError(w, http.StatusBadRequest, "txIds is required")
 		return
 	}
-	if !orgMemberContains(members, userID) {
-		writeError(w, http.StatusForbidden,
-			"not a member of this organisation")
-		return
-	}
-
-	if !TransitionValid(op.Status, StateCancelled) {
+	if op.Status != StateReady {
 		writeError(w, http.StatusConflict,
-			fmt.Sprintf("cannot cancel operation in state %q", op.Status))
+			fmt.Sprintf("operation must be in state \"ready\" to select transactions (current state %q)", op.Status))
 		return
 	}
 
-	op.Status = StateCancelled
+	snap := h.snapshot(op.ID)
+	if snap == nil {
+		writeError(w, http.StatusConflict, "no scan preview available for this operation")
+		return
+	}
+
+	txIndex := make(map[string]int, len(snap.metas))
+	for i, m := range snap.metas {
+		txIndex[m.TxID] = i
+	}
+
+	var unknown []string
+	for _, id := range req.TxIDs {
+		if _, ok := txIndex[id]; !ok {
+			unknown = append(unknown, id)
+		}
+	}
+	if len(unknown) > 0 {
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("transaction(s) not in scan preview: %s", strings.Join(unknown, ", ")))
+		return
+	}
+
+	// Build the statements in the client's requested order; StmtIndex is a
+	// global counter (the statements table is keyed by (op_id, stmt_index)).
+	var stmts []Statement
+	stmtIdx := 0
+	for _, id := range req.TxIDs {
+		wires := snap.sqlByTx[id]
+		if len(wires) == 0 {
+			writeError(w, http.StatusConflict,
+				fmt.Sprintf("no SQL statements available for transaction %s (scan produced metadata only)", id))
+			return
+		}
+		for _, w := range wires {
+			stmts = append(stmts, Statement{
+				TxIndex:   txIndex[id],
+				StmtIndex: stmtIdx,
+				SQL:       w.SQL,
+				TxID:      w.TxID,
+				TxOrder:   w.TxOrder,
+				Warnings:  w.Warnings,
+				Status:    "pending",
+			})
+			stmtIdx++
+		}
+	}
+
+	if err := h.opStore.SaveStatements(op.ID, stmts); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	op.SelectedTxIDs = req.TxIDs
 	op.UpdatedAt = time.Now()
 	if err := h.opStore.Update(op); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	// Record audit entry.
-	_ = h.auditStore.Append(&audit.AuditEntry{
-		OperationID: op.ID,
-		Operator:    emailFromRequest(r),
-		Timestamp:   time.Now(),
-		OrgID:       op.OrgID,
-		AgentID:     op.AgentID,
-		Status:      string(StateCancelled),
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"operationId":    op.ID,
+		"status":         op.Status,
+		"selectedTxIds":  req.TxIDs,
+		"statementCount": len(stmts),
 	})
+}
+
+// Execute issues CmdExecute with the persisted selected statements, moving a
+// `ready` operation to `executing`.
+//
+// POST /api/pitr/{id}/execute   {"batchSize": 100}
+func (h *Handler) Execute(w http.ResponseWriter, r *http.Request) {
+	op, ok := h.authorizeOp(w, r)
+	if !ok {
+		return
+	}
+	if op.Status != StateReady {
+		writeError(w, http.StatusConflict,
+			fmt.Sprintf("operation must be in state \"ready\" to execute (current state %q)", op.Status))
+		return
+	}
+
+	var req struct {
+		BatchSize int `json:"batchSize,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	h.sendExecute(w, r, op, req.BatchSize, StateExecuting)
+}
+
+// Resume re-issues CmdExecute for a paused operation, moving it back to
+// `executing`.
+//
+// POST /api/pitr/{id}/resume
+func (h *Handler) Resume(w http.ResponseWriter, r *http.Request) {
+	op, ok := h.authorizeOp(w, r)
+	if !ok {
+		return
+	}
+	if op.Status != StatePaused {
+		writeError(w, http.StatusConflict,
+			fmt.Sprintf("only paused operations can be resumed (current state %q)", op.Status))
+		return
+	}
+	h.sendExecute(w, r, op, 0, StateExecuting)
+}
+
+// sendExecute loads the operation's persisted statements and issues CmdExecute
+// to the agent, transitioning to `to` on acceptance or `failed` when the agent
+// rejects the command.
+func (h *Handler) sendExecute(w http.ResponseWriter, r *http.Request, op *Operation, batchSize int, to OperationState) {
+	stmts, err := h.opStore.LoadStatements(op.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if len(stmts) == 0 {
+		writeError(w, http.StatusConflict, "no selected statements to execute — select transactions first")
+		return
+	}
+
+	execReq := ws.ExecuteRequest{
+		OperationID: op.ID,
+		Statements:  statementsToWire(stmts),
+		BatchSize:   batchSize,
+	}
+	resp, err := h.sendCommand(r.Context(), op.AgentID, ws.Command{
+		Cmd:    op.ID,
+		Type:   ws.CmdExecute,
+		Params: paramsFrom(execReq),
+	})
+	if err != nil {
+		h.failOperation(op, err.Error())
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("send execute: %v", err))
+		return
+	}
+	if resp != nil && resp.Status == ws.StatusError {
+		h.failOperation(op, resp.Error)
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("agent rejected execute: %s", resp.Error))
+		return
+	}
+
+	if err := h.transitionTo(op, to); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"operationId":    op.ID,
+		"status":         op.Status,
+		"statementCount": len(stmts),
+	})
+}
+
+// Pause suspends an executing operation: CmdCancel is dispatched to the agent
+// and the local state moves to `paused` (resumable).
+//
+// POST /api/pitr/{id}/pause
+func (h *Handler) Pause(w http.ResponseWriter, r *http.Request) {
+	op, ok := h.authorizeOp(w, r)
+	if !ok {
+		return
+	}
+	if op.Status != StateExecuting {
+		writeError(w, http.StatusConflict,
+			fmt.Sprintf("only executing operations can be paused (current state %q)", op.Status))
+		return
+	}
+
+	resp, err := h.sendCommand(r.Context(), op.AgentID, ws.Command{
+		Cmd:  op.ID,
+		Type: ws.CmdCancel,
+		Params: map[string]interface{}{
+			"operationId": op.ID,
+		},
+	})
+	if err != nil {
+		h.failOperation(op, err.Error())
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("send pause: %v", err))
+		return
+	}
+	if resp != nil && resp.Status == ws.StatusError {
+		h.failOperation(op, resp.Error)
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("agent rejected pause: %s", resp.Error))
+		return
+	}
+
+	if err := h.transitionTo(op, StatePaused); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"operationId": op.ID,
+		"status":      op.Status,
+	})
+}
+
+// Cancel terminates an operation in a cancellable state (scanning, ready, or
+// paused). CmdCancel is dispatched to the agent best-effort: cancellation is
+// an authoritative local transition, so an unreachable agent still leaves the
+// operation cancelled (a stuck operation must remain cancellable).
+//
+// POST /api/pitr/{id}/cancel
+func (h *Handler) Cancel(w http.ResponseWriter, r *http.Request) {
+	op, ok := h.authorizeOp(w, r)
+	if !ok {
+		return
+	}
+	if !TransitionValid(op.Status, StateCancelled) {
+		writeError(w, http.StatusConflict,
+			fmt.Sprintf("cannot cancel operation in state %q", op.Status))
+		return
+	}
+
+	_, _ = h.sendCommand(r.Context(), op.AgentID, ws.Command{
+		Cmd:  op.ID,
+		Type: ws.CmdCancel,
+		Params: map[string]interface{}{
+			"operationId": op.ID,
+		},
+	})
+
+	if err := h.transitionTo(op, StateCancelled); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.forgetPreview(op.ID)
+	h.appendAudit(op, StateCancelled, emailFromRequest(r), "")
 
 	writeJSON(w, http.StatusOK, cancelResponse{
 		OperationID: op.ID,
@@ -401,49 +1019,111 @@ func (h *Handler) Cancel(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Preview returns the parsed/selected statements of a ready operation.
-//
-// Placeholder (Task 4): not implemented — the v3 preview flow (scanning ->
-// ready, statements persisted via SaveStatements) lands in Task 6.
-//
-// GET /api/pitr/{id}/preview
-func (h *Handler) Preview(w http.ResponseWriter, r *http.Request) {
-	writeError(w, http.StatusNotImplemented, "preview: not implemented (v3 flow lands in Task 6)")
-}
+// ---------- SSE ----------
 
-// Progress returns the current execution progress of an operation.
-//
-// Placeholder (Task 4): not implemented — the v3 executing/progress flow with
-// SSE lands in Task 6.
-//
-// GET /api/pitr/{id}/progress
-func (h *Handler) Progress(w http.ResponseWriter, r *http.Request) {
-	writeError(w, http.StatusNotImplemented, "progress: not implemented (v3 flow lands in Task 6)")
-}
+// ssePollInterval is how often the SSE loop re-checks the operation state, so
+// terminal transitions without an agent stream event (e.g. a local cancel) are
+// still observed by connected clients.
+const ssePollInterval = time.Second
 
-// Execute runs the selected statements of a ready operation.
+// Events streams the operation's agent events as Server-Sent Events:
 //
-// Placeholder (Task 4): not implemented — the v3 executing flow lands in
-// Task 6.
+//	event: <kind>
+//	data: <json>
 //
-// POST /api/pitr/{id}/execute
-func (h *Handler) Execute(w http.ResponseWriter, r *http.Request) {
-	writeError(w, http.StatusNotImplemented, "execute: not implemented (v3 flow lands in Task 6)")
-}
+// The loop terminates on a terminal event (op_done/op_error), on the client
+// disconnecting, or when the operation reaches a terminal state. On exit the
+// subscription is removed and the channel closed per the event bus contract
+// (Unsubscribe before close — the bus holds the same lock as Publish, so no
+// send can race the close).
+//
+// GET /api/pitr/{id}/events
+func (h *Handler) Events(w http.ResponseWriter, r *http.Request) {
+	op, ok := h.authorizeOp(w, r)
+	if !ok {
+		return
+	}
 
-// ---------- helpers ----------
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "streaming responses not supported")
+		return
+	}
 
-// agentConnected reports whether the operation's agent currently has a live
-// hub connection.
-func (h *Handler) agentConnected(agentID string) bool {
-	return h.commander != nil && h.commander.IsConnected(agentID)
-}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
 
-func orgMemberContains(members []org.Member, userID string) bool {
-	for _, m := range members {
-		if m.UserID == userID {
-			return true
+	// An operation that is already terminal has no live agent stream: emit a
+	// synthetic terminal frame so the client does not hang.
+	if IsTerminal(op.Status) {
+		writeSSEFrame(w, syntheticTerminalEvent(op))
+		flusher.Flush()
+		return
+	}
+
+	ch := h.bus.Subscribe(op.ID)
+	defer func() {
+		h.bus.Unsubscribe(op.ID, ch)
+		close(ch)
+	}()
+	flusher.Flush() // commit headers; also signals the subscription is live
+
+	ticker := time.NewTicker(ssePollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case ev, ok := <-ch:
+			if !ok {
+				return // subscription closed
+			}
+			writeSSEFrame(w, ev)
+			flusher.Flush()
+			if isTerminalKind(ev.Kind) {
+				return
+			}
+		case <-ticker.C:
+			cur, err := h.opStore.Get(op.ID)
+			if err != nil {
+				continue
+			}
+			if IsTerminal(cur.Status) {
+				writeSSEFrame(w, syntheticTerminalEvent(cur))
+				flusher.Flush()
+				return
+			}
+		case <-r.Context().Done():
+			return // client disconnected
 		}
 	}
-	return false
+}
+
+// writeSSEFrame writes one SSE frame: `event: <kind>\ndata: <json>\n\n`.
+func writeSSEFrame(w http.ResponseWriter, ev ws.StreamEvent) {
+	data := ev.Data
+	if len(data) == 0 {
+		data = json.RawMessage("{}")
+	}
+	_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Kind, data)
+}
+
+// isTerminalKind reports whether a stream event kind ends the operation.
+func isTerminalKind(kind string) bool {
+	return kind == ws.EvOpDone || kind == ws.EvOpError
+}
+
+// syntheticTerminalEvent builds a terminal event for an operation that reached
+// a terminal state without an agent notification (e.g. a local cancel), or was
+// already terminal when the client subscribed. The payload carries the
+// terminal state so the client can reconcile with /status; cancelled maps to
+// op_done with {"status":"cancelled"} to disambiguate.
+func syntheticTerminalEvent(op *Operation) ws.StreamEvent {
+	kind := ws.EvOpDone
+	switch op.Status {
+	case StateFailed, StateBlocked:
+		kind = ws.EvOpError
+	}
+	data, _ := json.Marshal(map[string]string{"status": string(op.Status)})
+	return ws.StreamEvent{ID: op.ID, Kind: kind, Data: data}
 }

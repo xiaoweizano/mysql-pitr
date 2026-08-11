@@ -78,8 +78,14 @@ func New() (*Server, error) {
 	authHandler := auth.NewHandler(userStore, jwtSecret())
 	orgHandler := org.NewHandler(orgStore, userStore, jwtSecret())
 	agentHandler := agent.NewHandler(agentStore, orgStore, jwtSecret())
-	pitrHandler := pitr.NewHandler(pitrStore, agentStore, orgStore, auditStore, jwtSecret(), agentHub)
+	pitrBus := pitr.NewEventBus()
+	pitrHandler := pitr.NewHandler(pitrStore, agentStore, orgStore, auditStore, pitrBus, agentHub, jwtSecret())
 	auditHandler := audit.NewHandler(auditStore, orgStore, jwtSecret())
+
+	// Route agent→server stream_event envelopes (scan tx/SQL, execution
+	// progress, operation completion) into the PITR handler, which fans them
+	// out to SSE subscribers.
+	agentHub.SetStreamEventHandler(pitrHandler.HandleStreamEvent)
 
 	// Keep the agents API's status field in sync with the hub. Unknown agents
 	// (e.g. after a server restart cleared the in-memory store) are registered

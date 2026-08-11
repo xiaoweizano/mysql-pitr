@@ -77,10 +77,13 @@ func newWebRouter(
 
 			r.Route("/{id}", func(r chi.Router) {
 				r.Get("/status", pitrHandler.Status)
-				r.Post("/cancel", pitrHandler.Cancel)
-				r.Get("/preview", pitrHandler.Preview)
-				r.Get("/progress", pitrHandler.Progress)
+				r.Get("/transactions", pitrHandler.Transactions)
+				r.Post("/select", pitrHandler.Select)
 				r.Post("/execute", pitrHandler.Execute)
+				r.Post("/pause", pitrHandler.Pause)
+				r.Post("/resume", pitrHandler.Resume)
+				r.Post("/cancel", pitrHandler.Cancel)
+				r.Get("/events", pitrHandler.Events)
 			})
 		})
 
@@ -141,7 +144,7 @@ func NewRouter() *chi.Mux {
 	authHandler := auth.NewHandler(userStore, jwtSecret)
 	orgHandler := org.NewHandler(orgStore, userStore, jwtSecret)
 	agentHandler := agent.NewHandler(agentStore, orgStore, jwtSecret)
-	pitrHandler := pitr.NewHandler(pitrStore, agentStore, orgStore, auditStore, jwtSecret, nil)
+	pitrHandler := pitr.NewHandler(pitrStore, agentStore, orgStore, auditStore, pitr.NewEventBus(), nil, jwtSecret)
 	auditHandler := audit.NewHandler(auditStore, orgStore, jwtSecret)
 
 	return newWebRouter(agentStore, orgStore, userStore, authHandler, orgHandler, agentHandler, pitrHandler, auditHandler)

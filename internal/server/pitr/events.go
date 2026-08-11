@@ -30,9 +30,12 @@ func NewEventBus() *eventBus {
 }
 
 // Subscribe registers a new subscriber for the given operation and returns
-// its buffered receive channel. Subscriptions are keyed by operation ID;
-// events published for other operations are never delivered to it.
-func (b *eventBus) Subscribe(opID string) <-chan ws.StreamEvent {
+// its buffered channel. Subscriptions are keyed by operation ID; events
+// published for other operations are never delivered to it.
+//
+// The returned channel is bidirectional so the subscriber can honour the
+// close contract (Unsubscribe then close) once the operation is terminal.
+func (b *eventBus) Subscribe(opID string) chan ws.StreamEvent {
 	ch := make(chan ws.StreamEvent, subBuffer)
 	b.mu.Lock()
 	b.subs[opID] = append(b.subs[opID], ch)
