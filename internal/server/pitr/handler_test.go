@@ -680,11 +680,99 @@ func TestStreamEvent_Progress_Published(t *testing.T) {
 		t.Fatal("progress event was not published to the bus")
 	}
 
-	// Progress does not change the operation state (checkpoint persistence is
-	// deferred to Task 7).
+	// Progress does not change the operation state; the checkpoint double-write
+	// is tested in TestStreamEvent_Progress_PersistsCheckpoint.
 	got, err := f.opStore.Get(op.ID)
 	require.NoError(t, err)
 	assert.Equal(t, StateExecuting, got.Status)
+}
+
+func TestStreamEvent_Progress_PersistsCheckpoint(t *testing.T) {
+	// Server-side checkpoint double-write: progress events upsert the
+	// checkpoints table so an operation can be resumed even after the agent
+	// (or the server) restarts.
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	op := f.createOp(t, "op_cp", orgID, agentID, StateExecuting)
+
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvProgress, map[string]interface{}{
+		"done": 20, "total": 100,
+		"errors": []map[string]interface{}{
+			{"statement": 3, "sql": "DELETE FROM shop.orders WHERE id=3", "err": "duplicate key"},
+		},
+	})
+
+	sqlStore := f.opStore.(*SQLiteOperationStore)
+	var lastStmt, total int
+	var errs string
+	require.NoError(t, sqlStore.db.QueryRow(
+		"SELECT last_statement, total, errors FROM checkpoints WHERE op_id = ?", op.ID).
+		Scan(&lastStmt, &total, &errs))
+	assert.Equal(t, 20, lastStmt)
+	assert.Equal(t, 100, total)
+	assert.Contains(t, errs, "duplicate key")
+	assert.Contains(t, errs, `"statement":3`)
+
+	// A later progress event overwrites the previous checkpoint row.
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvProgress, map[string]interface{}{"done": 40, "total": 100})
+	require.NoError(t, sqlStore.db.QueryRow(
+		"SELECT last_statement, errors FROM checkpoints WHERE op_id = ?", op.ID).
+		Scan(&lastStmt, &errs))
+	assert.Equal(t, 40, lastStmt)
+	var n int
+	require.NoError(t, sqlStore.db.QueryRow("SELECT count(*) FROM checkpoints WHERE op_id = ?", op.ID).Scan(&n))
+	assert.Equal(t, 1, n, "checkpoint rows are upserted, never duplicated")
+}
+
+func TestStreamEvent_OpDone_WithErrors_AuditDetailAndSSE(t *testing.T) {
+	// op_done with a non-empty errors list: the done audit records the error
+	// summary, and the SSE op_done payload passes the errors through so the
+	// front-end can surface per-statement failures.
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	op := f.createOp(t, "op_errs", orgID, agentID, StateExecuting)
+
+	ch := f.bus.Subscribe(op.ID)
+	defer func() {
+		f.bus.Unsubscribe(op.ID, ch)
+		close(ch)
+	}()
+
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvOpDone, map[string]interface{}{
+		"done": 2, "total": 2, "paused": false,
+		"errors": []map[string]interface{}{
+			{"statement": 1, "sql": "DELETE FROM shop.orders WHERE id=1", "err": "duplicate key"},
+		},
+	})
+
+	// Operation completes (done) despite statement errors.
+	got, err := f.opStore.Get(op.ID)
+	require.NoError(t, err)
+	assert.Equal(t, StateDone, got.Status)
+
+	// Audit records the error summary.
+	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "done", entries[0].Status)
+	assert.Contains(t, entries[0].ErrorDetails, "duplicate key")
+
+	// The SSE op_done payload carries the errors verbatim for the front-end.
+	select {
+	case ev := <-ch:
+		assert.Equal(t, ws.EvOpDone, ev.Kind)
+		var payload opDonePayload
+		require.NoError(t, json.Unmarshal(ev.Data, &payload))
+		require.Len(t, payload.Errors, 1)
+		assert.Equal(t, 1, payload.Errors[0].Statement)
+		assert.Equal(t, "duplicate key", payload.Errors[0].Err)
+	case <-time.After(time.Second):
+		t.Fatal("op_done was not published to the bus")
+	}
 }
 
 func TestStreamEvent_OpDone_Done(t *testing.T) {

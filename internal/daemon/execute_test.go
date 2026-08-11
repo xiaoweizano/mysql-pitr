@@ -15,15 +15,17 @@ import (
 	"github.com/a-shan/mysql-pitr/internal/ws"
 )
 
-// fakeExecutor 记录最后一次 Plan，按预设回调进度，返回预设报告。
+// fakeExecutor 记录最后一次 Plan，按预设回调进度，返回预设报告。Run 与 Resume
+// 分别计数，供测试断言 daemon 把 execute 路由到 Run、resume 路由到 Resume。
 type fakeExecutor struct {
-	mu         sync.Mutex
-	plan       executor.Plan
-	runCalls   int
-	progresses []executor.Progress
-	report     executor.FinalReport
-	runErr     error
-	// blockRun 非 nil 时 Run 阻塞直到通道关闭（用于确定性的 op 生命周期测试）。
+	mu          sync.Mutex
+	plan        executor.Plan
+	runCalls    int
+	resumeCalls int
+	progresses  []executor.Progress
+	report      executor.FinalReport
+	runErr      error
+	// blockRun 非 nil 时 Run/Resume 阻塞直到通道关闭（用于确定性的 op 生命周期测试）。
 	blockRun chan struct{}
 }
 
@@ -41,8 +43,18 @@ func (f *fakeExecutor) Run(ctx context.Context, plan executor.Plan, cb executor.
 	return f.report, f.runErr
 }
 
-func (f *fakeExecutor) Resume(ctx context.Context, operationID string, cb executor.ProgressCallback) (executor.FinalReport, error) {
-	return executor.FinalReport{}, errors.New("fakeExecutor: Resume not implemented (phase 3)")
+func (f *fakeExecutor) Resume(ctx context.Context, plan executor.Plan, cb executor.ProgressCallback) (executor.FinalReport, error) {
+	f.mu.Lock()
+	f.plan = plan
+	f.resumeCalls++
+	f.mu.Unlock()
+	if f.blockRun != nil {
+		<-f.blockRun
+	}
+	for _, p := range f.progresses {
+		cb(p)
+	}
+	return f.report, f.runErr
 }
 
 func (f *fakeExecutor) getPlan() executor.Plan {
@@ -55,6 +67,12 @@ func (f *fakeExecutor) getRunCalls() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.runCalls
+}
+
+func (f *fakeExecutor) getResumeCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.resumeCalls
 }
 
 // TestExecute_StreamsProgressAndOpDone 验证 Execute：转 Plan → goroutine Run →
@@ -139,10 +157,9 @@ func TestExecute_RejectsUnsafeOperationID(t *testing.T) {
 	require.Empty(t, sink.eventsCopy(), "被拒绝的 op 不产生任何事件")
 }
 
-// TestResume_RerunsPlan 验证 Resume：校验 operationID 后复用 Execute 路径重跑
-// （Phase 2 语义：executor.Run 启动清检查点、从零重跑；检查点续起是 Phase 3
-// server 层重发 Plan 的职责）。
-func TestResume_RerunsPlan(t *testing.T) {
+// TestResume_ContinuesViaExecutorResume 验证 Resume：校验 operationID 后把 Plan
+// 交给 executor.Resume（检查点续跑），而不是 Run（从零重跑）。
+func TestResume_ContinuesViaExecutorResume(t *testing.T) {
 	ctx := context.Background()
 	sink := &fakeSink{}
 	fex := &fakeExecutor{report: executor.FinalReport{Done: 1, Total: 1}}
@@ -154,8 +171,11 @@ func TestResume_RerunsPlan(t *testing.T) {
 	}))
 	require.Eventually(t, func() bool { return sink.hasKind(ws.EvOpDone) },
 		5*time.Second, 10*time.Millisecond)
-	require.Equal(t, 1, fex.getRunCalls(), "Resume 触发一次 Run")
+	require.Equal(t, 1, fex.getResumeCalls(), "Resume 触发一次 executor.Resume")
+	require.Equal(t, 0, fex.getRunCalls(), "Resume 不得调用 executor.Run")
 	require.Equal(t, "op-abc", fex.getPlan().OperationID)
+	require.Len(t, fex.getPlan().Statements, 1)
+	require.Equal(t, "DELETE FROM shop.orders WHERE id=1", fex.getPlan().Statements[0].SQL)
 
 	// Resume 同样拒绝不安全 operationID
 	err := d.Resume(ctx, "resume-x", ws.ExecuteRequest{OperationID: "../evil"})

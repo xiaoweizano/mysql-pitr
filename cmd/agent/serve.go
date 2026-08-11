@@ -350,8 +350,8 @@ func (d *serveDaemon) handleExecute(ctx context.Context, cmd ws.Command) *ws.Res
 	return okResp(cmd, map[string]interface{}{"accepted": true, "operationId": cmd.Cmd})
 }
 
-// handleResume 与 handleExecute 同一路径（Phase 2 语义：从零重跑；Phase 3 由
-// server 重发持久化 Plan 续跑）。
+// handleResume 与 handleExecute 同一路径（检查点续跑：executor.Resume 载入
+// operationID 的检查点从断点继续；server 重发持久化 Plan 作为续跑输入）。
 func (d *serveDaemon) handleResume(ctx context.Context, cmd ws.Command) *ws.Response {
 	var req ws.ExecuteRequest
 	if err := decodeParams(cmd, &req); err != nil {

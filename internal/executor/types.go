@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 
 	"github.com/a-shan/mysql-pitr/internal/reverse"
 )
@@ -56,10 +57,17 @@ type CheckpointStore interface {
 	Clear(operationID string) error
 }
 
+// ErrCheckpointNotFound 是 Load 在指定 operationID 没有检查点时的哨兵错误。
+// Resume 用它区分"从未跑过（从 0 全跑）"与"检查点损坏/加载失败（报错）"。
+var ErrCheckpointNotFound = errors.New("executor: checkpoint not found")
+
 // Executor 是执行器接口。
 type Executor interface {
 	Run(ctx context.Context, plan Plan, cb ProgressCallback) (FinalReport, error)
-	Resume(ctx context.Context, operationID string, cb ProgressCallback) (FinalReport, error)
+	// Resume 载入 plan.OperationID 的检查点并从断点续跑：
+	//   - 有检查点 → 从 LastCompletedStatement（已完成的语句数）继续；
+	//   - 无检查点（ErrCheckpointNotFound）→ 从 0 全跑（等价 Run 但不清检查点）。
+	Resume(ctx context.Context, plan Plan, cb ProgressCallback) (FinalReport, error)
 }
 
 // DefaultBatchSize 是 Plan.BatchSize=0 时使用的默认值。

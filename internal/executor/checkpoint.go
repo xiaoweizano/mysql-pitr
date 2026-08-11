@@ -20,7 +20,7 @@ func (s *InMemoryCheckpointStore) Load(operationID string) (*Checkpoint, error) 
 	defer s.mu.Unlock()
 	c, ok := s.data[operationID]
 	if !ok {
-		return nil, fmt.Errorf("executor: checkpoint for %q not found", operationID)
+		return nil, fmt.Errorf("%w (operation %q)", ErrCheckpointNotFound, operationID)
 	}
 	cp := c
 	return &cp, nil

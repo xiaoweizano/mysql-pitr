@@ -41,26 +41,23 @@ func (d *Daemon) Execute(ctx context.Context, id string, req ws.ExecuteRequest) 
 	if err := validateOperationID(req.OperationID); err != nil {
 		return err
 	}
-	return d.runExecute(ctx, id, req)
+	return d.runExecute(ctx, id, req, false)
 }
 
-// Resume 重发 Plan 并重新执行。
-//
-// Phase 2 语义：校验 operationID 后复用 Execute 路径（executor.Run 启动时 Clear
-// 检查点，因此当前会从零重跑）。检查点续起的正确路径是 Phase 3：server 层把
-// 持久化 Plan 重发给 agent，agent 再用 Run 续跑；executor.Executor.Resume 也预留
-// 了该入口。这里文档化该限制，避免 Phase 3 误用检查点语义。
+// Resume 重发 Plan 并检查点续跑：把 Plan 交给 executor.Resume（载入
+// operationID 对应的检查点，从断点继续；无检查点则从 0 全跑）。与 Execute 的
+// 区别仅在于调用的 executor 方法——检查点写入时机、进度/结果事件语义完全一致。
 func (d *Daemon) Resume(ctx context.Context, id string, req ws.ExecuteRequest) error {
 	if err := validateOperationID(req.OperationID); err != nil {
 		return err
 	}
-	return d.runExecute(ctx, id, req)
+	return d.runExecute(ctx, id, req, true)
 }
 
-// runExecute 是 Execute/Resume 的公共实现：转 Plan → 注册 op → goroutine Run →
-// 进度/结果事件推送。Plan.DSN 在 Phase 2 为空（daemon 无 DSN 来源）；Phase 3
-// server 层注入连接配置后填充。
-func (d *Daemon) runExecute(ctx context.Context, id string, req ws.ExecuteRequest) error {
+// runExecute 是 Execute/Resume 的公共实现：转 Plan → 注册 op → goroutine
+// Run/Resume → 进度/结果事件推送。resume=true 时走 executor.Resume（检查点续跑），
+// 否则 executor.Run。Plan.DSN 在 Phase 3 由 server 层注入连接配置后填充。
+func (d *Daemon) runExecute(ctx context.Context, id string, req ws.ExecuteRequest, resume bool) error {
 	if d.exec == nil {
 		return fmt.Errorf("daemon: executor not configured")
 	}
@@ -69,10 +66,15 @@ func (d *Daemon) runExecute(ctx context.Context, id string, req ws.ExecuteReques
 	ctx, cancel := context.WithCancel(ctx)
 	d.registerOp(id, cancel)
 
+	run := d.exec.Run
+	if resume {
+		run = d.exec.Resume
+	}
+
 	go func() {
 		defer d.unregisterOp(id)
 		defer cancel()
-		report, err := d.exec.Run(ctx, plan, func(p executor.Progress) {
+		report, err := run(ctx, plan, func(p executor.Progress) {
 			if data, merr := json.Marshal(p); merr == nil {
 				d.sink.Send(ws.StreamEvent{ID: id, Kind: ws.EvProgress, Data: data})
 			}

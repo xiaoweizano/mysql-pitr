@@ -60,4 +60,8 @@ type OperationStore interface {
 	// given set (selection re-runs overwrite previous selections).
 	SaveStatements(opID string, stmts []Statement) error
 	LoadStatements(opID string) ([]Statement, error)
+	// SaveCheckpoint upserts the operation's execution checkpoint (server-side
+	// double-write of the agent's per-batch progress, keyed by op_id in the
+	// checkpoints table). errorsJSON is the JSON-encoded executor error list.
+	SaveCheckpoint(opID string, lastStmt, total int, errorsJSON string) error
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 
 	"github.com/a-shan/mysql-pitr/internal/binlog"
+	"github.com/a-shan/mysql-pitr/internal/executor"
 	"github.com/a-shan/mysql-pitr/internal/server/agent"
 	"github.com/a-shan/mysql-pitr/internal/server/audit"
 	"github.com/a-shan/mysql-pitr/internal/server/auth"
@@ -493,8 +494,26 @@ func (h *Handler) HandleStreamEvent(agentID string, cmd ws.Command) {
 		h.bus.Publish(opID, ev)
 
 	case ws.EvProgress:
-		// Checkpoint persistence is intentionally deferred (Task 7): progress
-		// is streamed to SSE subscribers only.
+		// Server-side checkpoint double-write: the agent's progress carries the
+		// executor's per-batch checkpoint (done/total/errors). Persist it so an
+		// operation can be resumed from the server's own records after the
+		// agent (or server) restarts. A malformed progress payload still gets
+		// streamed to SSE subscribers; only the checkpoint write is skipped.
+		var prog executor.Progress
+		if err := json.Unmarshal(raw, &prog); err != nil {
+			log.Printf("pitr: op %s: parse progress: %v", opID, err)
+		} else {
+			errs := prog.Errors
+			if errs == nil {
+				errs = []executor.ExecError{}
+			}
+			errsJSON, merr := json.Marshal(errs)
+			if merr != nil {
+				log.Printf("pitr: op %s: marshal progress errors: %v", opID, merr)
+			} else if cerr := h.opStore.SaveCheckpoint(opID, prog.Done, prog.Total, string(errsJSON)); cerr != nil {
+				log.Printf("pitr: op %s: save checkpoint: %v", opID, cerr)
+			}
+		}
 		h.bus.Publish(opID, ev)
 
 	case ws.EvOpDone:
@@ -508,12 +527,14 @@ func (h *Handler) HandleStreamEvent(agentID string, cmd ws.Command) {
 			return
 		}
 		// Non-paused completion: audit and publish only when the transition is
-		// applied; a late op_done for a terminal operation is ignored.
+		// applied; a late op_done for a terminal operation is ignored. Statement
+		// errors recorded by the executor surface in the audit detail (the SSE
+		// payload passes the raw errors through to the front-end verbatim).
 		if err := h.transitionTo(op, StateDone); err != nil {
 			log.Printf("pitr: op %s: op_done: %v", opID, err)
 			return
 		}
-		h.appendAudit(op, StateDone, "agent", "")
+		h.appendAudit(op, StateDone, "agent", errorSummary(report.Errors))
 		h.forgetPreview(opID)
 		h.bus.Publish(opID, ev)
 
@@ -536,11 +557,35 @@ func (h *Handler) HandleStreamEvent(agentID string, cmd ws.Command) {
 
 // opDonePayload is the subset of the agent's executor.FinalReport that the
 // server needs from an op_done event: the paused flag distinguishes a
-// cancel/pause acknowledgement from a completed run.
+// cancel/pause acknowledgement from a completed run, and Errors carries the
+// per-statement failures recorded during execution (surfaced in the audit
+// detail and passed through to SSE subscribers for front-end display).
 type opDonePayload struct {
-	Done   int  `json:"done"`
-	Total  int  `json:"total"`
-	Paused bool `json:"paused"`
+	Done   int                  `json:"done"`
+	Total  int                  `json:"total"`
+	Paused bool                 `json:"paused"`
+	Errors []executor.ExecError `json:"errors,omitempty"`
+}
+
+// errorSummary renders the executor's statement errors as a bounded audit
+// detail line (first maxErrorSummaryEntries entries, then an ellipsis), so a
+// run with thousands of failed statements still yields a readable entry.
+const maxErrorSummaryEntries = 5
+
+func errorSummary(errs []executor.ExecError) string {
+	if len(errs) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d statement(s) failed:", len(errs))
+	for i, e := range errs {
+		if i >= maxErrorSummaryEntries {
+			b.WriteString(" ...")
+			break
+		}
+		fmt.Fprintf(&b, " #%d %s", e.Statement, e.Err)
+	}
+	return b.String()
 }
 
 // confirmPause handles an op_done event whose FinalReport carries Paused=true:

@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 )
 
@@ -14,21 +15,30 @@ func NewExecutor(factory DBConnFactory, store CheckpointStore) Executor {
 	return &executor{factory: factory, store: store}
 }
 
-func (e *executor) Run(ctx context.Context, plan Plan, cb ProgressCallback) (FinalReport, error) {
+// normalizePlan 校验并补齐 Plan 的默认值。Run/Resume 共用的前置校验。
+func (e *executor) normalizePlan(plan Plan) (Plan, error) {
 	if plan.OperationID == "" {
-		return FinalReport{}, fmt.Errorf("executor: plan.OperationID required")
+		return plan, fmt.Errorf("executor: plan.OperationID required")
 	}
 	if plan.BatchSize == 0 {
 		plan.BatchSize = DefaultBatchSize
 	}
 	if plan.BatchSize < 1 {
-		return FinalReport{}, fmt.Errorf("executor: BatchSize must be >= 1")
+		return plan, fmt.Errorf("executor: BatchSize must be >= 1")
 	}
 	if e.factory == nil {
-		return FinalReport{}, fmt.Errorf("executor: factory is nil")
+		return plan, fmt.Errorf("executor: factory is nil")
 	}
 	if e.store == nil {
-		return FinalReport{}, fmt.Errorf("executor: store is nil")
+		return plan, fmt.Errorf("executor: store is nil")
+	}
+	return plan, nil
+}
+
+func (e *executor) Run(ctx context.Context, plan Plan, cb ProgressCallback) (FinalReport, error) {
+	plan, err := e.normalizePlan(plan)
+	if err != nil {
+		return FinalReport{}, err
 	}
 
 	// 启动时清掉旧检查点（避免 Resume 误用）
@@ -41,30 +51,56 @@ func (e *executor) Run(ctx context.Context, plan Plan, cb ProgressCallback) (Fin
 		return FinalReport{}, fmt.Errorf("executor: init checkpoint: %w", err)
 	}
 
-	return e.runFromIndex(ctx, plan, 0, cb)
+	return e.runFromIndex(ctx, plan, 0, nil, cb)
 }
 
-func (e *executor) Resume(ctx context.Context, operationID string, cb ProgressCallback) (FinalReport, error) {
-	cp, err := e.store.Load(operationID)
+// Resume 载入检查点并从断点续跑：
+//   - 无检查点（ErrCheckpointNotFound）→ 从 0 全跑（等价 Run 语义，但不清检查点、
+//     不预写 init 检查点——每批提交后的 Save 会自然建立检查点）；
+//   - 有检查点 → 从 LastCompletedStatement（已完成的语句数，即下一语句的下标）续跑。
+//
+// 与 Run 的唯一区别：不清检查点、起点为检查点推进处。检查点写入时机与 Run 完全
+// 一致（每批提交后 Save 含 LastCompletedStatement/Errors）；中途取消时当前批次
+// 回滚、检查点停在上一已提交批次，Resume 可在任意中断点重入。
+func (e *executor) Resume(ctx context.Context, plan Plan, cb ProgressCallback) (FinalReport, error) {
+	plan, err := e.normalizePlan(plan)
 	if err != nil {
+		return FinalReport{}, err
+	}
+
+	cp, err := e.store.Load(plan.OperationID)
+	if err != nil && !errors.Is(err, ErrCheckpointNotFound) {
 		return FinalReport{}, fmt.Errorf("executor: load checkpoint: %w", err)
 	}
-	// Resume 需要 plan；通过 store 扩展保存 plan，或通过参数传入。
-	// 简化：要求 Resume 之前 Run 已注册 plan；这里返回错误。
-	// 实际生产：Plan 持久化由 server 层（SQLite）保存；agent 通过 WS 协议拿到 plan 后再 Resume。
-	_ = cp
-	return FinalReport{}, fmt.Errorf("executor: Resume requires plan; use Run-after-Load pattern (server-layer responsibility)")
+
+	startIdx := 0
+	var carriedErrs []ExecError
+	if cp != nil {
+		if cp.LastCompletedStatement > 0 {
+			startIdx = cp.LastCompletedStatement
+		}
+		carriedErrs = cp.Errors
+	}
+	if startIdx > len(plan.Statements) {
+		// 检查点推进已超出当前 Plan（Plan 变更过）：没有剩余语句，返回检查点口径。
+		return FinalReport{
+			Done: len(plan.Statements), Total: len(plan.Statements),
+			Errors: carriedErrs, Paused: false,
+		}, nil
+	}
+	return e.runFromIndex(ctx, plan, startIdx, carriedErrs, cb)
 }
 
-// runFromIndex 从 plan.Statements[startIdx] 开始执行。
-func (e *executor) runFromIndex(ctx context.Context, plan Plan, startIdx int, cb ProgressCallback) (FinalReport, error) {
+// runFromIndex 从 plan.Statements[startIdx] 开始执行。initialErrs 携带断点前的
+// 已记录错误（Run 传入 nil；Resume 传入检查点 Errors），随最终报告一起返回。
+func (e *executor) runFromIndex(ctx context.Context, plan Plan, startIdx int, initialErrs []ExecError, cb ProgressCallback) (FinalReport, error) {
 	db, err := e.factory(plan)
 	if err != nil {
 		return FinalReport{}, fmt.Errorf("executor: open db: %w", err)
 	}
 	defer db.Close()
 
-	var errs []ExecError
+	errs := append([]ExecError(nil), initialErrs...)
 	completed := startIdx
 	total := len(plan.Statements)
 

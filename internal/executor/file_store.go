@@ -20,6 +20,10 @@ func (s *FileCheckpointStore) path(id string) string {
 func (s *FileCheckpointStore) Load(operationID string) (*Checkpoint, error) {
 	data, err := os.ReadFile(s.path(operationID))
 	if err != nil {
+		if os.IsNotExist(err) {
+			// 无检查点文件 = 从未跑过（Resume 据此从 0 全跑），不是加载错误。
+			return nil, fmt.Errorf("%w (operation %q)", ErrCheckpointNotFound, operationID)
+		}
 		return nil, fmt.Errorf("executor: load checkpoint %s: %w", operationID, err)
 	}
 	var cp Checkpoint

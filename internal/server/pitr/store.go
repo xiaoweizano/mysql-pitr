@@ -12,6 +12,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 
 	"github.com/a-shan/mysql-pitr/internal/binlog"
+	"github.com/a-shan/mysql-pitr/internal/server/store"
 )
 
 // SQLiteOperationStore is a SQLite-backed implementation of OperationStore.
@@ -206,8 +207,7 @@ func (s *SQLiteOperationStore) SaveStatements(opID string, stmts []Statement) er
 
 // LoadStatements returns the persisted statements of an operation ordered by
 // statement index.
-func (s *SQLiteOperationStore) LoadStatements(opID string) ([]Statement, error) {
-	rows, err := s.db.Query(
+func (s *SQLiteOperationStore) LoadStatements(opID string) ([]Statement, error) {	rows, err := s.db.Query(
 		"SELECT tx_index, stmt_index, sql, tx_id, tx_order, warnings, status "+
 			"FROM statements WHERE op_id = ? ORDER BY stmt_index", opID)
 	if err != nil {
@@ -238,6 +238,13 @@ func (s *SQLiteOperationStore) LoadStatements(opID string) ([]Statement, error) 
 		return []Statement{}, nil
 	}
 	return result, nil
+}
+
+// SaveCheckpoint upserts the operation's execution checkpoint into the
+// checkpoints table (platform schema, see internal/server/store). Delegates to
+// the platform store so the upsert SQL lives next to the table definition.
+func (s *SQLiteOperationStore) SaveCheckpoint(opID string, lastStmt, total int, errorsJSON string) error {
+	return store.SaveCheckpoint(s.db, opID, lastStmt, total, errorsJSON)
 }
 
 // scanOperation reads one operations row (in opColumns order) from a scanner.

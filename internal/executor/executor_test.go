@@ -394,19 +394,133 @@ func TestExecutor_Run_NilStore(t *testing.T) {
 	assert.Contains(t, err.Error(), "store")
 }
 
-func TestExecutor_Resume_RequiresPlan(t *testing.T) {
-	// 先让 Load 成功（已有检查点），才能走到 "Resume requires plan" 分支。
+func TestResume_ContinuesFromCheckpoint(t *testing.T) {
+	// 100 条语句、BatchSize 10：先 Run 到第 20 条完成后取消（回调在第二批提交后
+	// 触发 cancel，检查点停在 LastCompletedStatement=20），再 Resume 同 Plan——
+	// 只执行剩余 80 条（索引 20..99，无重复），Done=Total=100。
+	db := &fakeDB{}
 	store := NewInMemoryCheckpointStore()
-	require.NoError(t, store.Save(Checkpoint{OperationID: "op-resume", Total: 3}))
-	ex := NewExecutor(newFakeFactory(&fakeDB{}), store)
-	_, err := ex.Resume(context.Background(), "op-resume", nil)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "Resume requires plan")
+	ex := NewExecutor(newFakeFactory(db), store)
+
+	stmts := make([]reverse.Statement, 100)
+	for i := range stmts {
+		stmts[i] = makeStmt(fmt.Sprintf("SQL %d", i), i)
+	}
+	plan := Plan{OperationID: "op-resume", Statements: stmts, BatchSize: 10}
+
+	// 阶段 1：Run 到第 2 批（20 条）提交后取消 → paused，检查点停在 20。
+	ctx, cancel := context.WithCancel(context.Background())
+	report, err := ex.Run(ctx, plan, func(p Progress) {
+		if p.Done == 20 {
+			cancel()
+		}
+	})
+	require.NoError(t, err)
+	assert.True(t, report.Paused)
+	assert.Equal(t, 20, report.Done)
+	cp, err := store.Load("op-resume")
+	require.NoError(t, err)
+	assert.Equal(t, 20, cp.LastCompletedStatement)
+	assert.Equal(t, 20, len(db.executed))
+
+	// 阶段 2：清空执行记录，Resume 同 Plan → 只执行剩余语句。
+	db.mu.Lock()
+	db.executed = nil
+	db.mu.Unlock()
+
+	report, err = ex.Resume(context.Background(), plan, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 100, report.Done)
+	assert.Equal(t, 100, report.Total)
+	assert.False(t, report.Paused)
+
+	// 恰好 80 条，从 "SQL 20" 开始（无跳过、无重复）。
+	require.Len(t, db.executed, 80)
+	assert.Equal(t, "SQL 20", db.executed[0])
+	assert.Equal(t, "SQL 99", db.executed[len(db.executed)-1])
+
+	cp, err = store.Load("op-resume")
+	require.NoError(t, err)
+	assert.Equal(t, 100, cp.LastCompletedStatement)
+}
+
+func TestResume_NoCheckpoint_FullRun(t *testing.T) {
+	// 无检查点（store 空）→ 从 0 全跑（等价 Run，但不预写 init 检查点）。
+	db := &fakeDB{}
+	store := NewInMemoryCheckpointStore()
+	ex := NewExecutor(newFakeFactory(db), store)
+
+	plan := Plan{
+		OperationID: "op-nocp",
+		Statements: []reverse.Statement{
+			makeStmt("SQL 1", 0),
+			makeStmt("SQL 2", 1),
+			makeStmt("SQL 3", 2),
+		},
+		BatchSize: 2,
+	}
+	report, err := ex.Resume(context.Background(), plan, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 3, report.Done)
+	assert.Equal(t, 3, report.Total)
+	assert.False(t, report.Paused)
+	require.Len(t, db.executed, 3)
+	cp, err := store.Load("op-nocp")
+	require.NoError(t, err)
+	assert.Equal(t, 3, cp.LastCompletedStatement)
+}
+
+func TestResume_ErrorsSurfaced(t *testing.T) {
+	// 检查点带 1 条既有错误；Resume 续跑中途再失败 1 条 → FinalReport.Errors
+	// 汇总两条（续跑前检查点里的 + 续跑中新产生的）。
+	//
+	// fakeDB.failOn 按全局执行序（executed 列表下标）键控：Resume 从 plan 索引 2
+	// 开始，executed[0] 对应 plan 索引 2、executed[1] 对应 plan 索引 3，因此
+	// failOn[1] 使 plan 索引 3 的语句失败。
+	db := &fakeDB{failOn: map[int]error{1: fmt.Errorf("boom (injected)")}}
+	store := NewInMemoryCheckpointStore()
+	require.NoError(t, store.Save(Checkpoint{
+		OperationID:            "op-errs",
+		LastCompletedStatement: 2,
+		Total:                  4,
+		Errors: []ExecError{
+			{Statement: 1, SQL: "SQL 1", Err: "earlier failure"},
+		},
+	}))
+	ex := NewExecutor(newFakeFactory(db), store)
+
+	plan := Plan{
+		OperationID: "op-errs",
+		Statements: []reverse.Statement{
+			makeStmt("SQL 1", 0),
+			makeStmt("SQL 2", 1),
+			makeStmt("SQL 3", 2),
+			makeStmt("SQL 4", 3),
+		},
+		BatchSize: 4,
+	}
+	report, err := ex.Resume(context.Background(), plan, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 4, report.Done)
+	assert.False(t, report.Paused)
+	require.Len(t, report.Errors, 2)
+	assert.Equal(t, 1, report.Errors[0].Statement)
+	assert.Equal(t, "earlier failure", report.Errors[0].Err)
+	assert.Equal(t, 3, report.Errors[1].Statement)
+	assert.Contains(t, report.Errors[1].Err, "boom")
+	require.Len(t, db.executed, 2) // 只执行了索引 2、3 两条
+	assert.Equal(t, "SQL 3", db.executed[0])
+	assert.Equal(t, "SQL 4", db.executed[1])
 }
 
 func TestExecutor_Resume_LoadError(t *testing.T) {
 	ex := NewExecutor(newFakeFactory(&fakeDB{}), &failingStore{})
-	_, err := ex.Resume(context.Background(), "op-resume", nil)
+	plan := Plan{
+		OperationID: "op-resume",
+		Statements:  []reverse.Statement{makeStmt("SQL 1", 0)},
+		BatchSize:   1,
+	}
+	_, err := ex.Resume(context.Background(), plan, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "load checkpoint")
 }

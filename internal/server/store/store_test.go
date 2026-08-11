@@ -8,10 +8,49 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/a-shan/mysql-pitr/internal/server/store"
 )
+
+// TestSaveCheckpoint_RoundTrip verifies SaveCheckpoint upserts into the
+// checkpoints table: insert, then overwrite in place (still exactly one row),
+// with the JSON error payload preserved verbatim.
+func TestSaveCheckpoint_RoundTrip(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "cp.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	require.NoError(t, store.Migrate(db))
+
+	require.NoError(t, store.SaveCheckpoint(db, "op-1", 20, 100, `[{"statement":3,"err":"boom"}]`))
+
+	var lastStmt, total int
+	var errs string
+	require.NoError(t, db.QueryRow(
+		"SELECT last_statement, total, errors FROM checkpoints WHERE op_id = ?", "op-1").
+		Scan(&lastStmt, &total, &errs))
+	assert.Equal(t, 20, lastStmt)
+	assert.Equal(t, 100, total)
+	assert.Equal(t, `[{"statement":3,"err":"boom"}]`, errs)
+
+	// Upsert semantics: the same op_id overwrites in place — still one row.
+	require.NoError(t, store.SaveCheckpoint(db, "op-1", 50, 100, "[]"))
+	var n int
+	require.NoError(t, db.QueryRow("SELECT count(*) FROM checkpoints WHERE op_id = ?", "op-1").Scan(&n))
+	assert.Equal(t, 1, n)
+	require.NoError(t, db.QueryRow(
+		"SELECT last_statement, total, errors FROM checkpoints WHERE op_id = ?", "op-1").
+		Scan(&lastStmt, &total, &errs))
+	assert.Equal(t, 50, lastStmt)
+	assert.Equal(t, 100, total)
+	assert.Equal(t, "[]", errs)
+
+	// Distinct operations keep independent rows.
+	require.NoError(t, store.SaveCheckpoint(db, "op-2", 7, 9, ""))
+	require.NoError(t, db.QueryRow("SELECT count(*) FROM checkpoints").Scan(&n))
+	assert.Equal(t, 2, n)
+}
 
 // TestOpenAndMigrate_IsIdempotent verifies Open creates a usable SQLite file,
 // Migrate is idempotent, and every platform table is queryable afterwards.
