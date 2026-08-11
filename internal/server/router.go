@@ -3,7 +3,8 @@ package server
 import (
 	"net/http"
 	"os"
-	"path/filepath"
+	"path"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	chiMiddleware "github.com/go-chi/chi/v5/middleware"
@@ -95,30 +96,37 @@ func newWebRouter(
 	})
 
 	// ---- Frontend SPA ----
-	// Serve the built Vite frontend for all non-API routes.
-	webDir := os.Getenv("WEB_DIR")
-	if webDir == "" {
-		webDir = "/usr/share/mysql-pitr/web"
-	}
-	fs := http.FileServer(http.Dir(webDir))
+	// Serve the embedded placeholder frontend (embed_stub/) for all non-API
+	// routes: real stub files resolve through the embed filesystem, and
+	// everything else falls back to index.html for client-side routing.
+	// Phase 4 replaces the stub with the real SvelteKit build (web/).
+	fileServer := http.FileServer(http.FS(stubFS))
 	r.Get("/*", func(w http.ResponseWriter, r *http.Request) {
-		path := filepath.Clean(r.URL.Path)
-		if path != "/" {
-			if _, err := os.Stat(filepath.Join(webDir, path)); err == nil {
-				fs.ServeHTTP(w, r)
-				return
+		name := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
+		if name != "" && name != "." {
+			if f, err := stubFS.Open(name); err == nil {
+				info, statErr := f.Stat()
+				_ = f.Close()
+				if statErr == nil && !info.IsDir() {
+					fileServer.ServeHTTP(w, r)
+					return
+				}
 			}
 		}
-		// SPA fallback: serve index.html for client-side routing.
-		http.ServeFile(w, r, filepath.Join(webDir, "index.html"))
+		// SPA fallback: serve the placeholder index page.
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(placeholderIndex)
 	})
 
 	return r
 }
 
 // NewRouter creates and configures a chi router with all API routes mounted.
-// It wires a fresh in-memory CA + hub; production deployments should use
-// New() from server.go for a persistent CA and the mTLS agent listener.
+// It is a lightweight dev/test helper: every store is in-memory (the pitr
+// store uses a throwaway, freshly migrated SQLite database) and the PITR flow
+// has no agent command channel. Production deployments should use New() from
+// server.go for the persistent SQLite database, CA and mTLS agent listener.
 func NewRouter() *chi.Mux {
 	jwtSecret := []byte(os.Getenv("JWT_SECRET"))
 	if len(jwtSecret) == 0 {
@@ -128,9 +136,6 @@ func NewRouter() *chi.Mux {
 	userStore := auth.NewInMemoryUserStore()
 	orgStore := org.NewInMemoryOrgStore()
 	agentStore := agent.NewInMemoryAgentStore()
-	// TODO(Task 7): wire the shared platform SQLite database; the pitr store
-	// currently uses a throwaway in-memory database so each NewRouter gets an
-	// isolated, migrated schema.
 	db, err := store.Open(":memory:")
 	if err != nil {
 		panic("pitr: open sqlite: " + err.Error())

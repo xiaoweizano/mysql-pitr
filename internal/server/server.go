@@ -18,6 +18,7 @@ import (
 	"github.com/a-shan/mysql-pitr/internal/server/org"
 	"github.com/a-shan/mysql-pitr/internal/server/pitr"
 	"github.com/a-shan/mysql-pitr/internal/server/store"
+	"github.com/a-shan/mysql-pitr/internal/ws"
 	"github.com/a-shan/mysql-pitr/internal/ws/ca"
 	"github.com/a-shan/mysql-pitr/internal/ws/hub"
 )
@@ -39,12 +40,26 @@ type Server struct {
 	closeFn func()
 }
 
-// New initialises all stores, the internal CA, the agent hub, and the two
-// routers. CA state is persisted under AGENT_DATA_DIR (default "./data").
+// New initialises the shared SQLite database, all stores, the internal CA,
+// the agent hub, and the two routers. CA state (ca.json) and the platform
+// database (app.db) persist under AGENT_DATA_DIR (default "./data").
 func New() (*Server, error) {
-	dataDir := os.Getenv("AGENT_DATA_DIR")
+	return newServer("", nil)
+}
+
+// newServer is New with an explicit data dir and an optional agent command
+// channel. commander is the AgentCommander behind the PITR flow: nil selects
+// the live agent hub (production); tests inject a fake so the HTTP flow can
+// be smoke-tested without a connected WebSocket agent.
+func newServer(dataDir string, commander pitr.AgentCommander) (*Server, error) {
 	if dataDir == "" {
-		dataDir = "data"
+		dataDir = os.Getenv("AGENT_DATA_DIR")
+		if dataDir == "" {
+			dataDir = "data"
+		}
+	}
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return nil, fmt.Errorf("server: create data dir: %w", err)
 	}
 
 	// Internal CA for agent mTLS: root cert and revocations persist across
@@ -57,35 +72,38 @@ func New() (*Server, error) {
 	agentHub := hub.NewHub("")
 	agentHub.SetCSRHandler(rootCA)
 
-	// ---- stores ----
-	userStore := auth.NewInMemoryUserStore()
-	orgStore := org.NewInMemoryOrgStore()
-	agentStore := agent.NewInMemoryAgentStore()
-	// TODO(Task 7): wire the shared platform SQLite database. The pitr store
-	// currently uses a throwaway in-memory database (equivalent to the old
-	// InMemoryOperationStore: operations are lost on restart).
-	storeDB, err := store.Open(":memory:")
+	// ---- stores: one shared SQLite database for every domain ----
+	db, err := store.Open(filepath.Join(dataDir, "app.db"))
 	if err != nil {
-		return nil, fmt.Errorf("pitr: open sqlite: %w", err)
+		return nil, fmt.Errorf("server: open sqlite: %w", err)
 	}
-	if err := store.Migrate(storeDB); err != nil {
-		return nil, fmt.Errorf("pitr: migrate sqlite: %w", err)
+	if err := store.Migrate(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("server: migrate sqlite: %w", err)
 	}
-	pitrStore := pitr.NewSQLiteOperationStore(storeDB)
-	auditStore := audit.NewInMemoryAuditStore()
+	userStore := auth.NewSQLiteUserStore(db)
+	orgStore := org.NewSQLiteOrgStore(db)
+	agentStore := agent.NewSQLiteAgentStore(db)
+	pitrStore := pitr.NewSQLiteOperationStore(db)
+	auditStore := audit.NewSQLiteAuditStore(db)
 
 	// ---- handlers ----
 	authHandler := auth.NewHandler(userStore, jwtSecret())
 	orgHandler := org.NewHandler(orgStore, userStore, jwtSecret())
 	agentHandler := agent.NewHandler(agentStore, orgStore, jwtSecret())
 	pitrBus := pitr.NewEventBus()
-	pitrHandler := pitr.NewHandler(pitrStore, agentStore, orgStore, auditStore, pitrBus, agentHub, jwtSecret())
+	if commander == nil {
+		commander = agentHub
+	}
+	pitrHandler := pitr.NewHandler(pitrStore, agentStore, orgStore, auditStore, pitrBus, commander, jwtSecret())
 	auditHandler := audit.NewHandler(auditStore, orgStore, jwtSecret())
 
 	// Route agent→server stream_event envelopes (scan tx/SQL, execution
 	// progress, operation completion) into the PITR handler, which fans them
 	// out to SSE subscribers.
-	agentHub.SetStreamEventHandler(pitrHandler.HandleStreamEvent)
+	agentHub.SetStreamEventHandler(func(agentID string, cmd ws.Command) {
+		pitrHandler.HandleStreamEvent(agentID, cmd)
+	})
 
 	// Keep the agents API's status field in sync with the hub. Unknown agents
 	// (e.g. after a server restart cleared the in-memory store) are registered
@@ -166,11 +184,12 @@ func New() (*Server, error) {
 	}
 	srv.closeFn = func() {
 		_ = agentHub.Close()
+		_ = db.Close()
 	}
 	return srv, nil
 }
 
-// Close shuts down the agent hub.
+// Close shuts down the agent hub and the shared SQLite database.
 func (s *Server) Close() {
 	if s.closeFn != nil {
 		s.closeFn()
