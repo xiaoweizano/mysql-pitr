@@ -379,6 +379,247 @@ func TestLoop_SealTransientFailureDoesNotDoubleAppend(t *testing.T) {
 	require.Equal(t, "mysql-bin.000003", st.LastFile)
 }
 
+// TestLoop_EmptyTailRotationAdvancesState（final review C1）：append 续拉
+// 追平+闲置时 MySQL 侧轮转（FLUSH LOGS 等）——流序列为
+// {公告R(000002), FDE, 边界R(000003), FDE, 下一文件内容...}——边界轮转
+// 必须被识别为「空尾部轮转」：当前文件无内容可封口，状态推进到边界文件后
+// 从新文件头续拉。修复前边界 R 被 skipStreamPreamble 当 preamble 吞掉，
+// 下一文件的首个内容事件 xid(30) 会被写进 000002 的 .partial → 组合验证
+// 通过 → 错档追加（归档缺档 + 事务重复）。
+func TestLoop_EmptyTailRotationAdvancesState(t *testing.T) {
+	binlogDir := t.TempDir()
+	archiveDir := t.TempDir()
+
+	// 已回填封口的 000002（magic+FDE+XID20）；master position 在其末尾
+	events2 := []binlogtest.Event{fde(), xid(20)}
+	P := offsetOf(events2)
+	writeBinlog(t, binlogDir, "mysql-bin.000002", events2)
+	writeBinlog(t, archiveDir, "mysql-bin.000002", events2)
+
+	rec := &positionRecorder{}
+	factory := factoryFor(rec, map[string][]binlogtest.Event{
+		// 追平+闲置：公告R → FDE → 边界R(000003)（无任何内容事件）
+		"mysql-bin.000002": {rotate("mysql-bin.000002"), fde(), rotate("mysql-bin.000003"), fde(), xid(30), rotate("mysql-bin.000004")},
+		"mysql-bin.000003": {rotate("mysql-bin.000003"), fde(), xid(30), rotate("mysql-bin.000004")},
+	}, 0)
+
+	l := newLoop(&stubMySQL{
+		files: []archive.ManifestFile{{Name: "mysql-bin.000002"}},
+		pos:   mysql.Position{Name: "mysql-bin.000002", Pos: P},
+	}, binlogDir, archiveDir, factory)
+
+	require.NoError(t, l.Run(context.Background()))
+
+	// 判别性断言 1：xid(30)（属于 000003）不得进 000002——归档 000002 与
+	// 源文件逐字节相同（修复前此处会多出 xid(30) 尾部）
+	require.Equal(t, readFile(t, filepath.Join(binlogDir, "mysql-bin.000002")),
+		readFile(t, filepath.Join(archiveDir, "mysql-bin.000002")))
+	// 判别性断言 2：000003 从新文件头重建，含 FDE + xid(30)
+	require.Equal(t, binlogtest.CraftFile([]binlogtest.Event{fde(), xid(30)}),
+		readFile(t, filepath.Join(archiveDir, "mysql-bin.000003")))
+	// 判别性断言 3：状态推进到 000004（修复前直接跳到 000004，000003 缺档）
+	st, err := LoadState(archiveDir)
+	require.NoError(t, err)
+	require.Equal(t, "mysql-bin.000004", st.LastFile)
+
+	// 续拉位置：空尾部轮转后从 (000003, 0) 继续，再到 (000004, 0)
+	poses := rec.all()
+	require.Equal(t, mysql.Position{Name: "mysql-bin.000002", Pos: P}, poses[0])
+	require.Equal(t, mysql.Position{Name: "mysql-bin.000003", Pos: 0}, poses[1])
+	require.Equal(t, mysql.Position{Name: "mysql-bin.000004", Pos: 0}, poses[2])
+}
+
+// TestLoop_EmptyOpenFileSkipsBackfill（final review C1，空文件缺陷同根）：
+// reconcile 时当前打开文件为空（master position = 4，仅 binlog magic）→
+// 跳过前缀回填（不造 magic-only 文件），续拉从 master position 开始、
+// 以全量重建模式把首个 FDE 写进文件——封口文件含 FDE，不触发 go-mysql
+// ParseFile nil-deref。
+func TestLoop_EmptyOpenFileSkipsBackfill(t *testing.T) {
+	binlogDir := t.TempDir()
+	archiveDir := t.TempDir()
+
+	// MySQL 侧 000002 为空：仅 magic（无 FDE、无内容）
+	writeBinlog(t, binlogDir, "mysql-bin.000002", nil)
+
+	rec := &positionRecorder{}
+	factory := factoryFor(rec, map[string][]binlogtest.Event{
+		"mysql-bin.000002": {rotate("mysql-bin.000002"), fde(), xid(20), rotate("mysql-bin.000003")},
+		"mysql-bin.000003": {rotate("mysql-bin.000003"), fde(), xid(30), rotate("mysql-bin.000004")},
+	}, 0)
+
+	l := newLoop(&stubMySQL{
+		files: []archive.ManifestFile{{Name: "mysql-bin.000002"}},
+		pos:   mysql.Position{Name: "mysql-bin.000002", Pos: 4},
+	}, binlogDir, archiveDir, factory)
+
+	require.NoError(t, l.Run(context.Background()))
+
+	// 续拉从 master position（4）开始——回填未产生 magic-only 前缀文件
+	poses := rec.all()
+	require.Equal(t, mysql.Position{Name: "mysql-bin.000002", Pos: 4}, poses[0])
+
+	// 判别性断言：封口文件含 FDE（修复前回填 magic-only + 续拉丢 FDE →
+	// 000002 缺 FDE，或 SealAppendVerified 组合验证 nil-deref）
+	require.Equal(t, binlogtest.CraftFile([]binlogtest.Event{fde(), xid(20)}),
+		readFile(t, filepath.Join(archiveDir, "mysql-bin.000002")))
+	require.Equal(t, binlogtest.CraftFile([]binlogtest.Event{fde(), xid(30)}),
+		readFile(t, filepath.Join(archiveDir, "mysql-bin.000003")))
+	st, err := LoadState(archiveDir)
+	require.NoError(t, err)
+	require.Equal(t, "mysql-bin.000004", st.LastFile)
+}
+
+// TestLoop_SealFailureRecoversByWholeFileBackfill（final review I2）：append
+// 封口永久失败（final 被篡改/损坏，组合验证不通过）且文件已在 MySQL 侧轮转
+// 封口（master position 已越过）→ 删除坏归档 + 整文件回填兜底，从新位置续拉，
+// 而不是无限退避重试。
+func TestLoop_SealFailureRecoversByWholeFileBackfill(t *testing.T) {
+	binlogDir := t.TempDir()
+	archiveDir := t.TempDir()
+
+	// 源文件：000002 完整（FDE+XID20+XID21），000002 在 MySQL 侧已轮转
+	// （master position 在 000003）
+	events2 := []binlogtest.Event{fde(), xid(20), xid(21)}
+	writeBinlog(t, binlogDir, "mysql-bin.000002", events2)
+
+	// 归档里是已回填的 000002 前缀，但被篡改一个字节（损坏 final）
+	P := offsetOf([]binlogtest.Event{fde(), xid(20)})
+	writeBinlog(t, archiveDir, "mysql-bin.000002", []binlogtest.Event{fde(), xid(20)})
+	finalPath := filepath.Join(archiveDir, "mysql-bin.000002")
+	b, err := os.ReadFile(finalPath)
+	require.NoError(t, err)
+	b[len(b)-5] ^= 0x01 // XID(20) body 末字节（末 4 字节是 CRC）
+	require.NoError(t, os.WriteFile(finalPath, b, 0o644))
+	require.NoError(t, SaveState(archiveDir, State{
+		LastFile:  "mysql-bin.000002",
+		LastPos:   P,
+		UpdatedAt: time.Now(),
+	}))
+
+	rec := &positionRecorder{}
+	factory := factoryFor(rec, map[string][]binlogtest.Event{
+		"mysql-bin.000002": {rotate("mysql-bin.000002"), fde(), xid(21), rotate("mysql-bin.000003")},
+		"mysql-bin.000003": {rotate("mysql-bin.000003"), fde(), xid(30), rotate("mysql-bin.000004")},
+	}, 0)
+
+	l := newLoop(&stubMySQL{
+		files: []archive.ManifestFile{{Name: "mysql-bin.000002"}, {Name: "mysql-bin.000003"}},
+		pos:   mysql.Position{Name: "mysql-bin.000003", Pos: 4}, // 000002 已轮转
+	}, binlogDir, archiveDir, factory)
+
+	require.NoError(t, l.Run(context.Background()))
+
+	// 归档恢复：000002 == 源文件整文件拷贝（坏归档被替换，尾部不重复）
+	require.Equal(t, readFile(t, filepath.Join(binlogDir, "mysql-bin.000002")),
+		readFile(t, filepath.Join(archiveDir, "mysql-bin.000002")))
+	// 续拉从新位置继续（不再从旧 pos 重试封口）
+	poses := rec.all()
+	require.Equal(t, mysql.Position{Name: "mysql-bin.000002", Pos: P}, poses[0])
+	require.Equal(t, mysql.Position{Name: "mysql-bin.000003", Pos: 0}, poses[1])
+	st, err := LoadState(archiveDir)
+	require.NoError(t, err)
+	require.Equal(t, "mysql-bin.000004", st.LastFile)
+	// 无 .partial 残留
+	require.NoFileExists(t, filepath.Join(archiveDir, "mysql-bin.000002.partial"))
+	require.NoFileExists(t, filepath.Join(archiveDir, "mysql-bin.000003.partial"))
+}
+
+// TestLoop_SealSuccessStatePersistFailureDoesNotDoubleAppend（final review I1）：
+// Seal 成功（尾部已追加进 final）但 SaveState 失败 → syncOnce 内短退避重试
+// SaveState；仍失败则内存状态先行（errStateAdvance），syncLoop 从新位置继续、
+// 不从旧位置重拉。崩溃窗口（Seal 成功、状态未落盘）后重启重拉由
+// SealAppendVerified 的追加幂等兜底——尾部只出现一次。
+func TestLoop_SealSuccessStatePersistFailureDoesNotDoubleAppend(t *testing.T) {
+	binlogDir := t.TempDir()
+	archiveDir := t.TempDir()
+
+	events2 := []binlogtest.Event{fde(), xid(20), xid(21)}
+	P := offsetOf([]binlogtest.Event{fde(), xid(20)})
+	writeBinlog(t, archiveDir, "mysql-bin.000002", []binlogtest.Event{fde(), xid(20)})
+	writeBinlog(t, binlogDir, "mysql-bin.000002", events2)
+
+	rec := &positionRecorder{}
+	factory := factoryFor(rec, map[string][]binlogtest.Event{
+		"mysql-bin.000002": {fde(), xid(21), rotate("mysql-bin.000003")},
+		"mysql-bin.000003": {fde(), rotate("mysql-bin.000004")},
+	}, 0)
+
+	l := newLoop(&stubMySQL{
+		files: []archive.ManifestFile{{Name: "mysql-bin.000002"}},
+		pos:   mysql.Position{Name: "mysql-bin.000002", Pos: P},
+	}, binlogDir, archiveDir, factory)
+
+	// 阶段 1：SaveState 第一次失败 → saveStateRetry 重试成功（短退避）
+	calls := 0
+	l.saveState = func(dir string, s State) error {
+		calls++
+		if calls == 1 {
+			return errors.New("simulated state write failure")
+		}
+		return SaveState(dir, s)
+	}
+	pos := mysql.Position{Name: "mysql-bin.000002", Pos: P}
+	require.NoError(t, l.syncOnce(context.Background(), pos))
+	require.GreaterOrEqual(t, calls, 2, "SaveState 失败后必须在 syncOnce 内重试")
+	require.Equal(t, readFile(t, filepath.Join(binlogDir, "mysql-bin.000002")),
+		readFile(t, filepath.Join(archiveDir, "mysql-bin.000002")))
+	st, err := LoadState(archiveDir)
+	require.NoError(t, err)
+	require.Equal(t, "mysql-bin.000003", st.LastFile)
+
+	// 阶段 2：模拟崩溃窗口（Seal 成功、状态文件丢失）——删除状态文件后
+	// 从旧位置重跑同一段（重启/重试路径），append 幂等必须拦截重复追加
+	require.NoError(t, os.Remove(filepath.Join(archiveDir, stateFileName)))
+	require.NoError(t, l.syncOnce(context.Background(), pos))
+	// 尾部只出现一次：final == 源文件（修复前重跑会再次追加 XID(21)）
+	require.Equal(t, readFile(t, filepath.Join(binlogDir, "mysql-bin.000002")),
+		readFile(t, filepath.Join(archiveDir, "mysql-bin.000002")))
+	require.NoFileExists(t, filepath.Join(archiveDir, "mysql-bin.000002.partial"))
+	st, err = LoadState(archiveDir)
+	require.NoError(t, err)
+	require.Equal(t, "mysql-bin.000003", st.LastFile)
+}
+
+// TestLoop_StatePersistFailureAdvancesWithoutOldPosRepull（final review I1 的
+// syncLoop 级行为）：SaveState 持续失败 → 每个已封口段以 errStateAdvance 推进
+// 内存状态继续，绝不从旧位置重拉（重拉会重复消费同一段尾部）。
+func TestLoop_StatePersistFailureAdvancesWithoutOldPosRepull(t *testing.T) {
+	binlogDir := t.TempDir()
+	archiveDir := t.TempDir()
+
+	events2 := []binlogtest.Event{fde(), xid(20), xid(21)}
+	P := offsetOf([]binlogtest.Event{fde(), xid(20)})
+	writeBinlog(t, archiveDir, "mysql-bin.000002", []binlogtest.Event{fde(), xid(20)})
+	writeBinlog(t, binlogDir, "mysql-bin.000002", events2)
+
+	rec := &positionRecorder{}
+	factory := factoryFor(rec, map[string][]binlogtest.Event{
+		"mysql-bin.000002": {fde(), xid(21), rotate("mysql-bin.000003")},
+		"mysql-bin.000003": {rotate("mysql-bin.000003"), fde(), rotate("mysql-bin.000004")},
+	}, 0)
+
+	l := newLoop(&stubMySQL{
+		files: []archive.ManifestFile{{Name: "mysql-bin.000002"}},
+		pos:   mysql.Position{Name: "mysql-bin.000002", Pos: P},
+	}, binlogDir, archiveDir, factory)
+	l.saveState = func(dir string, s State) error {
+		return errors.New("simulated persistent state write failure")
+	}
+
+	require.NoError(t, l.Run(context.Background()))
+
+	// 每个位置恰好出现一次：状态推进不重拉旧位置
+	poses := rec.all()
+	require.Equal(t, []mysql.Position{
+		{Name: "mysql-bin.000002", Pos: P},
+		{Name: "mysql-bin.000003", Pos: 0},
+		{Name: "mysql-bin.000004", Pos: 0},
+	}, poses)
+	// 尾部仍只出现一次（Seal 只执行一次）
+	require.Equal(t, readFile(t, filepath.Join(binlogDir, "mysql-bin.000002")),
+		readFile(t, filepath.Join(archiveDir, "mysql-bin.000002")))
+}
+
 // TestLoop_ServerIDRequired：ServerID=0 时 Run 立即报错（不落盘）。
 func TestLoop_ServerIDRequired(t *testing.T) {
 	l := NewLoop(Config{
