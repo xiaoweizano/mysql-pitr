@@ -106,6 +106,10 @@ type statusResponse struct {
 	CreatedBy string         `json:"createdBy"`
 	CreatedAt time.Time      `json:"createdAt"`
 	UpdatedAt time.Time      `json:"updatedAt"`
+	// PreviewTruncated reports that the in-memory scan preview was cut short by
+	// the operation's MaxPreview cap (more transactions were scanned than fit in
+	// the preview). Present only when true.
+	PreviewTruncated bool `json:"previewTruncated,omitempty"`
 }
 
 type cancelResponse struct {
@@ -140,6 +144,17 @@ type opPreview struct {
 	mu      sync.Mutex
 	metas   []txMetaWire                  // ordered transaction metadata
 	sqlByTx map[string][]ws.StatementWire // staged SQL per transaction ID
+	// known is the set of transaction IDs whose metadata was accepted into the
+	// preview (staged within maxEntries). stageSQL only stages SQL for known
+	// transactions, so the SQL staging cannot grow past the accepted meta set.
+	known map[string]struct{}
+	// maxEntries caps the preview at the operation's MaxPreview (default 500,
+	// matching the agent scan default): tx_meta entries beyond the cap are
+	// dropped and truncated is set, so a run-away agent stream cannot grow the
+	// in-memory preview without bound. Applied at Start from maxPreview; the
+	// per-transaction row/SQL count is bounded by the maxRowsPerTx clamp.
+	maxEntries int
+	truncated  bool
 }
 
 // ---------- helpers ----------
@@ -268,7 +283,12 @@ func scanFilterToBinlog(f ws.ScanFilter) binlog.Filter {
 	if f.EndFile != "" {
 		out.EndPos = mysql.Position{Name: f.EndFile, Pos: f.EndPos}
 	}
-	out.MaxRowsPerTx = f.MaxRowsPerTx
+	// MaxRowsPerTx 0 (or negative, normalized here) keeps the agent's default
+	// transaction row ceiling; a positive value above maxRowsPerTxCap is
+	// rejected by validateScanFilter before this mapping runs.
+	if f.MaxRowsPerTx > 0 {
+		out.MaxRowsPerTx = f.MaxRowsPerTx
+	}
 	out.SelectedTxIDs = f.SelectedTxIDs
 	return out
 }
@@ -306,6 +326,14 @@ func binlogFilterToWire(f binlog.Filter) ws.ScanFilter {
 	return out
 }
 
+// maxRowsPerTxCap is the server-side upper bound applied to filter.maxRowsPerTx
+// (plan decision): the agent truncates a single transaction at its own
+// maxRowsPerTx default of 1_000_000 rows, so a request above that ceiling is
+// rejected up front rather than recorded — the server-side preview of a
+// transaction can never exceed the agent's per-transaction truncation ceiling.
+// Values 0/negative are left to the agent's default (see scanFilterToBinlog).
+const maxRowsPerTxCap = 1_000_000
+
 // validateScanFilter rejects filters with unparseable time bounds or GTID sets
 // up front, so the agent never receives a scan it would reject.
 func validateScanFilter(f ws.ScanFilter) error {
@@ -325,6 +353,9 @@ func validateScanFilter(f ws.ScanFilter) error {
 				return fmt.Errorf("invalid filter.gtidSet %q", f.GTIDSet)
 			}
 		}
+	}
+	if f.MaxRowsPerTx > maxRowsPerTxCap {
+		return fmt.Errorf("filter.maxRowsPerTx %d exceeds the maximum %d", f.MaxRowsPerTx, maxRowsPerTxCap)
 	}
 	return nil
 }
@@ -479,6 +510,20 @@ func (h *Handler) ReconcileOnStartup() error {
 
 // ---------- preview (in-memory scan state) ----------
 
+// defaultMaxPreview is the server-side preview entry cap when the request does
+// not carry maxPreview (or carries 0/negative) — it mirrors the agent scan
+// default, so the server preview can never outgrow what the agent would emit.
+const defaultMaxPreview = 500
+
+// previewCap normalizes a requested preview entry cap: values <= 0 fall back to
+// the agent scan default, so the server-side preview bound always applies.
+func previewCap(v int) int {
+	if v <= 0 {
+		return defaultMaxPreview
+	}
+	return v
+}
+
 // preview returns the operation's preview, or nil when none exists.
 func (h *Handler) preview(opID string) *opPreview {
 	h.previewMu.Lock()
@@ -492,7 +537,11 @@ func (h *Handler) previewFor(opID string) *opPreview {
 	defer h.previewMu.Unlock()
 	p := h.previews[opID]
 	if p == nil {
-		p = &opPreview{sqlByTx: make(map[string][]ws.StatementWire)}
+		p = &opPreview{
+			sqlByTx:    make(map[string][]ws.StatementWire),
+			known:      make(map[string]struct{}),
+			maxEntries: defaultMaxPreview,
+		}
 		h.previews[opID] = p
 	}
 	return p
@@ -508,8 +557,9 @@ func (h *Handler) snapshot(opID string) *opPreview {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	snap := &opPreview{
-		metas:   append([]txMetaWire(nil), p.metas...),
-		sqlByTx: make(map[string][]ws.StatementWire, len(p.sqlByTx)),
+		metas:     append([]txMetaWire(nil), p.metas...),
+		sqlByTx:   make(map[string][]ws.StatementWire, len(p.sqlByTx)),
+		truncated: p.truncated,
 	}
 	for txID, wires := range p.sqlByTx {
 		snap.sqlByTx[txID] = append([]ws.StatementWire(nil), wires...)
@@ -525,21 +575,52 @@ func (h *Handler) forgetPreview(opID string) {
 	delete(h.previews, opID)
 }
 
-// stageTxMeta appends a scanned transaction to the operation's preview.
+// previewTruncated reports whether the operation's in-memory preview was cut
+// short by the server-side MaxPreview entry cap (more transactions scanned than
+// fit in the preview). A missing preview reads as false — the operation simply
+// has no preview.
+func (h *Handler) previewTruncated(opID string) bool {
+	p := h.preview(opID)
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.truncated
+}
+
+// stageTxMeta appends a scanned transaction to the operation's preview, bounded
+// by the operation's MaxPreview: entries beyond the cap are dropped (the
+// preview is marked truncated) so a run-away agent stream cannot grow the
+// in-memory preview without bound. scan_done still completes normally — the
+// preview is truncated, not the operation.
 func (h *Handler) stageTxMeta(opID string, meta txMetaWire) {
 	p := h.previewFor(opID)
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if len(p.metas) >= p.maxEntries {
+		p.truncated = true
+		return
+	}
 	p.metas = append(p.metas, meta)
+	p.known[meta.TxID] = struct{}{}
 }
 
-// stageSQL groups sql-event statements by transaction ID in the preview.
+// stageSQL groups sql-event statements by transaction ID in the preview. Only
+// transactions whose metadata was accepted into the preview (within the
+// MaxPreview cap) are staged: SQL for a truncated or unknown transaction is
+// dropped, so sqlByTx cannot grow past the accepted meta set. (The agent emits
+// tx_meta before sql per transaction, and stream events are processed in
+// arrival order, so every staged SQL has a preceding meta.)
 func (h *Handler) stageSQL(opID string, wires []ws.StatementWire) {
 	p := h.previewFor(opID)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, w := range wires {
 		if w.TxID == "" {
+			continue
+		}
+		if _, ok := p.known[w.TxID]; !ok {
 			continue
 		}
 		p.sqlByTx[w.TxID] = append(p.sqlByTx[w.TxID], w)
@@ -943,6 +1024,12 @@ func (h *Handler) Start(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// Normalize a negative maxRowsPerTx to the agent-default sentinel (0); the
+	// upper clamp was enforced by validateScanFilter, so the persisted filter
+	// and the wire value never carry out-of-range rows-per-transaction values.
+	if req.Filter.MaxRowsPerTx < 0 {
+		req.Filter.MaxRowsPerTx = 0
+	}
 
 	// Fetch the agent to determine the organisation.
 	agt, err := h.agentStore.Get(req.AgentID)
@@ -980,8 +1067,13 @@ func (h *Handler) Start(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// Reserve the preview slot so stream events can populate it.
-	h.previewFor(op.ID)
+	// Reserve the preview slot so stream events can populate it, bounded by the
+	// operation's MaxPreview (server-side entry cap; the agent enforces its own
+	// cap on the scan side).
+	p := h.previewFor(op.ID)
+	p.mu.Lock()
+	p.maxEntries = previewCap(req.MaxPreview)
+	p.mu.Unlock()
 
 	if !h.agentConnected(req.AgentID) {
 		op.Status = StateBlocked
@@ -1036,15 +1128,16 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, statusResponse{
-		ID:        op.ID,
-		OrgID:     op.OrgID,
-		AgentID:   op.AgentID,
-		Type:      op.Type,
-		Mode:      op.Mode,
-		Status:    op.Status,
-		CreatedBy: op.CreatedBy,
-		CreatedAt: op.CreatedAt,
-		UpdatedAt: op.UpdatedAt,
+		ID:               op.ID,
+		OrgID:            op.OrgID,
+		AgentID:          op.AgentID,
+		Type:             op.Type,
+		Mode:             op.Mode,
+		Status:           op.Status,
+		CreatedBy:        op.CreatedBy,
+		CreatedAt:        op.CreatedAt,
+		UpdatedAt:        op.UpdatedAt,
+		PreviewTruncated: h.previewTruncated(op.ID),
 	})
 }
 
@@ -1060,17 +1153,22 @@ func (h *Handler) Transactions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	txs := []txPreview{}
-	if snap := h.snapshot(op.ID); snap != nil {
+	snap := h.snapshot(op.ID)
+	if snap != nil {
 		for _, m := range snap.metas {
 			txs = append(txs, txPreview{txMetaWire: m, SQL: snap.sqlByTx[m.TxID]})
 		}
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	resp := map[string]interface{}{
 		"operationId":  op.ID,
 		"status":       op.Status,
 		"transactions": txs,
-	})
+	}
+	if snap != nil && snap.truncated {
+		resp["previewTruncated"] = true
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // Select drives the second phase of the recovery flow. In `sql` mode the

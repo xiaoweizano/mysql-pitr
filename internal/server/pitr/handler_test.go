@@ -401,6 +401,46 @@ func TestStart_InvalidFilterTime(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
+func TestStart_RejectsMaxRowsPerTxOverLimit(t *testing.T) {
+	// Plan deliverable: filter.maxRowsPerTx is server-side clamped to
+	// (0, 1_000_000] — a value above the agent's per-transaction truncation
+	// ceiling is rejected up front with 400 (no operation persisted, no command
+	// sent). The exact ceiling is accepted; 0 and negative values keep the agent
+	// default (0 = 1_000_000), so the server preview of a transaction can never
+	// exceed the agent's truncation ceiling.
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+
+	over := startBody(agentID)
+	over["filter"].(map[string]interface{})["maxRowsPerTx"] = 1_000_001
+	w := httptest.NewRecorder()
+	f.handler.Start(w, f.authenticatedRequest(t, http.MethodPost, "/api/pitr/start", over, userID))
+	assert.Equal(t, http.StatusBadRequest, w.Code, "maxRowsPerTx above 1_000_000 must be rejected with 400")
+	assert.Empty(t, f.commander.commands(), "no scan command for a rejected filter")
+
+	ops, err := f.opStore.ListByOrg(orgID)
+	require.NoError(t, err)
+	assert.Empty(t, ops, "no operation is persisted for a rejected filter")
+
+	for _, v := range []interface{}{1_000_000, 0, -5} {
+		body := startBody(agentID)
+		body["filter"].(map[string]interface{})["maxRowsPerTx"] = v
+		w := httptest.NewRecorder()
+		f.handler.Start(w, f.authenticatedRequest(t, http.MethodPost, "/api/pitr/start", body, userID))
+		assert.Equal(t, http.StatusCreated, w.Code, "maxRowsPerTx=%v must be accepted", v)
+
+		resp := startResponseBody(t, w)
+		op, err := f.opStore.Get(resp.OperationID)
+		require.NoError(t, err)
+		assert.False(t, op.Filter.MaxRowsPerTx > 1_000_000, "persisted maxRowsPerTx must stay within the ceiling")
+		if v == -5 {
+			assert.Equal(t, 0, op.Filter.MaxRowsPerTx, "negative maxRowsPerTx normalizes to the agent-default sentinel 0")
+		}
+	}
+}
+
 func TestStart_NoAuth(t *testing.T) {
 	f := setupTest(t)
 	req := httptest.NewRequest(http.MethodPost, "/api/pitr/start",
@@ -710,6 +750,73 @@ func TestTransactions_EmptyPreview(t *testing.T) {
 	}
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.Empty(t, resp.Transactions)
+}
+
+func TestPreview_MemoryBound(t *testing.T) {
+	// Plan deliverable: the in-memory scan preview is capped at the operation's
+	// MaxPreview (server-side), dropping tx_meta entries beyond the cap and
+	// marking the preview truncated rather than growing without bound. SQL for a
+	// dropped transaction is dropped along with its metadata. scan_done still
+	// completes normally — the preview is truncated, not the operation.
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+
+	body := startBody(agentID)
+	body["maxPreview"] = 2
+	req := f.authenticatedRequest(t, http.MethodPost, "/api/pitr/start", body, userID)
+	w := httptest.NewRecorder()
+	f.handler.Start(w, req)
+	require.Equal(t, http.StatusCreated, w.Code)
+	opID := startResponseBody(t, w).OperationID
+
+	// Inject three tx_meta events; only the first two fit the MaxPreview=2 cap.
+	f.injectStreamEvent(t, agentID, opID, ws.EvTxMeta, txMetaData("aaa:1", "2026-07-08T12:00:00Z", 2))
+	f.injectStreamEvent(t, agentID, opID, ws.EvTxMeta, txMetaData("aaa:2", "2026-07-08T12:01:00Z", 1))
+	f.injectStreamEvent(t, agentID, opID, ws.EvTxMeta, txMetaData("aaa:3", "2026-07-08T12:02:00Z", 4))
+	// SQL for a retained transaction is staged; SQL for the truncated one is
+	// dropped along with its metadata.
+	f.injectStreamEvent(t, agentID, opID, ws.EvSQL, []ws.StatementWire{
+		{SQL: "DELETE FROM shop.orders WHERE id=1", TxID: "aaa:1", TxOrder: 0},
+		{SQL: "DELETE FROM shop.orders WHERE id=2", TxID: "aaa:3", TxOrder: 0},
+	})
+
+	// /transactions exposes only the retained entries, flagged as truncated.
+	txReq := f.authenticatedRouteRequest(t, http.MethodGet, "/api/pitr/"+opID+"/transactions", opID, nil, userID)
+	txW := httptest.NewRecorder()
+	f.handler.Transactions(txW, txReq)
+	require.Equal(t, http.StatusOK, txW.Code)
+	var txResp struct {
+		Transactions     []txPreview `json:"transactions"`
+		PreviewTruncated bool        `json:"previewTruncated"`
+	}
+	require.NoError(t, json.NewDecoder(txW.Body).Decode(&txResp))
+	require.Len(t, txResp.Transactions, 2, "preview must be capped at MaxPreview=2")
+	assert.Equal(t, "aaa:1", txResp.Transactions[0].TxID)
+	assert.Equal(t, "aaa:2", txResp.Transactions[1].TxID)
+	assert.True(t, txResp.PreviewTruncated, "dropped entries must mark the preview truncated")
+	require.Len(t, txResp.Transactions[0].SQL, 1, "SQL for a retained transaction is staged")
+	assert.Equal(t, "aaa:1", txResp.Transactions[0].SQL[0].TxID)
+	assert.Empty(t, txResp.Transactions[1].SQL)
+
+	// /status carries the same marker so the front-end can react without
+	// polling /transactions.
+	stReq := f.authenticatedRouteRequest(t, http.MethodGet, "/api/pitr/"+opID+"/status", opID, nil, userID)
+	stW := httptest.NewRecorder()
+	f.handler.Status(stW, stReq)
+	require.Equal(t, http.StatusOK, stW.Code)
+	var stResp struct {
+		PreviewTruncated bool `json:"previewTruncated"`
+	}
+	require.NoError(t, json.NewDecoder(stW.Body).Decode(&stResp))
+	assert.True(t, stResp.PreviewTruncated, "/status must surface the preview-truncated marker")
+
+	// The scan still completes normally — truncation is preview-local.
+	f.injectStreamEvent(t, agentID, opID, ws.EvScanDone, map[string]interface{}{})
+	got, err := f.opStore.Get(opID)
+	require.NoError(t, err)
+	assert.Equal(t, StateReady, got.Status, "scan_done completes even with a truncated preview")
 }
 
 func TestTransactions_NotFound(t *testing.T) {
