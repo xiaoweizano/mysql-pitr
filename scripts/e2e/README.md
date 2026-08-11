@@ -53,13 +53,33 @@ go test -tags integration ./internal/binlog/ -run TestE2E_FetchSchema -count=1
 
 # collector 归档循环 e2e（回填 + 续拉 + FLUSH LOGS 轮转 + 归档可扫描还原）
 go test -tags integration ./internal/collector/ -run TestE2E_ArchiveLoop -count=1
+
+# server↔agent↔MySQL 黄金路径（真实 hub WebSocket + 真实 agent 命令层）
+# 覆盖：DELETE 回滚完整 v3 流程（start→scan_done→select→execute→done）、
+# scan 中 cancel、执行中 pause→resume
+go test -tags integration ./internal/server/ -run TestE2E_Server -count=1
 ```
 
 - 环境变量缺省时测试直接 `t.Skip`，不会失败。
 - `-run TestE2E` 会同时命中 `TestE2E_FetchSchema`（前缀匹配）；如需精确只跑
   场景，用 `-run TestE2E_`（带下划线）。
-- 所有测试都在独立数据库（`e2e.*` / `e2e_collector.*` / `e2e_schema.*`）上
-  操作并负责清理，可在共享实例上并行跑多个仓库副本。
+- 所有测试都在独立数据库（`e2e.*` / `e2e_collector.*` / `e2e_schema.*` /
+  `e2e_pitr.*`）上操作并负责清理，可在共享实例上并行跑多个仓库副本。
+
+## server e2e 说明（internal/server，Task 8）
+
+- **不需要额外进程**：agent 在测试进程内组装（`daemon` 命令层 + 本地 MySQL
+  executor + ws client + dispatcher），mTLS 证书由测试用 server 的内部 CA
+  （`<AGENT_DATA_DIR>/ca.json`）现场签发，自动完成注册/审批流程
+  （register → login → create org → register agent → approve → 连 hub）。
+- **不起 collector 归档循环**：扫描直接读 `E2E_BINLOG_DIR`（与归档镜像内容
+  等价）；collector 循环本身由 `TestE2E_ArchiveLoop` 覆盖。
+- **时序**：scan/cancel/pause 场景用较大事务（5 万行 / 1000 行）保证命令在
+  扫描/执行进行中到达；`waitForStatus` 轮询（90s 上限）而非固定 sleep。
+- 三条路径：`TestE2E_ServerAgentMySQL_GoldenPath`（DELETE 回滚全流程）、
+  `TestE2E_ServerAgentMySQL_CancelDuringScan`（scan 中 cancel，终态
+  cancelled 且不落库）、`TestE2E_ServerAgentMySQL_PauseResume`（执行中
+  pause→resume，恢复后全部行还原）。
 
 ## 时序说明（collector e2e，无 sleep）
 
