@@ -27,7 +27,7 @@
 |---|---|
 | **agent** | Deployed on the MySQL host. Reads the local binlog directory, parses binlog files with `mysqlbinlog`, answers preflight/parse/execute commands, executes rollback SQL on its local MySQL connection. Never sends MySQL credentials to the server. |
 | **server** | Web dashboard + REST API + agent hub. Authenticates users (JWT), tracks organisations/agents/operations, drives agents over the WebSocket hub. Never accesses binlog files or MySQL directly. |
-| **web** | React + Ant Design frontend served by the server. |
+| **web** | SvelteKit frontend, embedded into the server binary via `make build-web`. |
 
 ## Quick Start (Docker, host MySQL)
 

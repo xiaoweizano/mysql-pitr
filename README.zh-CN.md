@@ -27,7 +27,7 @@
 |---|---|
 | **agent** | 部署在 MySQL 主机。读取本地 binlog 目录，用 `mysqlbinlog` 解析，响应预检/解析/执行命令，在本地 MySQL 连接上执行回滚 SQL。MySQL 凭据不出主机。 |
 | **server** | Web 控制台 + REST API + agent 连接中枢。JWT 用户认证，管理组织/agent/操作，通过 WebSocket 中枢驱动 agent。不直接访问 binlog 或 MySQL。 |
-| **web** | React + Ant Design 前端，由 server 托管。 |
+| **web** | SvelteKit 前端，通过 `make build-web` 嵌入 server 二进制。 |
 
 ## 快速开始（Docker + 宿主机 MySQL）
 
