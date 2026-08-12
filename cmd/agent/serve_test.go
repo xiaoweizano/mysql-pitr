@@ -30,8 +30,7 @@ func testServeDaemon(t *testing.T) *serveDaemon {
 		MySQL: config.MySQLConfig{
 			Host: "127.0.0.1", Port: 3306, User: "u", Password: "p", Database: "d",
 		},
-		DataDir:         t.TempDir(),
-		MySQLBinlogPath: "/opt/mysql/bin/mysqlbinlog",
+		DataDir: t.TempDir(),
 	}
 	return newServeDaemon(cfg, "agent-1")
 }

@@ -49,23 +49,15 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
 # =============================================================================
 # Stage 3: Agent image
 # =============================================================================
-# Base on debian:slim and install mariadb-client, which provides both
-# mariadb-binlog and a /usr/bin/mysqlbinlog compatibility symlink. Alpine
-# 3.20's mariadb packaging splits the binlog tool out of mariadb-client /
-# mariadb-server-utils / mariadb-server entirely, but Debian's packaging
-# keeps it where it belongs. mariadb-binlog parses both MariaDB and MySQL
-# binlogs. ~150MB vs ~600MB for mysql:8.0 as the agent base.
+# The v3 agent parses binlogs with go-mysql internally — no mysqlbinlog or
+# mysql client tools are needed. python3/openssl/curl/jq stay for the
+# provision service, which shares this image (scripts/e2e-provision.sh uses
+# them to register the agent and issue its mTLS certificate).
 FROM debian:12-slim AS agent
 
-# python3/openssl/curl/jq are preinstalled for the provision service, which
-# shares this agent image (scripts/e2e-provision.sh uses them to register the
-# agent and issue its mTLS certificate).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates tzdata mariadb-client python3 openssl curl jq && \
-    rm -rf /var/lib/apt/lists/* && \
-    ln -sf /usr/bin/mariadb-binlog /usr/bin/mysqlbinlog && \
-    test -x /usr/bin/mysqlbinlog && \
-    mysqlbinlog --version
+        ca-certificates tzdata python3 openssl curl jq && \
+    rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/mysql-pitr-agent /usr/local/bin/mysql-pitr-agent
 

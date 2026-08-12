@@ -99,9 +99,6 @@ type Config struct {
 	// BinlogDir overrides the binlog directory discovered from the MySQL
 	// server variable log_bin_basename.
 	BinlogDir string `json:"binlog_dir,omitempty"`
-	// MySQLBinlogPath overrides the mysqlbinlog binary location (auto-discovered
-	// from PATH when empty).
-	MySQLBinlogPath string `json:"mysqlbinlog_path,omitempty"`
 }
 
 // Validate checks that required fields are present and returns an error if not.

@@ -139,8 +139,7 @@ setup_config() {
     "ca_file": "/etc/agent/ca.pem"
   },
   "data_dir": "/var/lib/mysql-pitr",
-  "binlog_dir": "",
-  "mysqlbinlog_path": ""
+  "binlog_dir": ""
 }
 CONFEOF
     pass "Default config created"

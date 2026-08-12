@@ -6,8 +6,8 @@ This guide covers deploying the MySQL PITR (Point-in-Time Recovery) system.
 
 The system has two components:
 
-- **agent** — deployed **on the MySQL host**. It reads the local binlog files,
-  parses them with `mysqlbinlog`, executes rollbacks on its local MySQL
+- **agent** — deployed **on the MySQL host**. It parses the local binlog files
+  with go-mysql, executes rollbacks on its local MySQL
   connection, and serves the mysql-pitr-server over a long-lived mTLS
   WebSocket connection (`agent serve`). It never sends MySQL credentials to
   the server.
@@ -201,7 +201,6 @@ Plaintext shape:
   },
   "data_dir": "/var/lib/mysql-pitr",
   "binlog_dir": "",
-  "mysqlbinlog_path": "",
   "archive": {
     "dir": "/var/lib/mysql-pitr/archive",
     "server_id": 1001,
@@ -218,7 +217,6 @@ Plaintext shape:
 | `server.ca_file` | Server CA certificate used to verify the endpoint |
 | `data_dir` | Where rollback checkpoints are persisted |
 | `binlog_dir` | Optional override for the binlog directory (default: `log_bin_basename`) |
-| `mysqlbinlog_path` | Optional override for the `mysqlbinlog` binary |
 | `archive.dir` | Archive directory for the binlog archive loop (required for `serve`) |
 | `archive.server_id` | Replication server id for the archive loop's binlog syncer (required for `serve`, must be unique per agent) |
 | `archive.retention_days` | Delete archived binlogs older than N days (0 = never clean up) |
@@ -252,7 +250,7 @@ Use the included `docker-compose.yml` as a starting point (host MySQL — see
 ### Building images yourself
 
 ```bash
-# Agent only (includes mysqlbinlog via mariadb-client)
+# Agent only (binlog parsing via embedded go-mysql; no mysql client tools)
 docker build --target=agent -t mysql-pitr-agent .
 
 # Server only (frontend embedded in the binary via the Dockerfile's
@@ -342,9 +340,7 @@ nssm start mysql-pitr-agent
 ### Task Scheduler
 
 Create a task that runs at startup with the same command line; tick
-"Restart on failure". Note the default `mysqlbinlog_path` on Windows:
-`C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqlbinlog.exe` — set
-`mysqlbinlog_path` in the config if it is not on PATH.
+"Restart on failure".
 
 ---
 
@@ -396,7 +392,6 @@ GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o bin/mysql-pitr-agent-linux-
 | Agent connects but stays unapproved | Register flow not completed | Approve the agent in the web console (Agents page) |
 | PITR start fails "agent is offline" | Agent not running/connected | Run `mysql-pitr-agent serve --config=... --passphrase=...`; check `journalctl -u agent` |
 | Operation failed "agent_offline" | Agent disconnected mid-operation | Check agent logs/network; retry the operation once the agent reconnects |
-| `mysqlbinlog` not found | MySQL tools not installed | Install `mysql-client`/`mariadb-client`, or set `mysqlbinlog_path` in the config |
 | `binlog_format` must be ROW | MySQL not configured for ROW-based replication | Set `binlog_format=ROW` and `binlog_row_image=FULL` in my.cnf |
 | Permission denied for /etc/agent | Install script not run as root | Run with `sudo` |
 | Port 8080 already in use | Another process on that port | Change `LISTEN_ADDR` or use a reverse proxy on a different port |

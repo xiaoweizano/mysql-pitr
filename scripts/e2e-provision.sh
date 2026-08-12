@@ -128,11 +128,21 @@ mysql-pitr-agent config encrypt \
 
 rm -f "$CONFIG_DIR/plain.json" "$CONFIG_DIR/ca-key.pem" "$CONFIG_DIR/ca-key.pem.srl"
 
-# Verify the MySQL account the agent will use. The agent connects from the
-# Docker network (source IP is a container address), so 'user'@'localhost'
-# is not enough — catch that here instead of at PITR time.
-echo "[provision] verifying MySQL connectivity as '$MYSQL_USER'..."
-if ! mysqladmin ping -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$MYSQL_USER" -p"$MYSQL_PASSWORD" --silent; then
+# Verify the MySQL server is reachable from the Docker network. The v3 agent
+# no longer ships mysql client tools (go-mysql does the binlog parsing), so
+# use a plain python3 TCP probe. A reachable server with wrong credentials
+# will surface in the agent logs via friendlyConnError with the grant
+# guidance below — this check catches the common container networking failure
+# (host unreachable / port blocked) early.
+echo "[provision] verifying MySQL reachability as '$MYSQL_USER'..."
+if ! python3 - "$MYSQL_HOST" "$MYSQL_PORT" <<'PYEOF'
+import socket, sys
+try:
+    socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=5).close()
+except OSError:
+    sys.exit(1)
+PYEOF
+then
   echo "[provision] ERROR: cannot connect to MySQL at $MYSQL_HOST:$MYSQL_PORT as user '$MYSQL_USER'."
   echo "[provision] The agent needs a MySQL account allowed from the Docker network."
   echo "[provision] On the MySQL host, run as root:"
