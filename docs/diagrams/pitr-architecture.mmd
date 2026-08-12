@@ -1,0 +1,35 @@
+graph LR
+    subgraph B["浏览器"]
+        UI["SvelteKit SPA<br/>中文界面"]
+    end
+
+    subgraph S["server · 单二进制（Go）"]
+        REST["REST API<br/>JWT 认证"]
+        SSE["SSE 进度推送"]
+        HUB["agent Hub<br/>mTLS WebSocket"]
+        DB[("SQLite<br/>平台元数据")]
+    end
+
+    subgraph A["agent · MySQL 主机"]
+        FS["FileSource<br/>ParseFile 解析"]
+        AGG["事务聚合器"]
+        ARC[("归档目录<br/>唯一事实源")]
+        SYNC["binlogsyncer<br/>增量流式"]
+        EXEC["executor<br/>检查点化执行"]
+    end
+
+    M[("MySQL<br/>binlog 文件")]
+
+    UI -->|"REST / SSE"| REST
+    REST -->|"操作命令"| HUB
+    REST --> DB
+    HUB -->|"scan / execute / cancel"| AGG
+    HUB -->|"流事件回传"| EXEC
+    M -->|"本地 binlog 文件"| FS
+    M -->|"复制协议"| SYNC
+    FS --> AGG
+    SYNC -->|"原始事件还原"| ARC
+    AGG -->|"事务流"| ARC
+    ARC -->|"PITR 扫描"| AGG
+    AGG -->|"事务元数据 / 逆向 SQL"| HUB
+    EXEC -->|"逆向 SQL 执行"| M
