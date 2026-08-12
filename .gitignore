@@ -30,3 +30,4 @@ internal/server/embed_build/*
 # --- OS ---
 .DS_Store
 Thumbs.db
+.claude/worktrees/
