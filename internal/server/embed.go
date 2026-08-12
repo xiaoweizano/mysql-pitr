@@ -5,31 +5,49 @@ import (
 	"io/fs"
 )
 
-// embedStub bundles the placeholder frontend (embed_stub/) into the binary
-// until the real SvelteKit build lands in Phase 4. The directory contains
-// index.html and any static assets the placeholder needs.
+// embedStub bundles the placeholder frontend (embed_stub/) into the binary.
+// It is served until `make build-web` has embedded the real SvelteKit build —
+// the directory contains index.html and app.css.
 //
 //go:embed embed_stub/*
 var embedStub embed.FS
 
-// stubFS is the embed filesystem rooted at embed_stub/, so HTTP paths resolve
-// without the embed_stub/ prefix (e.g. "/index.html" → "index.html").
-var stubFS = func() fs.FS {
+// buildFS embeds whatever `make build-web` copied into embed_build/. In a
+// source checkout that directory holds only .gitkeep (build artifacts are
+// gitignored), so resolveWebFS falls back to the placeholder. After
+// `make build-web` the real SvelteKit build (index.html, _app/, favicon.svg)
+// is compiled into the binary and served instead — a single-binary delivery.
+//
+//go:embed embed_build/*
+var buildFS embed.FS
+
+// resolveWebFS returns the frontend filesystem rooted at the web root, so
+// HTTP paths resolve without a directory prefix (e.g. "/index.html" →
+// "index.html"): the real SvelteKit build when embed_build/ contains
+// index.html, otherwise the placeholder stub.
+func resolveWebFS() fs.FS {
+	if _, err := buildFS.Open("embed_build/index.html"); err == nil {
+		sub, err := fs.Sub(buildFS, "embed_build")
+		if err != nil {
+			// //go:embed guarantees embed_build exists at compile time.
+			panic("server: embed_build: " + err.Error())
+		}
+		return sub
+	}
 	sub, err := fs.Sub(embedStub, "embed_stub")
 	if err != nil {
-		// The //go:embed directive above guarantees embed_stub exists at
-		// compile time, so this cannot fail at runtime.
+		// //go:embed guarantees embed_stub exists at compile time.
 		panic("server: embed_stub: " + err.Error())
 	}
 	return sub
-}()
+}
 
-// placeholderIndex is the embed_stub/index.html content, served as the SPA
-// fallback for every non-API, non-static route.
-var placeholderIndex = func() []byte {
-	b, err := embedStub.ReadFile("embed_stub/index.html")
+// indexHTML is the SPA fallback page served for every non-API, non-static
+// route: the build's index.html when embedded, otherwise the placeholder.
+var indexHTML = func() []byte {
+	b, err := fs.ReadFile(resolveWebFS(), "index.html")
 	if err != nil {
-		panic("server: embed_stub/index.html: " + err.Error())
+		panic("server: resolveWebFS index.html: " + err.Error())
 	}
 	return b
 }()

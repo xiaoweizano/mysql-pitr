@@ -14,7 +14,7 @@ GOVET       := $(GOCMD) vet
 # Build flags
 LDFLAGS     := -ldflags="-s -w"
 
-.PHONY: all build agent server test lint vet clean docker-build fmt
+.PHONY: all build agent server test lint vet clean docker-build fmt build-web
 
 all: lint test build
 
@@ -55,6 +55,18 @@ vet:
 
 clean:
 	rm -rf $(OUTPUT_DIR) coverage.out coverage.html
+
+# --- Frontend ---
+
+# Build the SvelteKit frontend and copy it into internal/server/embed_build/
+# so it is compiled into the server binary (single-binary delivery, served via
+# resolveWebFS). Run before `make server` / `go build ./cmd/server`.
+# NOTE: `rm -rf …/*` deliberately keeps the dotfile .gitkeep (sh globs do not
+# match it), so the directory stays git-trackable after builds.
+build-web:
+	cd web && npm ci && npm run build
+	rm -rf internal/server/embed_build/*
+	cp -r web/build/* internal/server/embed_build/
 
 # --- Docker ---
 

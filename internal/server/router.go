@@ -97,11 +97,13 @@ func newWebRouter(
 	})
 
 	// ---- Frontend SPA ----
-	// Serve the embedded placeholder frontend (embed_stub/) for all non-API
-	// routes: real stub files resolve through the embed filesystem, and
-	// everything else falls back to index.html for client-side routing.
-	// Phase 4 replaces the stub with the real SvelteKit build (web/).
-	fileServer := http.FileServer(http.FS(stubFS))
+	// Serve the embedded frontend for all non-API routes: real files resolve
+	// through the embed filesystem, and everything else falls back to
+	// index.html for client-side routing. The served build is the real
+	// SvelteKit bundle when `make build-web` has run (resolveWebFS), otherwise
+	// the placeholder stub.
+	webFS := resolveWebFS()
+	fileServer := http.FileServer(http.FS(webFS))
 	r.Get("/*", func(w http.ResponseWriter, r *http.Request) {
 		// Unknown /api routes are 404, not SPA fallback: a typo'd API path must
 		// not be answered with the front-end index page. Known API routes are
@@ -112,7 +114,7 @@ func newWebRouter(
 		}
 		name := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
 		if name != "" && name != "." {
-			if f, err := stubFS.Open(name); err == nil {
+			if f, err := webFS.Open(name); err == nil {
 				info, statErr := f.Stat()
 				_ = f.Close()
 				if statErr == nil && !info.IsDir() {
@@ -121,10 +123,10 @@ func newWebRouter(
 				}
 			}
 		}
-		// SPA fallback: serve the placeholder index page.
+		// SPA fallback: serve the frontend index page.
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(placeholderIndex)
+		_, _ = w.Write(indexHTML)
 	})
 
 	return r

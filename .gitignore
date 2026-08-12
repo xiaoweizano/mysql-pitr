@@ -17,6 +17,10 @@ web/.svelte-kit/
 web/static/node_modules/
 web/static/build/
 
+# --- Embedded web build (rebuilt via `make build-web`; only .gitkeep is committed) ---
+internal/server/embed_build/*
+!internal/server/embed_build/.gitkeep
+
 # --- gstack tool ---
 .gstack/
 

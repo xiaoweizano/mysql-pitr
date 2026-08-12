@@ -29,9 +29,18 @@ func (fakeCommander) SendToAgent(ctx context.Context, agentID string, cmd ws.Com
 	return &ws.Response{Cmd: cmd.Cmd, Status: ws.StatusOK}, nil
 }
 
+// webFSHasBuild reports whether `make build-web` has embedded the real
+// SvelteKit build into the binary (embed_build/ contains index.html at
+// compile time). Tests branch on this so they pass both from a clean checkout
+// (placeholder stub served) and after a frontend build (real build served).
+func webFSHasBuild() bool {
+	_, err := buildFS.Open("embed_build/index.html")
+	return err == nil
+}
+
 // TestNewBootstrap exercises server.New() end to end against a temporary
 // AGENT_DATA_DIR: the shared SQLite database and CA file are created, both
-// handlers and the hub are wired, the embed placeholder serves "/", and the
+// handlers and the hub are wired, the embedded frontend serves "/", and the
 // v3 PITR routes are mounted behind auth (401, not 404, when unauthenticated).
 func TestNewBootstrap(t *testing.T) {
 	dataDir := t.TempDir()
@@ -52,30 +61,52 @@ func TestNewBootstrap(t *testing.T) {
 		assert.NoErrorf(t, statErr, "expected %s in data dir", f)
 	}
 
-	// GET / serves the embed placeholder page.
+	hasBuild := webFSHasBuild()
+	indexMarker := "PITR 平台"
+	stubMarker := "PITR 平台（Phase 4 前端）"
+	buildMarker := "_app/immutable"
+
+	// GET / serves the frontend: the real SvelteKit build when `make
+	// build-web` has run, otherwise the embed placeholder.
 	w := httptest.NewRecorder()
 	srv.Web.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/", nil))
 	assert.Equal(t, http.StatusOK, w.Code)
-	assert.Contains(t, w.Body.String(), "PITR 平台")
+	if hasBuild {
+		assert.Contains(t, w.Body.String(), buildMarker, "embedded build served at /")
+		assert.NotContains(t, w.Body.String(), stubMarker, "placeholder must not be served when the build is embedded")
+	} else {
+		assert.Contains(t, w.Body.String(), indexMarker, "placeholder index served at /")
+	}
 
-	// Static stub files resolve through the embed filesystem.
+	// Static assets resolve through the embed filesystem. The stub ships
+	// app.css; the SvelteKit build emits hashed CSS under /_app/immutable/
+	// only, so /app.css falls through to the SPA index page (text/html).
 	w = httptest.NewRecorder()
 	srv.Web.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/app.css", nil))
 	assert.Equal(t, http.StatusOK, w.Code)
-	assert.Contains(t, w.Header().Get("Content-Type"), "text/css")
+	if hasBuild {
+		assert.Contains(t, w.Header().Get("Content-Type"), "text/html", "build: /app.css is not a real asset, SPA fallback expected")
+	} else {
+		assert.Contains(t, w.Header().Get("Content-Type"), "text/css", "stub: /app.css served as CSS")
+	}
 
 	// Unknown non-API routes fall back to the SPA index page.
 	w = httptest.NewRecorder()
 	srv.Web.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/some/spa/route", nil))
 	assert.Equal(t, http.StatusOK, w.Code)
-	assert.Contains(t, w.Body.String(), "PITR 平台")
+	if hasBuild {
+		assert.Contains(t, w.Body.String(), buildMarker, "build index served for SPA routes")
+	} else {
+		assert.Contains(t, w.Body.String(), indexMarker, "placeholder index served for SPA routes")
+	}
 
 	// Unknown /api routes return 404 instead of the SPA index page: a typo'd
 	// API path must not be answered with the front-end HTML.
 	w = httptest.NewRecorder()
 	srv.Web.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/nonexistent", nil))
 	assert.Equal(t, http.StatusNotFound, w.Code)
-	assert.NotContains(t, w.Body.String(), "PITR 平台")
+	assert.NotContains(t, w.Body.String(), indexMarker)
+	assert.NotContains(t, w.Body.String(), stubMarker)
 
 	// The v3 SSE route exists: unauthenticated requests hit the auth
 	// middleware (401) instead of chi's 404 — proving the route is mounted.
