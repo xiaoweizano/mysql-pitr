@@ -81,6 +81,26 @@ make build       # 产出 bin/server 与 bin/agent
 
 or Docker: `docker build --target server .` / `docker build --target agent .`
 
+### Docker Compose
+
+The repo ships a `docker-compose.yml` that deploys the full stack against a **host MySQL** (no MySQL container). A one-shot `provision` service registers the agent, issues its mTLS certificate, and writes the encrypted agent config; then `agent` (with the archive loop) and `server` run persistently.
+
+Host MySQL prerequisites:
+
+- `log-bin=mysql-bin`, `binlog-format=ROW`, `binlog-row-image=FULL`
+- an account reachable from the Docker bridge network (e.g. `'pitr'@'%'` with `SELECT, REPLICATION SLAVE, REPLICATION CLIENT`)
+
+```bash
+cp .env.example .env     # fill in MYSQL_PASSWORD and MYSQL_BINLOG_DIR_HOST
+docker compose up -d
+```
+
+- `server` → http://localhost:8080 (register, create an organisation, approve the agent in the UI)
+- `agent` → mounts the host binlog directory read-only (`MYSQL_BINLOG_DIR_HOST`) and runs the archive loop; archive state lives in the `agent-data` volume
+- `ARCHIVE_SERVER_ID` (syncer id, unique per agent) and `ARCHIVE_RETENTION_DAYS` (0 = keep forever) are configurable via `.env`
+
+The SvelteKit frontend is embedded in the server binary at build time (the Dockerfile's multi-stage build copies `web/build` into the `go:embed` tree) — there is no separate web container.
+
 ### Run the server
 
 ```bash

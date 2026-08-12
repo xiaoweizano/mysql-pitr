@@ -81,6 +81,26 @@ make build       # 产出 bin/server 与 bin/agent
 
 或 Docker：`docker build --target server .` / `docker build --target agent .`
 
+### Docker Compose 部署
+
+仓库自带的 `docker-compose.yml` 可一键部署全栈，连接的是**宿主机 MySQL**（不在容器内另起 MySQL）。一次性 `provision` 服务完成 agent 注册、mTLS 证书签发与加密配置写入；之后 `agent`（含归档循环）与 `server` 常驻运行。
+
+宿主机 MySQL 前置要求：
+
+- `log-bin=mysql-bin`、`binlog-format=ROW`、`binlog-row-image=FULL`
+- 允许容器网段访问的账号（如 `'pitr'@'%'`，授予 `SELECT, REPLICATION SLAVE, REPLICATION CLIENT`）
+
+```bash
+cp .env.example .env     # 填写 MYSQL_PASSWORD 与 MYSQL_BINLOG_DIR_HOST
+docker compose up -d
+```
+
+- `server` → http://localhost:8080（注册账号、创建组织、在界面上审批 agent）
+- `agent` → 只读挂载宿主机 binlog 目录（`MYSQL_BINLOG_DIR_HOST`）并运行归档循环；归档状态存于 `agent-data` 卷
+- `ARCHIVE_SERVER_ID`（syncer id，每 agent 唯一）与 `ARCHIVE_RETENTION_DAYS`（0 = 永久保留）可在 `.env` 配置
+
+前端已由 Dockerfile 多阶段构建在编译期内嵌进 server 二进制（`web/build` 拷入 `go:embed` 树）——无需单独的前端容器。
+
 ### 启动 server
 
 ```bash
