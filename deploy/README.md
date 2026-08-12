@@ -169,7 +169,9 @@ the ID registered in the web console.
 | `AGENT_DATA_DIR` | `./data` | Where the internal CA and revocations persist |
 | `AGENT_CERT_HOSTS` | `localhost,server` | SANs for the server certificate agents verify |
 | `JWT_SECRET` | insecure default | JWT signing key (always set in production) |
-| `WEB_DIR` | `/usr/share/mysql-pitr/web` | Built frontend directory |
+
+> The web console is embedded into the server binary (see "Build server (with
+> frontend)" below) — there is no `WEB_DIR` directory to configure.
 
 ### Agent config file (`/etc/agent/config.json`)
 
@@ -360,13 +362,19 @@ go build -ldflags="-s -w" -o bin/mysql-pitr-agent ./cmd/agent
 
 ### Build server (with frontend)
 
-```bash
-# Build frontend
-cd web && npm ci && npm run build && cd ..
+The frontend is embedded into the server binary (single-binary delivery). To
+include the current `web/` frontend:
 
-# Build server binary
+```bash
+# Build the SvelteKit frontend and copy it into internal/server/embed_build/
+make build-web   # cd web && npm ci && npm run build; cp -r web/build/* internal/server/embed_build/
+
+# Build the server binary (the frontend is compiled into it)
 go build -ldflags="-s -w" -o bin/mysql-pitr-server ./cmd/server
 ```
+
+Without `make build-web` the binary serves a placeholder stub — run it before
+building the server whenever the frontend has changed.
 
 ### Cross-compile
 
@@ -391,4 +399,4 @@ GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o bin/mysql-pitr-agent-linux-
 | `binlog_format` must be ROW | MySQL not configured for ROW-based replication | Set `binlog_format=ROW` and `binlog_row_image=FULL` in my.cnf |
 | Permission denied for /etc/agent | Install script not run as root | Run with `sudo` |
 | Port 8080 already in use | Another process on that port | Change `LISTEN_ADDR` or use a reverse proxy on a different port |
-| Server shows blank page | Frontend not built | Run `npm run build` in `web/` and ensure the binary can find `web/dist` |
+| Server shows blank page | Frontend not built | Run `make build-web` and rebuild the server binary — the frontend is embedded at build time |

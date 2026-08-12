@@ -125,8 +125,11 @@ mysql-pitr-agent serve \
 go build -o bin/mysql-pitr-agent ./cmd/agent
 go build -o bin/mysql-pitr-server ./cmd/server
 
-# 前端（server 镜像需要先构建前端）
-cd web && npm ci && npm run build && cd ..
+# 前端 — 内嵌进 server 二进制（单二进制构建）
+# `make build-web` 执行 `npm ci` + `npm run build`，然后把
+# `web/build/` 拷贝到 `internal/server/embed_build/`，
+# 下次 `go build ./cmd/server` 时前端会被编译进二进制。
+make build-web
 
 # 或直接构建两个 Docker 镜像
 make docker-build
@@ -151,7 +154,7 @@ internal/
   server/       REST 处理器：auth、org、agent、pitr、audit
   ws/           mTLS WebSocket 客户端/服务端中枢、内置 CA、证书续期
 scripts/        provision 与 e2e 测试脚本
-web/            React + Ant Design 前端
+web/            SvelteKit 前端（经 `make build-web` 内嵌进 server 二进制）
 deploy/         部署指南（systemd、Windows、故障排查）
 ```
 

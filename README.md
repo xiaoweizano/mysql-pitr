@@ -125,8 +125,11 @@ Requirements: Go 1.22+, Node.js 20+.
 go build -o bin/mysql-pitr-agent ./cmd/agent
 go build -o bin/mysql-pitr-server ./cmd/server
 
-# Frontend (must be built before the server image is useful)
-cd web && npm ci && npm run build && cd ..
+# Frontend — embedded into the server binary (single-binary build)
+# `make build-web` runs `npm ci` + `npm run build`, then copies
+# `web/build/` into `internal/server/embed_build/` so the next
+# `go build ./cmd/server` compiles the frontend into the binary.
+make build-web
 
 # Or build both Docker images
 make docker-build
@@ -151,7 +154,7 @@ internal/
   server/       REST handlers: auth, org, agent, pitr, audit
   ws/           mTLS WebSocket client/server hub, internal CA, cert renewal
 scripts/        provisioning & e2e test scripts
-web/            React + Ant Design frontend
+web/            SvelteKit frontend (embedded into the server binary via `make build-web`)
 deploy/         deployment guide (systemd, Windows, troubleshooting)
 ```
 
