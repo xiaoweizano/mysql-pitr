@@ -253,6 +253,11 @@
 		return { refs, error: null };
 	}
 
+	function toRFC3339(value: string): string | null {
+		const d = new Date(value);
+		return Number.isNaN(d.getTime()) ? null : d.toISOString();
+	}
+
 	function buildFilter(): { filter: ScanFilter; error: string | null } {
 		const { refs, error: tableError } = parseTables(tablesText);
 		if (tableError) return { filter: {}, error: tableError };
@@ -260,9 +265,14 @@
 		const filter: ScanFilter = {};
 		if (refs.length > 0) filter.tables = refs;
 		// datetime-local is browser-local time; toISOString converts to the
-		// UTC RFC3339 form the backend validates against.
-		if (timeStart) filter.timeStart = new Date(timeStart).toISOString();
-		if (timeEnd) filter.timeEnd = new Date(timeEnd).toISOString();
+		// UTC RFC3339 form the backend validates against. Invalid values get a
+		// friendly error instead of a RangeError.
+		const startIso = timeStart ? toRFC3339(timeStart) : null;
+		if (timeStart && !startIso) return { filter, error: t('pitr.filter.error.invalidTime') };
+		if (startIso) filter.timeStart = startIso;
+		const endIso = timeEnd ? toRFC3339(timeEnd) : null;
+		if (timeEnd && !endIso) return { filter, error: t('pitr.filter.error.invalidTime') };
+		if (endIso) filter.timeEnd = endIso;
 		if (gtidText.trim()) filter.gtidSet = gtidText.trim();
 		// maxRowsPerTx 是 number | null：null/0/非有限值均视为「未填」，由后端用默认值
 		if (maxRowsPerTx != null && Number.isFinite(maxRowsPerTx) && maxRowsPerTx > 0) {

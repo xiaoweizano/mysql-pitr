@@ -113,6 +113,7 @@
 	"pitr.filter.error.invalidTable": "无效的表名（应为 schema.table）：",
 	"pitr.filter.error.maxRows": "单事务最大行数不能超过 1000000",
 	"pitr.filter.error.timeRequired": "请填写截止时间（恢复点）",
+	"pitr.filter.error.invalidTime": "时间格式无效，请重新选择",
 	"pitr.filter.error.gtidRequired": "GTID 定位需要填写 GTID 集",
 	"pitr.filter.error.rangeOrGtid": "请填写时间范围或 GTID 集",
 	"pitr.tx.count": "已接收事务",
