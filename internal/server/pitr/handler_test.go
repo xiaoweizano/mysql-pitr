@@ -34,6 +34,11 @@ type fakeCommander struct {
 	connected bool
 	sendErr   error
 	sent      []ws.Command
+	// onSend, when set, runs synchronously inside SendToAgent after the command
+	// is recorded and before the response is produced — tests use it to
+	// interleave server-side event processing (e.g. a scan_done racing the
+	// ready -> scanning transition) into the command round-trip.
+	onSend func(cmd ws.Command)
 }
 
 func (f *fakeCommander) IsConnected(agentID string) bool { return f.connected }
@@ -42,6 +47,9 @@ func (f *fakeCommander) SendToAgent(ctx context.Context, agentID string, cmd ws.
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.sent = append(f.sent, cmd)
+	if f.onSend != nil {
+		f.onSend(cmd)
+	}
 	if f.sendErr != nil {
 		return nil, f.sendErr
 	}
@@ -1521,6 +1529,76 @@ func TestSelect_NotMember(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, w.Code)
 }
 
+func TestSelect_RescanCompletedBeforeCAS(t *testing.T) {
+	// Rescan race (final-review I1): the agent finishes the directed second
+	// scan (scan_done) before the Select handler persists the ready -> scanning
+	// transition. The scan_done fallback round-trips the disk ready -> scanning
+	// -> ready and persists the staged statements; Select's ready -> scanning
+	// CAS then lands on the already-ready disk and succeeds — with no further
+	// scan_done coming, the op would be stuck in scanning forever. The post-CAS
+	// re-read must detect the completed rescan and roll the state back to ready.
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	op := f.createOp(t, "op_rescan_race", orgID, agentID, StateReady)
+	op.Mode = "selected"
+	op.Filter = binlog.Filter{
+		Tables:       []binlog.TableRef{{Schema: "shop", Table: "orders"}},
+		MaxRowsPerTx: 500,
+	}
+	require.NoError(t, f.opStore.Update(op))
+
+	// Metadata preview from the first (meta-only) scan, plus the rescan's SQL
+	// staged up front so the injected scan_done has statements to persist.
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvTxMeta, txMetaData("aaa:1", "2026-07-08T12:00:00Z", 2))
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvTxMeta, txMetaData("aaa:2", "2026-07-08T12:01:00Z", 1))
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvSQL, []ws.StatementWire{
+		{SQL: "DELETE FROM shop.orders WHERE id=1", TxID: "aaa:1", TxOrder: 0},
+		{SQL: "DELETE FROM shop.orders WHERE id=2", TxID: "aaa:1", TxOrder: 1},
+		{SQL: "DELETE FROM shop.orders WHERE id=3", TxID: "aaa:2", TxOrder: 0},
+	})
+
+	// The commander completes the rescan synchronously inside the command
+	// round-trip — before Select's CAS can land.
+	f.commander.onSend = func(cmd ws.Command) {
+		if cmd.Type == ws.CmdScan {
+			f.injectStreamEvent(t, agentID, op.ID, ws.EvScanDone, map[string]interface{}{})
+		}
+	}
+	defer func() { f.commander.onSend = nil }()
+
+	req := f.authenticatedRouteRequest(t, http.MethodPost, "/api/pitr/op_rescan_race/select", "op_rescan_race",
+		map[string]interface{}{"txIds": []string{"aaa:1", "aaa:2"}}, userID)
+	w := httptest.NewRecorder()
+	f.handler.Select(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	// The rescan completed before the CAS: the op must not be stuck scanning.
+	got, err := f.opStore.Get(op.ID)
+	require.NoError(t, err)
+	assert.Equal(t, StateReady, got.Status, "op must not be stuck in scanning when the rescan completed before the CAS")
+
+	// The response reflects the completed rescan (ready, not scanning).
+	var resp struct {
+		Status OperationState `json:"status"`
+	}
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.Equal(t, StateReady, resp.Status)
+
+	// The rescan's statements were persisted and remain loadable.
+	stmts, err := f.opStore.LoadStatements(op.ID)
+	require.NoError(t, err)
+	require.Len(t, stmts, 3)
+
+	// Exactly one ready audit: the fallback's scan_done audit. The select-side
+	// rollback is a correction of our own premature write and writes none.
+	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "ready", entries[0].Status)
+}
+
 // ---------- Execute ----------
 
 func TestExecute_SendsCmdExecute(t *testing.T) {
@@ -1686,7 +1764,12 @@ func TestPause_SendError_StaysExecuting(t *testing.T) {
 	assert.Equal(t, StatePaused, got.Status)
 }
 
-func TestResume_ResendsExecute(t *testing.T) {
+func TestResume_SendsCmdResume(t *testing.T) {
+	// Final-review C1: resume must dispatch CmdResume (the agent's
+	// executor.Resume continues from the checkpoint saved at the pause) — NOT
+	// CmdExecute, which would clear the checkpoint and re-run the batches the
+	// pause already committed, re-applying them and recording duplicate-key
+	// errors.
 	f := setupTest(t)
 	userID := f.createUser(t)
 	orgID := f.createOrg(t, userID)
@@ -1701,8 +1784,10 @@ func TestResume_ResendsExecute(t *testing.T) {
 	f.handler.Resume(w, req)
 	require.Equal(t, http.StatusOK, w.Code)
 
-	exec, ok := f.commander.findCommand(ws.CmdExecute)
-	require.True(t, ok, "resume must re-issue CmdExecute")
+	exec, ok := f.commander.findCommand(ws.CmdResume)
+	require.True(t, ok, "resume must dispatch CmdResume to the agent")
+	_, ok = f.commander.findCommand(ws.CmdExecute)
+	require.False(t, ok, "resume must not dispatch CmdExecute — that would restart the run from the beginning")
 	assert.Equal(t, op.ID, exec.Cmd)
 	var execReq ws.ExecuteRequest
 	decodeParams(t, exec, &execReq)

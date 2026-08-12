@@ -38,6 +38,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -209,16 +210,34 @@ func TestE2E_ServerAgentMySQL_PauseResume(t *testing.T) {
 
 	h.waitForStatus(token, opID, pitr.StateDone)
 	require.Equal(t, "1000", h.queryValue("SELECT COUNT(*) FROM "+e2eDB+".t"), "all rows restored after resume")
+
+	// 判别性断言（最终评审 C1）：resume 必须从 agent 检查点续跑（CmdResume →
+	// executor.Resume），而不是清检查点从 0 重跑（CmdExecute → executor.Run
+	// 会把暂停前已提交的批次再执行一遍、产生主键冲突错误）。因此 done 审计的
+	// errorDetails 必须为空——出现任何 statement failed 即说明 resume 走了
+	// 重跑路径。
+	require.Eventually(t, func() bool {
+		for _, e := range h.auditForOp(opID) {
+			if e["status"] == "done" {
+				details, _ := e["errorDetails"].(string)
+				return details == ""
+			}
+		}
+		return false
+	}, 10*time.Second, 100*time.Millisecond,
+		"done audit must carry no statement errors — resume must continue from the checkpoint, not re-run")
 }
 
 // ---------------------------------------------------------------------------
 // 装配（server + HTTP 引导 + agent 组件）
 // ---------------------------------------------------------------------------
 
-// e2eHarness 持有一组测试共享的最小状态（web 端点 + 数据连接）。
+// e2eHarness 持有一组测试共享的最小状态（web 端点 + 数据连接 + 引导身份）。
 type e2eHarness struct {
 	t      *testing.T
 	webURL string
+	token  string
+	orgID  string
 	db     *sql.DB
 }
 
@@ -264,21 +283,21 @@ func newE2EHarness(t *testing.T) (*e2eHarness, string, string) {
 	agentURL := "wss://" + strings.TrimPrefix(agentSrv.URL, "https://") + "/ws/agent"
 
 	// ---- HTTP 引导：注册/登录/建 org/注册 agent/approve ----
-	token, agentID := bootstrapPlatform(t, webSrv.URL)
+	token, agentID, orgID := bootstrapPlatform(t, webSrv.URL)
 
 	// ---- 组装并连接 agent（测试进程内）----
 	client := assembleAgent(t, agentURL, agentID, dataDir, connCfg, binlogDir, t.TempDir())
 	t.Cleanup(func() { _ = client.Close() })
 
-	h := &e2eHarness{t: t, webURL: webSrv.URL, db: db}
+	h := &e2eHarness{t: t, webURL: webSrv.URL, token: token, orgID: orgID, db: db}
 	require.Eventually(t, func() bool { return srv.Hub.IsConnected(agentID) },
 		30*time.Second, 200*time.Millisecond, "agent should connect to hub")
 	return h, token, agentID
 }
 
 // bootstrapPlatform 走真实 HTTP API：注册用户 → 登录 → 建 org → 注册 agent
-// （pending）→ approve。返回 (token, agentID)。
-func bootstrapPlatform(t *testing.T, webURL string) (string, string) {
+// （pending）→ approve。返回 (token, agentID, orgID)。
+func bootstrapPlatform(t *testing.T, webURL string) (string, string, string) {
 	t.Helper()
 
 	resp, _ := e2ePost(t, webURL, "/api/auth/register",
@@ -304,10 +323,10 @@ func bootstrapPlatform(t *testing.T, webURL string) (string, string) {
 	agentID, _ := agt["id"].(string)
 	require.NotEmpty(t, agentID, "agent id")
 
-	resp, _ = e2ePost(t, webURL, "/api/agents/"+agentID+"/approve", nil, token)
+	resp, out = e2ePost(t, webURL, "/api/agents/"+agentID+"/approve", nil, token)
 	require.Equal(t, http.StatusOK, resp.StatusCode, "approve agent")
 
-	return token, agentID
+	return token, agentID, orgID
 }
 
 // assembleAgent 在测试进程内组装 agent 侧组件：daemon（scan/execute/resume/
@@ -602,6 +621,34 @@ func (h *e2eHarness) execute(token, opID string, batchSize int) {
 	resp, out := e2ePost(h.t, h.webURL, "/api/pitr/"+opID+"/execute",
 		map[string]interface{}{"batchSize": batchSize}, token)
 	require.Equal(h.t, http.StatusOK, resp.StatusCode, "execute: %v", out)
+}
+
+// auditForOp 返回某操作的全部审计条目（GET /api/audit?org_id&operation_id，
+// 响应为裸 JSON 数组）。
+func (h *e2eHarness) auditForOp(opID string) []map[string]interface{} {
+	h.t.Helper()
+	body := e2eRawBody(h.t, h.webURL, "/api/audit?org_id="+h.orgID+"&operation_id="+opID, h.token)
+	var entries []map[string]interface{}
+	require.NoError(h.t, json.Unmarshal([]byte(body), &entries))
+	return entries
+}
+
+// e2eRawBody 返回 GET 响应的原始 body（e2eGetJSON 只解 map 对象，审计 Query
+// 返回裸数组）。
+func e2eRawBody(t *testing.T, base, path, token string) string {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, base+path, nil)
+	require.NoError(t, err)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := e2eHTTPClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode, "GET %s", path)
+	b, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	return string(b)
 }
 
 // waitForStatus 轮询 /status 直到命中 want 之一；提前到达其他终态立即失败。

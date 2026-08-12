@@ -1316,6 +1316,16 @@ func (h *Handler) selectRescan(w http.ResponseWriter, r *http.Request, op *Opera
 		return
 	}
 
+	// Clear any statements persisted by a previous rescan cycle. Once a new
+	// selection is recorded the old statements are stale (Execute would run the
+	// wrong transaction set), and their absence makes "statements persisted"
+	// below a sound signal that THIS rescan's scan_done already ran — see the
+	// post-CAS race check.
+	if err := h.opStore.SaveStatements(op.ID, nil); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
 	filter := binlogFilterToWire(op.Filter)
 	filter.SelectedTxIDs = txIDs
 	resp, err := h.sendCommand(r.Context(), op.AgentID, ws.Command{
@@ -1341,6 +1351,31 @@ func (h *Handler) selectRescan(w http.ResponseWriter, r *http.Request, op *Opera
 	} else if !ok {
 		writeError(w, http.StatusConflict, "operation state changed concurrently — reload and retry")
 		return
+	}
+
+	// Rescan race (final-review I1): the agent can complete the directed second
+	// scan (scan_done) before the ready -> scanning CAS above lands. scan_done
+	// treats a ready op as scanning (idempotent fallback) and round-trips the
+	// disk ready -> scanning -> ready; our CAS then re-writes scanning with no
+	// further scan_done coming — the op would be stuck in scanning forever.
+	// Detect the completed rescan after the CAS and roll the state back:
+	//   - the re-read shows the disk is no longer scanning: a scan_done already
+	//     migrated it (back to ready) after our CAS — answer with that state;
+	//   - the re-read still shows scanning but the statements are already
+	//     persisted (cleared up front, so presence means THIS rescan's scan_done
+	//     ran before our CAS) — roll scanning -> ready under CAS. Losing the
+	//     rollback means a concurrent actor (e.g. cancel) advanced the op —
+	//     answer with the state it actually reached.
+	if cur, gerr := h.opStore.Get(op.ID); gerr == nil {
+		if cur.Status != StateScanning {
+			op.Status = cur.Status
+		} else if stmts, lerr := h.opStore.LoadStatements(op.ID); lerr == nil && len(stmts) > 0 {
+			if ok, terr := h.transitionTo(op, StateReady); terr == nil && ok {
+				log.Printf("pitr: op %s: rescan completed before the ready->scanning transition — rolled back to ready", op.ID)
+			} else if cur2, gerr2 := h.opStore.Get(op.ID); gerr2 == nil {
+				op.Status = cur2.Status
+			}
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -1421,11 +1456,16 @@ func (h *Handler) Execute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.sendExecute(w, r, op, req.BatchSize, StateExecuting)
+	h.sendExecute(w, r, op, req.BatchSize, ws.CmdExecute, StateExecuting)
 }
 
-// Resume re-issues CmdExecute for a paused operation, moving it back to
-// `executing`.
+// Resume re-issues the operation's execution from the agent's checkpoint,
+// moving it back to `executing`. The command type is CmdResume — NOT
+// CmdExecute — so the agent's executor.Resume continues from the checkpoint
+// saved at the pause instead of executor.Run re-running the batches the pause
+// already committed (which would re-apply them and record duplicate-key
+// errors). The agent side of the wire contract is registered as
+// cmd/agent/serve.go handleResume → daemon.Resume.
 //
 // POST /api/pitr/{id}/resume
 func (h *Handler) Resume(w http.ResponseWriter, r *http.Request) {
@@ -1438,13 +1478,16 @@ func (h *Handler) Resume(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("only paused operations can be resumed (current state %q)", op.Status))
 		return
 	}
-	h.sendExecute(w, r, op, 0, StateExecuting)
+	h.sendExecute(w, r, op, 0, ws.CmdResume, StateExecuting)
 }
 
-// sendExecute loads the operation's persisted statements and issues CmdExecute
-// to the agent, transitioning to `to` on acceptance or `failed` when the agent
-// rejects the command.
-func (h *Handler) sendExecute(w http.ResponseWriter, r *http.Request, op *Operation, batchSize int, to OperationState) {
+// sendExecute loads the operation's persisted statements and issues the
+// execute-family command — CmdExecute for a fresh run, CmdResume for a paused
+// operation's checkpoint continuation — to the agent, transitioning to `to` on
+// acceptance. A transport failure or agent rejection of a fresh run fails the
+// operation; a paused operation has no paused -> failed transition, so it
+// stays paused and retryable.
+func (h *Handler) sendExecute(w http.ResponseWriter, r *http.Request, op *Operation, batchSize int, cmdType string, to OperationState) {
 	stmts, err := h.opStore.LoadStatements(op.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -1462,7 +1505,7 @@ func (h *Handler) sendExecute(w http.ResponseWriter, r *http.Request, op *Operat
 	}
 	resp, err := h.sendCommand(r.Context(), op.AgentID, ws.Command{
 		Cmd:    op.ID,
-		Type:   ws.CmdExecute,
+		Type:   cmdType,
 		Params: paramsFrom(execReq),
 	})
 	if err != nil {
