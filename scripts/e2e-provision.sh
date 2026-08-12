@@ -112,7 +112,12 @@ cat > "$CONFIG_DIR/plain.json" <<EOF
     "ca_file": "$CONFIG_DIR/ca.pem"
   },
   "data_dir": "/var/lib/mysql-pitr",
-  "binlog_dir": "$MYSQL_BINLOG_DIR"
+  "binlog_dir": "$MYSQL_BINLOG_DIR",
+  "archive": {
+    "dir": "/var/lib/mysql-pitr/archive",
+    "server_id": ${ARCHIVE_SERVER_ID:-424242},
+    "retention_days": ${ARCHIVE_RETENTION_DAYS:-0}
+  }
 }
 EOF
 
