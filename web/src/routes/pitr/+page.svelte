@@ -89,7 +89,8 @@
 	let timeStart = $state('');
 	let timeEnd = $state('');
 	let gtidText = $state('');
-	let maxRowsPerTx = $state('');
+	// type="number" 输入的 bind:value 绑定为 number | null（空输入为 null）
+	let maxRowsPerTx = $state<number | null>(null);
 	let formError = $state<string | null>(null);
 	let starting = $state(false);
 
@@ -263,12 +264,10 @@
 		if (timeStart) filter.timeStart = new Date(timeStart).toISOString();
 		if (timeEnd) filter.timeEnd = new Date(timeEnd).toISOString();
 		if (gtidText.trim()) filter.gtidSet = gtidText.trim();
-		if (maxRowsPerTx.trim()) {
-			const n = Number(maxRowsPerTx);
-			if (Number.isFinite(n) && n > 0) {
-				if (n > 1_000_000) return { filter, error: t('pitr.filter.error.maxRows') };
-				filter.maxRowsPerTx = n;
-			}
+		// maxRowsPerTx 是 number | null：null/0/非有限值均视为「未填」，由后端用默认值
+		if (maxRowsPerTx != null && Number.isFinite(maxRowsPerTx) && maxRowsPerTx > 0) {
+			if (maxRowsPerTx > 1_000_000) return { filter, error: t('pitr.filter.error.maxRows') };
+			filter.maxRowsPerTx = maxRowsPerTx;
 		}
 
 		if (typeChoice === 'flashback' || typeChoice === 'update_rollback' || typeChoice === 'pitr_time') {
@@ -286,31 +285,34 @@
 	}
 
 	async function handleStart() {
+		formError = null;
 		if (!agentId) {
 			formError = t('pitr.agent.required');
 			return;
 		}
-		const { filter, error } = buildFilter();
-		if (error) {
-			formError = error;
-			return;
-		}
-		starting = true;
-		formError = null;
+		// 整体包在 try 里：任何意外异常都显示具体原因，而不是静默失败
 		try {
-			const res = await startPITR({ agentId, type: opType, mode, filter });
-			opId = res.operationId;
-			opStatus = res.status;
-			received = 0;
-			sqlReceived = 0;
-			txs = [];
-			progress = null;
-			execErrors = [];
-			step = 3;
+			const { filter, error } = buildFilter();
+			if (error) {
+				formError = error;
+				return;
+			}
+			starting = true;
+			try {
+				const res = await startPITR({ agentId, type: opType, mode, filter });
+				opId = res.operationId;
+				opStatus = res.status;
+				received = 0;
+				sqlReceived = 0;
+				txs = [];
+				progress = null;
+				execErrors = [];
+				step = 3;
+			} finally {
+				starting = false;
+			}
 		} catch (e) {
 			formError = e instanceof Error ? e.message : String(e);
-		} finally {
-			starting = false;
 		}
 	}
 
