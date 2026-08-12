@@ -255,7 +255,8 @@ Use the included `docker-compose.yml` as a starting point (host MySQL — see
 # Agent only (includes mysqlbinlog via mariadb-client)
 docker build --target=agent -t mysql-pitr-agent .
 
-# Server only (includes React frontend; no mysql client needed)
+# Server only (frontend embedded in the binary via the Dockerfile's
+# multi-stage build; no mysql client needed)
 docker build --target=server -t mysql-pitr-server .
 
 # Both with compose

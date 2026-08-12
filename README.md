@@ -131,7 +131,8 @@ go build -o bin/mysql-pitr-server ./cmd/server
 # `go build ./cmd/server` compiles the frontend into the binary.
 make build-web
 
-# Or build both Docker images
+# Or build both Docker images — the Dockerfile's multi-stage build builds
+# and embeds the frontend itself, so no `make build-web` is needed first
 make docker-build
 ```
 

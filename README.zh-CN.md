@@ -131,7 +131,8 @@ go build -o bin/mysql-pitr-server ./cmd/server
 # 下次 `go build ./cmd/server` 时前端会被编译进二进制。
 make build-web
 
-# 或直接构建两个 Docker 镜像
+# 或直接构建两个 Docker 镜像——Dockerfile 的多阶段构建会自行构建并内嵌前端，
+# 无需先执行 `make build-web`
 make docker-build
 ```
 
