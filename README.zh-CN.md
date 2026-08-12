@@ -96,6 +96,12 @@ docker compose logs -f agent   # 等待 agent 上线并保持在线
    - **勾选需要执行的语句**，点击「**执行选中的 SQL**」——这是唯一会改动数据库的时刻。执行中显示进度与恢复行数。
 4. **审计日志** — 每次操作均有记录，可导出 CSV。
 
+## 执行语义与恢复
+
+- **执行中 agent 断线** — 若 agent 在 `scanning`/`executing` 期间掉线，操作会进入 `blocked`（终态），需要新建操作重新扫描并执行仍要恢复的语句。`paused` 操作与 agent 侧检查点可跨 server 重启保留，但 `resume` 仅在 agent 在线时有效。
+- **重复执行依赖单条错误容忍** — 带主键的逆向 SQL 可能与已恢复的行冲突，产生 duplicate-key 错误，逐条记录后继续执行。`resume` 不会重跑 pause 前已提交的 batch，而是从 agent 持久化的检查点继续。
+- **server 的 `checkpoints` 表为预留数据** — 检查点会双写留存备用；当前没有任何读取方，`resume` 使用 agent 本地的检查点文件。
+
 ## CLI（flashback）
 
 agent 二进制还自带独立 CLI，无需 server 即可生成逆向 SQL：
@@ -118,7 +124,7 @@ mysql-pitr-agent serve \
 
 ## 从源码构建
 
-依赖：Go 1.22+、Node.js 20+。
+依赖：Go 1.25+（见 go.mod）、Node.js 20+。
 
 ```bash
 # Agent 与 server 二进制

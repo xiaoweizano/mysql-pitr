@@ -96,6 +96,12 @@ docker compose logs -f agent   # wait for the agent to connect and stay online
    - **Check the statements you want** and click **Execute selected SQL** — this is the only moment the database changes. Progress and the restored row count are shown.
 4. **Audit log** — every operation is recorded and exportable as CSV.
 
+## Execution Semantics and Recovery
+
+- **Agent disconnect mid-operation** — if the agent drops while an operation is `scanning` or `executing`, the operation ends up `blocked` (a terminal state); start a new operation to re-scan and re-execute the statements you still want to apply. `paused` operations and agent-side checkpoints survive server restarts, but `resume` only works while the agent is online.
+- **Duplicate execution is tolerated, per statement** — reverse SQL against rows that carry a primary key may collide with already-restored rows, producing duplicate-key errors that are logged while execution continues. `resume` never re-runs batches that were committed before the pause: it continues from the agent's persisted checkpoint.
+- **The server `checkpoints` table is reserved** — checkpoints are double-written to the server for future use; nothing reads them today, since `resume` relies on the agent's local checkpoint files.
+
 ## CLI (flashback)
 
 The agent binary also ships a standalone CLI that generates reverse SQL without any server:
@@ -118,7 +124,7 @@ mysql-pitr-agent serve \
 
 ## Build from Source
 
-Requirements: Go 1.22+, Node.js 20+.
+Requirements: Go 1.25+ (see go.mod), Node.js 20+.
 
 ```bash
 # Agent + server binaries
