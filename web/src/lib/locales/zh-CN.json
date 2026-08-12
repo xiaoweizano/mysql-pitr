@@ -246,6 +246,8 @@
 	"orgs.createSubmit": "创建",
 	"orgs.createError": "创建失败",
 	"orgs.createdAt": "创建时间",
+	"orgs.copyId": "复制",
+	"orgs.copied": "已复制",
 	"orgs.memberId": "用户 ID",
 	"orgs.memberRole": "角色",
 	"orgs.memberJoined": "加入时间",

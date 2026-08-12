@@ -28,7 +28,7 @@
 		type OrgInfo,
 		type OrgMember
 	} from '$lib/api/orgs.js';
-	import { formatDateTime, shortId } from '$lib/format.js';
+	import { formatDateTime } from '$lib/format.js';
 	import { Building2, UserPlus } from '@lucide/svelte';
 
 	/**
@@ -63,6 +63,22 @@
 	let accepting = $state(false);
 	let acceptError = $state<string | null>(null);
 	let acceptSuccess = $state<string | null>(null);
+
+	// 复制组织 ID / 邀请码（完整值复制，页面显示截断不影响复制）
+	let copied = $state<string | null>(null);
+	let copyTimer: ReturnType<typeof setTimeout> | undefined;
+
+	async function copyValue(label: string, value: string) {
+		try {
+			await navigator.clipboard.writeText(value);
+			copied = label;
+			clearTimeout(copyTimer);
+			copyTimer = setTimeout(() => (copied = null), 1500);
+		} catch {
+			// 剪贴板不可用（非 HTTPS / 权限）时回退到选中文本
+			copied = null;
+		}
+	}
 
 	async function load() {
 		loading = true;
@@ -272,7 +288,16 @@
 					<CardHeader>
 						<CardTitle>{o.name}</CardTitle>
 						<CardDescription>
-							<span class="font-mono text-xs" title={o.id}>{shortId(o.id)}</span>
+							<span class="flex items-center gap-2">
+								<span class="font-mono text-xs break-all">{o.id}</span>
+								<button
+									type="button"
+									class="text-xs text-primary underline-offset-2 hover:underline"
+									onclick={() => copyValue(o.id, o.id)}
+								>
+									{copied === o.id ? t('orgs.copied') : t('orgs.copyId')}
+								</button>
+							</span>
 							<span class="mx-1">·</span>
 							{t('orgs.createdAt')}：{formatDateTime(o.createdAt)}
 						</CardDescription>
@@ -287,6 +312,13 @@
 							<div class="mb-3 flex items-center gap-2 rounded-lg border border-dashed px-3 py-2">
 								<span class="text-sm text-zinc-500">{t('orgs.inviteCode')}：</span>
 								<code class="break-all font-mono text-sm text-zinc-900">{inviteCodes[o.id]}</code>
+								<button
+									type="button"
+									class="shrink-0 text-xs text-primary underline-offset-2 hover:underline"
+									onclick={() => copyValue(`code-${o.id}`, inviteCodes[o.id])}
+								>
+									{copied === `code-${o.id}` ? t('orgs.copied') : t('orgs.copyId')}
+								</button>
 							</div>
 						{/if}
 						<Table>

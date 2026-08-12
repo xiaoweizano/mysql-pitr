@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { t } from '$lib/i18n.svelte.js';
+	import { login } from '$lib/auth.svelte.js';
 	import { register } from '$lib/api/auth.js';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import {
@@ -17,7 +18,6 @@
 	let password = $state('');
 	let confirmPassword = $state('');
 	let error = $state<string | null>(null);
-	let success = $state(false);
 	let submitting = $state(false);
 
 	const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -38,11 +38,10 @@
 		}
 		submitting = true;
 		try {
-			await register(email.trim(), password);
-			// Decision: after a successful signup, send the user to /login —
-			// keeping the frontend simple instead of auto-logging-in.
-			success = true;
-			await goto('/login');
+			// 后端注册即返回 token —— 直接写入会话并进入控制台，无需再走登录页。
+			const result = await register(email.trim(), password);
+			login(result.token, result.user);
+			await goto('/instances');
 		} catch (e) {
 			error = e instanceof Error ? e.message : t('auth.error.generic');
 		} finally {
@@ -104,9 +103,6 @@
 
 				{#if error}
 					<p class="text-sm text-destructive" role="alert">{error}</p>
-				{/if}
-				{#if success}
-					<p class="text-sm text-emerald-600" role="status">{t('auth.register.success')}</p>
 				{/if}
 
 				<Button type="submit" class="w-full" disabled={submitting}>
