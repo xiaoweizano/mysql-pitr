@@ -352,7 +352,7 @@ Create a task that runs at startup with the same command line; tick
 
 ### Prerequisites
 
-- Go 1.22+
+- Go 1.25+
 - Node.js 20+ (for frontend)
 
 ### Build agent
