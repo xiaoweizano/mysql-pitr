@@ -229,8 +229,9 @@
 											>
 												{t('instances.approve')}
 											</Button>
+										{/if}
 											<Button
-												variant="destructive"
+												variant={a.approved ? 'outline' : 'destructive'}
 												size="xs"
 												disabled={pendingId !== null}
 												onclick={(e) => {
@@ -240,7 +241,6 @@
 											>
 												{t('instances.reject')}
 											</Button>
-										{/if}
 										<Button
 											variant="ghost"
 											size="xs"
