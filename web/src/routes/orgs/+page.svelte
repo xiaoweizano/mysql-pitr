@@ -29,7 +29,7 @@
 		type OrgMember
 	} from '$lib/api/orgs.js';
 	import { formatDateTime } from '$lib/format.js';
-	import { Building2, UserPlus } from '@lucide/svelte';
+	import { Building2, Check, Copy, UserPlus } from '@lucide/svelte';
 
 	/**
 	 * Organisations page — list the user's orgs with their members, create a
@@ -69,14 +69,33 @@
 	let copyTimer: ReturnType<typeof setTimeout> | undefined;
 
 	async function copyValue(label: string, value: string) {
-		try {
-			await navigator.clipboard.writeText(value);
+		if (await copyText(value)) {
 			copied = label;
 			clearTimeout(copyTimer);
 			copyTimer = setTimeout(() => (copied = null), 1500);
+		}
+	}
+
+	// navigator.clipboard 只在 HTTPS/localhost 下可用;http://<IP> 访问时回退
+	// textarea + execCommand,否则复制按钮会静默失效(此前 catch 为空 = 点了没反应)。
+	async function copyText(value: string): Promise<boolean> {
+		try {
+			await navigator.clipboard.writeText(value);
+			return true;
 		} catch {
-			// 剪贴板不可用（非 HTTPS / 权限）时回退到选中文本
-			copied = null;
+			try {
+				const ta = document.createElement('textarea');
+				ta.value = value;
+				ta.style.position = 'fixed';
+				ta.style.opacity = '0';
+				document.body.appendChild(ta);
+				ta.select();
+				const ok = document.execCommand('copy');
+				ta.remove();
+				return ok;
+			} catch {
+				return false;
+			}
 		}
 	}
 
@@ -292,10 +311,16 @@
 								<span class="font-mono text-xs break-all">{o.id}</span>
 								<button
 									type="button"
-									class="text-xs text-primary underline-offset-2 hover:underline"
-									onclick={() => copyValue(o.id, o.id)}
+									class="inline-flex shrink-0 items-center gap-1 rounded-md border border-zinc-200 px-1.5 py-0.5 text-xs text-zinc-500 transition-colors hover:border-primary/50 hover:text-primary"
+									onclick={() => copyValue(o.id, o.id)} title={o.id}
 								>
-									{copied === o.id ? t('orgs.copied') : t('orgs.copyId')}
+									{#if copied === o.id}
+											<Check class="size-3.5 text-emerald-600" />
+											<span class="text-emerald-600">{t('orgs.copied')}</span>
+										{:else}
+											<Copy class="size-3.5" />
+											<span>{t('orgs.copyId')}</span>
+										{/if}
 								</button>
 							</span>
 							<span class="mx-1">·</span>
@@ -314,10 +339,16 @@
 								<code class="break-all font-mono text-sm text-zinc-900">{inviteCodes[o.id]}</code>
 								<button
 									type="button"
-									class="shrink-0 text-xs text-primary underline-offset-2 hover:underline"
-									onclick={() => copyValue(`code-${o.id}`, inviteCodes[o.id])}
+									class="inline-flex shrink-0 items-center gap-1 rounded-md border border-zinc-200 px-1.5 py-0.5 text-xs text-zinc-500 transition-colors hover:border-primary/50 hover:text-primary"
+									onclick={() => copyValue(`code-${o.id}`, inviteCodes[o.id])} title={inviteCodes[o.id]}
 								>
-									{copied === `code-${o.id}` ? t('orgs.copied') : t('orgs.copyId')}
+									{#if copied === `code-${o.id}`}
+											<Check class="size-3.5 text-emerald-600" />
+											<span class="text-emerald-600">{t('orgs.copied')}</span>
+										{:else}
+											<Copy class="size-3.5" />
+											<span>{t('orgs.copyId')}</span>
+										{/if}
 								</button>
 							</div>
 						{/if}
