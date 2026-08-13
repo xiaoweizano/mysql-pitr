@@ -101,6 +101,13 @@ docker compose up -d
 
 前端已由 Dockerfile 多阶段构建在编译期内嵌进 server 二进制（`web/build` 拷入 `go:embed` 树）——无需单独的前端容器。
 
+> **低内存服务器（2C2G）**：compose 构建默认使用**预构建前端**（`FRONTEND_FROM=prebuilt`），避免在容器内跑 `npm ci` / Vite —— 2GB 内存下那一步会 OOM。构建前请在本机生成产物并上传：
+> ```bash
+> cd web && npm run build                # 本机（Node 22+）
+> scp -r web/build root@<服务器>:/path/to/project/web/build
+> ```
+> 标准 `docker build --target server .` 仍是自包含构建（容器内编译前端）。
+
 ### 启动 server
 
 ```bash

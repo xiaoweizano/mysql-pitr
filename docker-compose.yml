@@ -6,6 +6,8 @@ version: '3.8'
 #   - 宿主机的 MySQL 数据目录（含 binlog 文件）只读挂载进 agent 容器
 #   - 宿主机 MySQL 必须开启 binlog：log-bin=mysql-bin、binlog-format=ROW、
 #     binlog-row-image=FULL（Windows: my.ini 中 [mysqld] 段）
+#   - 前端不在此处构建:低内存服务器在容器内跑 npm/vite 会 OOM。
+#     构建前请先在本机 `cd web && npm run build`,把 web/build 上传到服务器。
 
 services:
   # 一次性初始化：提取 server CA → 通过 API 注册 agent → 签发 mTLS 证书 →
@@ -14,6 +16,8 @@ services:
     build:
       context: .
       target: agent
+      args:
+        FRONTEND_FROM: prebuilt
     entrypoint: ["/bin/sh", "/scripts/e2e-provision.sh"]
     environment:
       PITR_PASSPHRASE: ${PITR_PASSPHRASE:-pitr-test}
@@ -44,6 +48,8 @@ services:
     build:
       context: .
       target: agent
+      args:
+        FRONTEND_FROM: prebuilt
     command: ["serve", "--config=/etc/agent/config.json", "--passphrase=${PITR_PASSPHRASE:-pitr-test}"]
     depends_on:
       provision:
@@ -62,6 +68,8 @@ services:
     build:
       context: .
       target: server
+      args:
+        FRONTEND_FROM: prebuilt
     ports:
       - "8080:8080"
       - "9443:9443"

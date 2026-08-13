@@ -101,6 +101,13 @@ docker compose up -d
 
 The SvelteKit frontend is embedded in the server binary at build time (the Dockerfile's multi-stage build copies `web/build` into the `go:embed` tree) — there is no separate web container.
 
+> **Low-memory servers (2C2G)**: the compose build uses a **pre-built frontend** (`FRONTEND_FROM=prebuilt`) so `npm ci` / Vite never runs inside the container — it OOMs under 2 GB RAM. Build the frontend locally and upload it before `docker compose up -d --build`:
+> ```bash
+> cd web && npm run build                # local (Node 22+)
+> scp -r web/build user@<server>:/path/to/project/web/build
+> ```
+> Plain `docker build --target server .` stays self-contained (builds the frontend in-container).
+
 ### Run the server
 
 ```bash

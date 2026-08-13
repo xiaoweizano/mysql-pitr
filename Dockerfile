@@ -19,9 +19,22 @@ RUN npm run build
 # favicon.svg, robots.txt).
 
 # =============================================================================
+# Stage 1b: Prebuilt frontend (skip the in-container frontend build)
+# Reads web/build straight from the build context (produced locally by
+# `npm run build`, then uploaded). Only referenced when FRONTEND_FROM=prebuilt;
+# a missing web/build fails here with a clear COPY error.
+# =============================================================================
+FROM scratch AS prebuilt
+COPY web/build /web/build
+
+# =============================================================================
 # Stage 2: Go build
 # =============================================================================
 FROM golang:1.25-alpine AS builder
+
+# Frontend source: frontend (in-container build, default, self-contained) or
+# prebuilt (take web/build from the build context — for low-RAM servers).
+ARG FRONTEND_FROM=frontend
 
 RUN apk add --no-cache git ca-certificates
 
@@ -45,7 +58,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
 # compiled in at build time via go:embed (internal/server/embed.go) — it is
 # NOT shipped as files in the image. Without this step the server binary
 # would serve the placeholder stub instead of the real UI.
-COPY --from=frontend /web/build ./internal/server/embed_build/
+COPY --from=${FRONTEND_FROM} /web/build ./internal/server/embed_build/
 
 # Build server binary.
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \

@@ -1,8 +1,8 @@
 # 缩小构建上下文:小内存机器上,上下文越大,构建越容易卡死
+# 注意:web/build 不能排除——低内存服务器用 prebuilt 前端,必须从上下文读取它
 .git
 .claude
 **/node_modules
-**/build
 **/.svelte-kit
 .env
 .env.*
