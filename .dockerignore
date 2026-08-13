@@ -1,0 +1,13 @@
+# 缩小构建上下文:小内存机器上,上下文越大,构建越容易卡死
+.git
+.claude
+**/node_modules
+**/build
+**/.svelte-kit
+.env
+.env.*
+!.env.example
+docs
+Makefile
+README.md
+README.zh-CN.md

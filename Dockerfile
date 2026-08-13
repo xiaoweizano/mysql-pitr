@@ -7,6 +7,9 @@ FROM node:20-alpine AS frontend
 
 WORKDIR /web
 
+# 小内存机器(2C2G)构建:限制 Node 堆内存,避免 npm ci / vite build 时 OOM 卡死
+ENV NODE_OPTIONS="--max-old-space-size=768"
+
 COPY web/package*.json ./
 RUN npm ci
 
@@ -23,6 +26,9 @@ FROM golang:1.25-alpine AS builder
 RUN apk add --no-cache git ca-certificates
 
 WORKDIR /src
+
+# 串行编译:2 核并行编译的峰值内存 >1.5GB,小内存机器必 OOM
+ENV GOFLAGS="-p=1"
 
 # Cache dependency downloads.
 COPY go.mod go.sum ./
