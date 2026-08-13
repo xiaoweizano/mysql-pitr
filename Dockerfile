@@ -1,5 +1,9 @@
 # syntax=docker/dockerfile:1
 
+# 前端来源:frontend(容器内构建,默认,自包含)或 prebuilt(取上下文 web/build,低内存服务器)。
+# 必须在全局作用域声明:COPY --from 不支持变量展开,只能经 FROM 中转。
+ARG FRONTEND_FROM=frontend
+
 # =============================================================================
 # Stage 1: Frontend build
 # =============================================================================
@@ -28,13 +32,15 @@ FROM scratch AS prebuilt
 COPY web/build /web/build
 
 # =============================================================================
+# Stage 1c: Resolve the frontend source chosen by FRONTEND_FROM
+# (workaround: --from does not support variable expansion)
+# =============================================================================
+FROM ${FRONTEND_FROM} AS frontend-src
+
+# =============================================================================
 # Stage 2: Go build
 # =============================================================================
 FROM golang:1.25-alpine AS builder
-
-# Frontend source: frontend (in-container build, default, self-contained) or
-# prebuilt (take web/build from the build context — for low-RAM servers).
-ARG FRONTEND_FROM=frontend
 
 RUN apk add --no-cache git ca-certificates
 
@@ -58,7 +64,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
 # compiled in at build time via go:embed (internal/server/embed.go) — it is
 # NOT shipped as files in the image. Without this step the server binary
 # would serve the placeholder stub instead of the real UI.
-COPY --from=${FRONTEND_FROM} /web/build ./internal/server/embed_build/
+COPY --from=frontend-src /web/build ./internal/server/embed_build/
 
 # Build server binary.
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
