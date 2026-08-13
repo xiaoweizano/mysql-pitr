@@ -25,6 +25,15 @@ DATA_DIR="/var/lib/mysql-pitr"
 CONFIG_DIR="/etc/agent"
 PASSPHRASE="${PITR_PASSPHRASE:-pitr-test}"
 
+# 幂等:agent-config 卷在 docker compose down 后仍保留,config.json 存在即说明
+# 此前已注册 agent 并签发过证书。每次 up 都无条件注册会在 server 库里留下重复
+# agent 记录(旧容器已删除的 agent 显示为 offline)。如需强制重新注册:
+#   docker compose down && docker volume rm <项目名>_agent-config
+if [ -f "$CONFIG_DIR/config.json" ]; then
+  echo "[provision] config.json exists — agent already provisioned, skipping"
+  exit 0
+fi
+
 # Host MySQL connection (configured via .env, see docker-compose.yml).
 MYSQL_HOST="${MYSQL_HOST:-host.docker.internal}"
 MYSQL_PORT="${MYSQL_PORT:-3306}"
