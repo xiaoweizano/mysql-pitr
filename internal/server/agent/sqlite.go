@@ -126,6 +126,12 @@ func (s *SQLiteAgentStore) Delete(id string) error {
 	return nil
 }
 
+// MarkAllOffline marks every agent offline (see the interface doc).
+func (s *SQLiteAgentStore) MarkAllOffline() error {
+	_, err := s.db.Exec("UPDATE agents SET status = 'offline'")
+	return err
+}
+
 // scanAgent reads one agent row (in agentColumns order) from a scanner.
 func scanAgent(row interface{ Scan(...any) error }) (*AgentRecord, error) {
 	var agent AgentRecord

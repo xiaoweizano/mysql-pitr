@@ -29,6 +29,11 @@ type AgentStore interface {
 	ListByOrg(orgID string) ([]*AgentRecord, error)
 	Update(agent *AgentRecord) error
 	Delete(id string) error
+	// MarkAllOffline marks every agent offline. Called at server startup:
+	// agents that reconnect are set online again by the hub lifecycle hook,
+	// stale records (whose containers are gone) stay offline instead of
+	// showing a stale "online" state.
+	MarkAllOffline() error
 }
 
 // InMemoryAgentStore is a thread-safe in-memory implementation of AgentStore.
@@ -112,6 +117,16 @@ func (s *InMemoryAgentStore) Delete(id string) error {
 		return fmt.Errorf("agent not found: %s", id)
 	}
 	delete(s.agents, id)
+	return nil
+}
+
+// MarkAllOffline marks every agent offline (see the interface doc).
+func (s *InMemoryAgentStore) MarkAllOffline() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, a := range s.agents {
+		a.Status = "offline"
+	}
 	return nil
 }
 

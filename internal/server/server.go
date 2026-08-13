@@ -198,6 +198,14 @@ func newServer(dataDir string, commander pitr.AgentCommander) (*Server, error) {
 		log.Printf("server: pitr startup reconcile: %v", err)
 	}
 
+	// Mark all agents offline: nothing is connected at boot. Agents that
+	// reconnect are set online by the hub lifecycle hook; stale records
+	// (whose containers no longer exist) stay offline instead of showing a
+	// stale "online" state.
+	if err := agentStore.MarkAllOffline(); err != nil {
+		log.Printf("server: mark agents offline: %v", err)
+	}
+
 	return srv, nil
 }
 
