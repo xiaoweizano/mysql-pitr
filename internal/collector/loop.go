@@ -1,9 +1,12 @@
 package collector
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log/slog"
 	"os"
@@ -185,11 +188,71 @@ func copyFilePrefix(src, dst string, limit int64) error {
 		_ = os.Remove(partial)
 		return fmt.Errorf("collector: copy %s: %w", src, copyErr)
 	}
+	if err := clearInUseFlag(partial); err != nil {
+		_ = os.Remove(partial)
+		return fmt.Errorf("collector: clear in-use flag %s: %w", partial, err)
+	}
 	if err := os.Rename(partial, dst); err != nil {
 		_ = os.Remove(partial)
 		return fmt.Errorf("collector: rename %s: %w", dst, err)
 	}
 	return nil
+}
+
+// clearInUseFlag 修复「活跃 binlog 文件」回填副本的 FDE 校验不一致。
+//
+// mysqld 创建 binlog 文件时按 flags=0 计算并写入 FDE 校验和,随后直接把
+// LOG_EVENT_BINLOG_IN_USE_F(0x0001)标志位写进 FDE 头而不重算 CRC(文件
+// 干净关闭时同样只回写标志位)。因此正在写入的 binlog 文件,其 FDE 的严格
+// CRC 校验(parser.SetVerifyChecksum(true),扫描引擎与封口验证均使用)必然
+// 失败——线上实测 MySQL 8.0.46 的活跃文件即如此。
+//
+// 归档副本不是"使用中"文件:把标志位清零后 CRC 恰好恢复一致(等价于正常
+// 关闭后的文件)。仅当清零使校验确实通过时才落盘修改;本来就一致的文件、
+// 或清零也无法修复的文件(真损坏)都保持原样。
+func clearInUseFlag(path string) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	head := make([]byte, 23) // magic(4) + FDE header(19)
+	if _, err := io.ReadFull(f, head); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil // 不足一个事件头(极短前缀),无可修复
+		}
+		return err
+	}
+	if !bytes.Equal(head[:4], []byte{0xfe, 0x62, 0x69, 0x6e}) ||
+		head[8] != byte(replication.FORMAT_DESCRIPTION_EVENT) {
+		return nil // 非 binlog 或首事件不是 FDE(不应发生),不动
+	}
+	if head[21] == 0 && head[22] == 0 {
+		return nil // 无 in-use 标志
+	}
+
+	evSize := binary.LittleEndian.Uint32(head[13:17])
+	if evSize <= replication.EventHeaderSize+replication.BinlogChecksumLength || evSize > 1<<16 {
+		return nil // 尺度异常(FDE 实际约 120B),不动
+	}
+	ev := make([]byte, evSize)
+	if _, err := f.ReadAt(ev, 4); err != nil {
+		return nil // FDE 不完整(截断/损坏的副本),保持原样交给校验失败暴露
+	}
+	crcLen := replication.BinlogChecksumLength
+	stored := binary.LittleEndian.Uint32(ev[len(ev)-crcLen:])
+	if crc32.ChecksumIEEE(ev[:len(ev)-crcLen]) == stored {
+		return nil // 校验本来就一致(含标志位的 CRC 变体),不动
+	}
+	patched := append([]byte(nil), ev...)
+	patched[17] = 0
+	patched[18] = 0
+	if crc32.ChecksumIEEE(patched[:len(patched)-crcLen]) != stored {
+		return nil // 清零也修不好(真损坏),不动
+	}
+	_, err = f.WriteAt([]byte{0, 0}, 21)
+	return err
 }
 
 // saveStateRetry 持久化状态并重试：SaveState 是极小原子写，瞬态失败
