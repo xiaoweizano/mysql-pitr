@@ -14,14 +14,19 @@ type Handler struct {
 	orgStore  OrgStore
 	userStore auth.UserStore
 	jwtSecret []byte
+	// reassignAgents is called before an org is deleted. It moves all agents
+	// belonging to orgID to a fallback org. nil disables agent reassignment.
+	reassignAgents func(orgID, fallbackOrgID string) error
 }
 
-// NewHandler creates an org Handler.
-func NewHandler(orgStore OrgStore, userStore auth.UserStore, jwtSecret []byte) *Handler {
+// NewHandler creates an org Handler. reassignAgents is optional (may be nil);
+// when set, deleting an org reassigns its agents to a fallback org.
+func NewHandler(orgStore OrgStore, userStore auth.UserStore, jwtSecret []byte, reassignAgents func(orgID, fallbackOrgID string) error) *Handler {
 	return &Handler{
-		orgStore:  orgStore,
-		userStore: userStore,
-		jwtSecret: jwtSecret,
+		orgStore:       orgStore,
+		userStore:      userStore,
+		jwtSecret:      jwtSecret,
+		reassignAgents: reassignAgents,
 	}
 }
 
@@ -274,6 +279,88 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]bool{"success": true})
+}
+
+// DeleteWithAgentReassignment removes an organisation, reassigning its agents
+// to a fallback org first so they are not orphaned. When reassignAgents is nil,
+// falls back to the basic Delete behavior.
+func (h *Handler) DeleteWithAgentReassignment(w http.ResponseWriter, r *http.Request) {
+	userID := userIDFromRequest(r)
+	if userID == "" {
+		writeError(w, http.StatusUnauthorized, "not authenticated")
+		return
+	}
+
+	orgID := chi.URLParam(r, "id")
+	if orgID == "" {
+		writeError(w, http.StatusBadRequest, "missing org id")
+		return
+	}
+
+	// Verify the requester is an admin of this org.
+	members, err := h.orgStore.ListMembers(orgID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	isAdmin := false
+	for _, m := range members {
+		if m.UserID == userID && m.Role == "admin" {
+			isAdmin = true
+			break
+		}
+	}
+	if !isAdmin {
+		writeError(w, http.StatusForbidden, "only admins can delete organisations")
+		return
+	}
+
+	// Find or create a fallback org for orphaned agents.
+	if h.reassignAgents != nil {
+		fallbackOrgID, ferr := h.ensureFallbackOrg(userID, orgID)
+		if ferr != nil {
+			writeError(w, http.StatusInternalServerError, ferr.Error())
+			return
+		}
+		if fallbackOrgID != "" {
+			if err := h.reassignAgents(orgID, fallbackOrgID); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
+	}
+
+	if err := h.orgStore.Delete(orgID); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]bool{"success": true})
+}
+
+// ensureFallbackOrg finds an existing org the user belongs to (other than
+// excludeID) or creates a default one. Returns the fallback org ID, or ""
+// if the user has no other org and creation failed.
+func (h *Handler) ensureFallbackOrg(userID, excludeID string) (string, error) {
+	orgs, err := h.orgStore.ListByUserID(userID)
+	if err != nil {
+		return "", err
+	}
+	for _, o := range orgs {
+		if o.ID != excludeID {
+			return o.ID, nil
+		}
+	}
+	// No other org — create a default one.
+	defaultOrg := &Organization{Name: "默认组织"}
+	if err := h.orgStore.Create(defaultOrg); err != nil {
+		return "", err
+	}
+	if err := h.orgStore.AddMember(defaultOrg.ID, userID, "admin"); err != nil {
+		return "", err
+	}
+	return defaultOrg.ID, nil
 }
 
 // ListMembers returns all members of an organisation.

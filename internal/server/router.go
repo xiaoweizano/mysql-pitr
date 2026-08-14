@@ -53,7 +53,7 @@ func newWebRouter(
 			r.Post("/", orgHandler.Create)
 
 			r.Route("/{id}", func(r chi.Router) {
-				r.Delete("/", orgHandler.Delete)
+				r.Delete("/", orgHandler.DeleteWithAgentReassignment)
 				r.Post("/invite", orgHandler.Invite)
 				r.Post("/accept", orgHandler.AcceptInvite)
 				r.Get("/members", orgHandler.ListMembers)
@@ -158,7 +158,7 @@ func NewRouter() *chi.Mux {
 	auditStore := audit.NewInMemoryAuditStore()
 
 	authHandler := auth.NewHandler(userStore, jwtSecret)
-	orgHandler := org.NewHandler(orgStore, userStore, jwtSecret)
+	orgHandler := org.NewHandler(orgStore, userStore, jwtSecret, nil)
 	agentHandler := agent.NewHandler(agentStore, orgStore, jwtSecret, nil)
 	pitrHandler := pitr.NewHandler(pitrStore, agentStore, orgStore, auditStore, pitr.NewEventBus(), nil, jwtSecret)
 	auditHandler := audit.NewHandler(auditStore, orgStore, jwtSecret)

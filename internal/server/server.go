@@ -89,7 +89,20 @@ func newServer(dataDir string, commander pitr.AgentCommander) (*Server, error) {
 
 	// ---- handlers ----
 	authHandler := auth.NewHandler(userStore, jwtSecret())
-	orgHandler := org.NewHandler(orgStore, userStore, jwtSecret())
+	reassignFn := func(fromOrgID, toOrgID string) error {
+		agents, err := agentStore.ListByOrg(fromOrgID)
+		if err != nil {
+			return err
+		}
+		for _, a := range agents {
+			a.OrgID = toOrgID
+			if err := agentStore.Update(a); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	orgHandler := org.NewHandler(orgStore, userStore, jwtSecret(), reassignFn)
 	agentHandler := agent.NewHandler(agentStore, orgStore, jwtSecret(), agentHub)
 	pitrBus := pitr.NewEventBus()
 	if commander == nil {
