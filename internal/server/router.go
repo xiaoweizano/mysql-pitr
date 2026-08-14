@@ -53,6 +53,7 @@ func newWebRouter(
 			r.Post("/", orgHandler.Create)
 
 			r.Route("/{id}", func(r chi.Router) {
+				r.Delete("/", orgHandler.Delete)
 				r.Post("/invite", orgHandler.Invite)
 				r.Post("/accept", orgHandler.AcceptInvite)
 				r.Get("/members", orgHandler.ListMembers)

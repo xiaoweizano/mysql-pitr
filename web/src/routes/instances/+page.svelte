@@ -25,6 +25,7 @@
 		rejectAgent,
 		type AgentInfo
 	} from '$lib/api/agents.js';
+	import Pagination from '$lib/components/Pagination.svelte';
 
 	// State (Svelte 5 runes). Everything optional → no blank flash: an empty
 	// list renders the empty state, a failed fetch renders an inline error with
@@ -37,6 +38,10 @@
 
 	let actionError = $state<string | null>(null);
 	let pendingId = $state<string | null>(null);
+	let page = $state(1);
+	let pageSize = $state(10);
+
+	const pagedAgents = $derived(agents.slice((page - 1) * pageSize, page * pageSize));
 
 	/**
 	 * Load orgs, then agents per org. `GET /api/agents` requires an `orgId`
@@ -54,8 +59,12 @@
 			const all: AgentInfo[] = [];
 			for (const org of orgs) {
 				names[org.id] = org.name;
-				const list = await listAgents(org.id);
-				all.push(...list);
+				try {
+					const list = await listAgents(org.id);
+					all.push(...list);
+				} catch {
+					// Per-org agent fetch failure should not break the whole page.
+				}
 			}
 			orgNames = names;
 			agents = all;
@@ -140,6 +149,9 @@
 			<h1 class="text-xl font-semibold text-zinc-900">{t('instances.title')}</h1>
 			<p class="text-sm text-zinc-500">{t('instances.subtitle')}</p>
 		</div>
+		<Button variant="outline" size="sm" onclick={load} disabled={loading}>
+			{loading ? t('common.loading') : t('common.retry')}
+		</Button>
 	</div>
 
 	{#if loadError}
@@ -191,7 +203,7 @@
 						</TableRow>
 					</TableHeader>
 					<TableBody>
-						{#each agents as a (a.id)}
+						{#each pagedAgents as a (a.id)}
 							<TableRow
 								class="cursor-pointer"
 								onclick={() => goDetail(a.id)}
@@ -259,5 +271,8 @@
 				</Table>
 			</CardContent>
 		</Card>
+		<div class="mt-3">
+			<Pagination total={agents.length} bind:page bind:pageSize />
+		</div>
 	{/if}
 </div>

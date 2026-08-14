@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 )
 
@@ -30,4 +31,20 @@ func SaveCheckpoint(db *sql.DB, opID string, lastStmt, total int, errorsJSON str
 		return fmt.Errorf("store: save checkpoint %s: %w", opID, err)
 	}
 	return nil
+}
+
+// LoadCheckpoint reads the execution checkpoint for an operation. Returns
+// (0, 0, "", false, nil) when no checkpoint exists for the operation.
+func LoadCheckpoint(db *sql.DB, opID string) (lastStmt, total int, errorsJSON string, found bool, err error) {
+	err = db.QueryRow(
+		"SELECT last_statement, total, errors FROM checkpoints WHERE op_id = ?",
+		opID,
+	).Scan(&lastStmt, &total, &errorsJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, 0, "", false, nil
+	}
+	if err != nil {
+		return 0, 0, "", false, fmt.Errorf("store: load checkpoint %s: %w", opID, err)
+	}
+	return lastStmt, total, errorsJSON, true, nil
 }

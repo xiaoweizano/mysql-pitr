@@ -24,6 +24,7 @@
 	import { queryAudit, exportAuditCsv, type AuditEntry } from '$lib/api/audit.js';
 	import { formatDateTime, shortId } from '$lib/format.js';
 	import { ChevronDown, ChevronRight, Download } from '@lucide/svelte';
+	import Pagination from '$lib/components/Pagination.svelte';
 
 	/**
 	 * Audit log page — filtered query over `GET /api/audit` with CSV export.
@@ -65,6 +66,11 @@
 
 	/** operationId of the row whose detail (errorDetails etc.) is expanded. */
 	let expandedId = $state<string | null>(null);
+
+	let page = $state(1);
+	let pageSize = $state(10);
+
+	const pagedEntries = $derived(entries.slice((page - 1) * pageSize, page * pageSize));
 
 	let exporting = $state(false);
 	let exportError = $state<string | null>(null);
@@ -325,7 +331,7 @@
 						</TableRow>
 					</TableHeader>
 					<TableBody>
-						{#each entries as e (e.operationId)}
+						{#each pagedEntries as e (e.operationId)}
 							{@const expanded = expandedId === e.operationId}
 							<TableRow
 								class="cursor-pointer"
@@ -389,5 +395,8 @@
 				</Table>
 			</CardContent>
 		</Card>
+		<div class="mt-3">
+			<Pagination total={entries.length} bind:page bind:pageSize />
+		</div>
 	{/if}
 </div>

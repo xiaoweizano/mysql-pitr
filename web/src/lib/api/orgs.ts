@@ -77,3 +77,13 @@ export function acceptInvite(orgId: string, code: string): Promise<OrgInfo> {
 		body: JSON.stringify({ code })
 	}).then((r) => r.organization);
 }
+
+/**
+ * Delete an organisation (admin only).
+ * `DELETE /api/orgs/{id}` → 200 `{ success: true }`.
+ */
+export function deleteOrg(orgId: string): Promise<void> {
+	return apiFetch<void>(`/orgs/${encodeURIComponent(orgId)}`, {
+		method: 'DELETE'
+	});
+}

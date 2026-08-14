@@ -35,6 +35,7 @@ type Invite struct {
 type OrgStore interface {
 	Create(org *Organization) error
 	Get(id string) (*Organization, error)
+	Delete(id string) error
 	ListAll() ([]*Organization, error)
 	ListByUserID(userID string) ([]*Organization, error)
 	AddMember(orgID, userID, role string) error
@@ -87,6 +88,19 @@ func (s *InMemoryOrgStore) Get(id string) (*Organization, error) {
 		return nil, fmt.Errorf("organisation not found: %s", id)
 	}
 	return org, nil
+}
+
+// Delete removes an organisation and all its members.
+func (s *InMemoryOrgStore) Delete(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.orgs[id]; !ok {
+		return fmt.Errorf("organisation not found: %s", id)
+	}
+	delete(s.orgs, id)
+	delete(s.members, id)
+	return nil
 }
 
 // ListAll returns all organisations.

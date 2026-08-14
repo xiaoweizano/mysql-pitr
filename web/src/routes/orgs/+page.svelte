@@ -25,11 +25,12 @@
 		listMembers,
 		inviteMember,
 		acceptInvite,
+		deleteOrg,
 		type OrgInfo,
 		type OrgMember
 	} from '$lib/api/orgs.js';
 	import { formatDateTime } from '$lib/format.js';
-	import { Building2, Check, Copy, UserPlus } from '@lucide/svelte';
+	import { Building2, Check, Copy, Trash2, UserPlus } from '@lucide/svelte';
 
 	/**
 	 * Organisations page — list the user's orgs with their members, create a
@@ -63,6 +64,10 @@
 	let accepting = $state(false);
 	let acceptError = $state<string | null>(null);
 	let acceptSuccess = $state<string | null>(null);
+
+	// Delete org.
+	let deleteError = $state<string | null>(null);
+	let deletingOrgId = $state<string | null>(null);
 
 	// 复制组织 ID / 邀请码（完整值复制，页面显示截断不影响复制）
 	let copied = $state<string | null>(null);
@@ -168,6 +173,22 @@
 			acceptError = e instanceof Error ? e.message : String(e);
 		} finally {
 			accepting = false;
+		}
+	}
+
+	async function handleDelete(orgId: string) {
+		if (!window.confirm(t('orgs.deleteConfirm'))) return;
+		deletingOrgId = orgId;
+		deleteError = null;
+		try {
+			await deleteOrg(orgId);
+			orgs = orgs.filter((o) => o.id !== orgId);
+			const { [orgId]: _, ...rest } = membersByOrg;
+			membersByOrg = rest;
+		} catch (e) {
+			deleteError = e instanceof Error ? e.message : String(e);
+		} finally {
+			deletingOrgId = null;
 		}
 	}
 
@@ -333,6 +354,11 @@
 								{t('orgs.inviteError')}：{inviteError}
 							</p>
 						{/if}
+						{#if deleteError}
+							<p class="mb-3 text-sm text-destructive" role="alert">
+								{t('orgs.deleteError')}：{deleteError}
+							</p>
+						{/if}
 						{#if inviteCodes[o.id]}
 							<div class="mb-3 flex items-center gap-2 rounded-lg border border-dashed px-3 py-2">
 								<span class="text-sm text-zinc-500">{t('orgs.inviteCode')}：</span>
@@ -376,7 +402,7 @@
 								{/each}
 							</TableBody>
 						</Table>
-						<div class="mt-3">
+						<div class="mt-3 flex items-center gap-2">
 							<Button
 								variant="outline"
 								size="sm"
@@ -384,6 +410,15 @@
 								onclick={() => void handleInvite(o.id)}
 							>
 								{invitingOrgId === o.id ? t('common.loading') : t('orgs.invite')}
+							</Button>
+							<Button
+								variant="destructive"
+								size="sm"
+								disabled={deletingOrgId !== null}
+								onclick={() => void handleDelete(o.id)}
+							>
+								<Trash2 class="size-3.5" />
+								{deletingOrgId === o.id ? t('common.loading') : t('orgs.delete')}
 							</Button>
 						</div>
 					</CardContent>

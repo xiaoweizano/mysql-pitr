@@ -13,6 +13,7 @@
 	import { listOrgs } from '$lib/api/orgs.js';
 	import { formatDateTime, tablesLabel } from '$lib/format.js';
 	import { History } from '@lucide/svelte';
+	import Pagination from '$lib/components/Pagination.svelte';
 
 	/**
 	 * Operation history list — all PITR operations of the user's
@@ -24,15 +25,20 @@
 	let loading = $state(true);
 	let loadError = $state<string | null>(null);
 	let operations = $state<OperationListItem[]>([]);
+	let page = $state(1);
+	let pageSize = $state(10);
+
+	const pagedOps = $derived(operations.slice((page - 1) * pageSize, page * pageSize));
 
 	async function load() {
 		loading = true;
 		loadError = null;
 		try {
 			const orgs = await listOrgs();
-			const perOrg = await Promise.all(orgs.map((o) => listOperations(o.id)));
-			const merged = perOrg
-				.flat()
+			const results = await Promise.allSettled(orgs.map((o) => listOperations(o.id)));
+			const merged = results
+				.filter((r): r is PromiseFulfilledResult<Awaited<ReturnType<typeof listOperations>>> => r.status === 'fulfilled')
+				.flatMap((r) => r.value)
 				.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 			operations = merged;
 		} catch (e) {
@@ -136,7 +142,7 @@
 							</tr>
 						</thead>
 						<tbody>
-							{#each operations as op (op.id)}
+							{#each pagedOps as op (op.id)}
 								<tr class="border-b border-zinc-100 align-middle">
 									<td class="px-4 py-2.5">
 										<div class="flex items-center gap-2">
@@ -176,5 +182,8 @@
 				</div>
 			</CardContent>
 		</Card>
+		<div class="mt-3">
+			<Pagination total={operations.length} bind:page bind:pageSize />
+		</div>
 	{/if}
 </div>

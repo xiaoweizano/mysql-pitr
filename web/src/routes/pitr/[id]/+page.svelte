@@ -89,6 +89,11 @@
 				previewTruncated = txResp.previewTruncated ?? false;
 				if (isTerminalState(st.status)) {
 					// 终态预览已释放 — nothing more to stream.
+					// Initialize progress from checkpoint data so the done/total
+					// statement count is displayed correctly.
+					if (st.checkpointDone !== undefined || st.checkpointTotal !== undefined) {
+						progress = { done: st.checkpointDone ?? 0, total: st.checkpointTotal ?? 0 };
+					}
 				}
 			} catch (e) {
 				if (!stale) loadError = e instanceof Error ? e.message : String(e);

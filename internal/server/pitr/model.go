@@ -79,4 +79,7 @@ type OperationStore interface {
 	// double-write of the agent's per-batch progress, keyed by op_id in the
 	// checkpoints table). errorsJSON is the JSON-encoded executor error list.
 	SaveCheckpoint(opID string, lastStmt, total int, errorsJSON string) error
+	// LoadCheckpoint reads the execution checkpoint for an operation. Returns
+	// found=false when no checkpoint exists.
+	LoadCheckpoint(opID string) (lastStmt, total int, errorsJSON string, found bool, err error)
 }

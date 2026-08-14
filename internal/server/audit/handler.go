@@ -183,8 +183,8 @@ func (h *Handler) Export(w http.ResponseWriter, r *http.Request) {
 
 	// Header row.
 	_ = writer.Write([]string{
-		"operationId", "operator", "timestamp", "orgId", "agentId",
-		"targetTable", "recoveryTime", "rowsAffected", "status", "errorDetails",
+		"操作ID", "操作人", "时间", "组织ID", "实例ID",
+		"目标表", "恢复时间", "影响行数", "状态", "错误详情",
 	})
 
 	for _, e := range entries {

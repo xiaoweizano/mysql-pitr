@@ -63,6 +63,35 @@ func (s *SQLiteOrgStore) Get(id string) (*Organization, error) {
 	return &org, nil
 }
 
+// Delete removes an organisation and all its members and invites.
+func (s *SQLiteOrgStore) Delete(id string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var one int
+	err = tx.QueryRow("SELECT 1 FROM orgs WHERE id = ?", id).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("organisation not found: %s", id)
+	}
+	if err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec("DELETE FROM members WHERE org_id = ?", id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM invites WHERE org_id = ?", id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM orgs WHERE id = ?", id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ListAll returns all organisations.
 func (s *SQLiteOrgStore) ListAll() ([]*Organization, error) {
 	rows, err := s.db.Query("SELECT id, name, created_at FROM orgs ORDER BY rowid")

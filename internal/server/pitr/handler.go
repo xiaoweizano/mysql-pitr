@@ -110,6 +110,11 @@ type statusResponse struct {
 	// the operation's MaxPreview cap (more transactions were scanned than fit in
 	// the preview). Present only when true.
 	PreviewTruncated bool `json:"previewTruncated,omitempty"`
+	// CheckpointDone is the number of statements executed (from the checkpoint).
+	// Present only when a checkpoint exists (terminal operations).
+	CheckpointDone int `json:"checkpointDone,omitempty"`
+	// CheckpointTotal is the total number of statements (from the checkpoint).
+	CheckpointTotal int `json:"checkpointTotal,omitempty"`
 }
 
 type cancelResponse struct {
@@ -1127,7 +1132,7 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, statusResponse{
+	resp := statusResponse{
 		ID:               op.ID,
 		OrgID:            op.OrgID,
 		AgentID:          op.AgentID,
@@ -1138,7 +1143,14 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:        op.CreatedAt,
 		UpdatedAt:        op.UpdatedAt,
 		PreviewTruncated: h.previewTruncated(op.ID),
-	})
+	}
+	if IsTerminal(op.Status) {
+		if lastStmt, total, _, found, err := h.opStore.LoadCheckpoint(op.ID); err == nil && found {
+			resp.CheckpointDone = lastStmt
+			resp.CheckpointTotal = total
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // Transactions returns the in-memory scan preview of an operation: the ordered
@@ -1670,7 +1682,7 @@ func (h *Handler) Events(w http.ResponseWriter, r *http.Request) {
 	// An operation that is already terminal has no live agent stream: emit a
 	// synthetic terminal frame so the client does not hang.
 	if IsTerminal(op.Status) {
-		writeSSEFrame(w, syntheticTerminalEvent(op))
+		writeSSEFrame(w, h.syntheticTerminalEvent(op))
 		flusher.Flush()
 		return
 	}
@@ -1702,7 +1714,7 @@ func (h *Handler) Events(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if IsTerminal(cur.Status) {
-				writeSSEFrame(w, syntheticTerminalEvent(cur))
+				writeSSEFrame(w, h.syntheticTerminalEvent(cur))
 				flusher.Flush()
 				return
 			}
@@ -1730,13 +1742,20 @@ func isTerminalKind(kind string) bool {
 // a terminal state without an agent notification (e.g. a local cancel), or was
 // already terminal when the client subscribed. The payload carries the
 // terminal state so the client can reconcile with /status; cancelled maps to
-// op_done with {"status":"cancelled"} to disambiguate.
-func syntheticTerminalEvent(op *Operation) ws.StreamEvent {
+// op_done with {"status":"cancelled"} to disambiguate. When a checkpoint
+// exists (execution progress was recorded), done and total are included so
+// the front-end can display the correct statement count.
+func (h *Handler) syntheticTerminalEvent(op *Operation) ws.StreamEvent {
 	kind := ws.EvOpDone
 	switch op.Status {
 	case StateFailed, StateBlocked:
 		kind = ws.EvOpError
 	}
-	data, _ := json.Marshal(map[string]string{"status": string(op.Status)})
+	payload := map[string]interface{}{"status": string(op.Status)}
+	if lastStmt, total, _, found, err := h.opStore.LoadCheckpoint(op.ID); err == nil && found {
+		payload["done"] = lastStmt
+		payload["total"] = total
+	}
+	data, _ := json.Marshal(payload)
 	return ws.StreamEvent{ID: op.ID, Kind: kind, Data: data}
 }

@@ -162,7 +162,7 @@
 	// authoritative archive state) and advance the wizard from the snapshot when
 	// it reports ready. Outside step 3 this poll also preserves the original
 	// fallback of observing terminal transitions while the stream is down.
-	const SCAN_POLL_MS = 10_000;
+	const SCAN_POLL_MS = 3_000;
 	$effect(() => {
 		const id = opId;
 		if (

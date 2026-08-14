@@ -233,6 +233,49 @@ func (h *Handler) AcceptInvite(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, acceptInviteResponse{Organization: org})
 }
 
+// Delete removes an organisation. Only admins of the org may delete it.
+//
+// DELETE /api/orgs/{id}
+func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
+	userID := userIDFromRequest(r)
+	if userID == "" {
+		writeError(w, http.StatusUnauthorized, "not authenticated")
+		return
+	}
+
+	orgID := chi.URLParam(r, "id")
+	if orgID == "" {
+		writeError(w, http.StatusBadRequest, "missing org id")
+		return
+	}
+
+	// Verify the requester is an admin of this org.
+	members, err := h.orgStore.ListMembers(orgID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	isAdmin := false
+	for _, m := range members {
+		if m.UserID == userID && m.Role == "admin" {
+			isAdmin = true
+			break
+		}
+	}
+	if !isAdmin {
+		writeError(w, http.StatusForbidden, "only admins can delete organisations")
+		return
+	}
+
+	if err := h.orgStore.Delete(orgID); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]bool{"success": true})
+}
+
 // ListMembers returns all members of an organisation.
 //
 // GET /api/orgs/{id}/members

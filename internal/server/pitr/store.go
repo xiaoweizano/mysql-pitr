@@ -329,6 +329,12 @@ func (s *SQLiteOperationStore) SaveCheckpoint(opID string, lastStmt, total int, 
 	return store.SaveCheckpoint(s.db, opID, lastStmt, total, errorsJSON)
 }
 
+// LoadCheckpoint reads the execution checkpoint for an operation. Returns
+// found=false when no checkpoint exists.
+func (s *SQLiteOperationStore) LoadCheckpoint(opID string) (lastStmt, total int, errorsJSON string, found bool, err error) {
+	return store.LoadCheckpoint(s.db, opID)
+}
+
 // scanOperation reads one operations row (in opColumns order) from a scanner.
 func scanOperation(row interface{ Scan(...any) error }) (*Operation, error) {
 	var op Operation

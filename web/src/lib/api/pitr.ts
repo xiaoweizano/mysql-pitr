@@ -109,6 +109,10 @@ export interface OperationStatus {
 	updatedAt: string;
 	/** True when the in-memory preview was cut short by MaxPreview. */
 	previewTruncated?: boolean;
+	/** Statements executed (from checkpoint). Present for terminal operations. */
+	checkpointDone?: number;
+	/** Total statements (from checkpoint). Present for terminal operations. */
+	checkpointTotal?: number;
 }
 
 /** GET /api/pitr/{id}/transactions. */
