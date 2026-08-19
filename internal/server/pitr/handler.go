@@ -1080,10 +1080,26 @@ func (h *Handler) Start(w http.ResponseWriter, r *http.Request) {
 	p.maxEntries = previewCap(req.MaxPreview)
 	p.mu.Unlock()
 
+	// Move the operation to `scanning` BEFORE the scan command leaves: the
+	// hub processes agent stream events (tx_meta / scan_done) in their own
+	// goroutines, so a fast scan can deliver scan_done before a post-send
+	// transition would land — scan_done would find the op still `created`,
+	// reject the invalid created->ready transition, and the op would be stuck
+	// in scanning forever (no second scan_done is coming). Every failure path
+	// below is a valid transition from scanning: offline -> blocked,
+	// transport failure / agent rejection -> failed.
+	if ok, err := h.transitionTo(op, StateScanning); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	} else if !ok {
+		writeError(w, http.StatusConflict, "operation state changed concurrently — reload and retry")
+		return
+	}
+
 	if !h.agentConnected(req.AgentID) {
-		op.Status = StateBlocked
-		op.UpdatedAt = time.Now()
-		_ = h.opStore.Update(op)
+		if ok, err := h.transitionTo(op, StateBlocked); err != nil || !ok {
+			log.Printf("pitr: op %s: block on offline agent: applied=%v err=%v", op.ID, ok, err)
+		}
 		writeError(w, http.StatusConflict,
 			"agent is offline — start it with `mysql-pitr-agent serve` first")
 		return
@@ -1106,14 +1122,6 @@ func (h *Handler) Start(w http.ResponseWriter, r *http.Request) {
 	if resp != nil && resp.Status == ws.StatusError {
 		h.failOperation(op, resp.Error)
 		writeError(w, http.StatusBadGateway, fmt.Sprintf("agent rejected scan: %s", resp.Error))
-		return
-	}
-
-	if ok, err := h.transitionTo(op, StateScanning); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	} else if !ok {
-		writeError(w, http.StatusConflict, "operation state changed concurrently — reload and retry")
 		return
 	}
 

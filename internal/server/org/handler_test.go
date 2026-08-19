@@ -31,7 +31,7 @@ func setupOrgTest(t *testing.T) (*Handler, *InMemoryOrgStore, *auth.InMemoryUser
 	orgStore := NewInMemoryOrgStore()
 	userStore := auth.NewInMemoryUserStore()
 	secret := []byte("org-test-secret")
-	handler := NewHandler(orgStore, userStore, secret)
+	handler := NewHandler(orgStore, userStore, secret, nil)
 	return handler, orgStore, userStore, secret
 }
 

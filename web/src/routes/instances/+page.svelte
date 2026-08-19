@@ -134,7 +134,7 @@
 		actionError = null;
 		try {
 			await rejectAgent(a.id);
-			agents = agents.map((x) => x.id === a.id ? { ...x, approved: false, status: 'rejected' } : x);
+			agents = agents.filter((x) => x.id !== a.id);
 		} catch (e) {
 			actionError = e instanceof Error ? e.message : String(e);
 		} finally {
@@ -147,8 +147,8 @@
 	<title>{t('instances.title')} · {t('app.name')}</title>
 </svelte:head>
 
-<div class="p-6">
-	<div class="flex items-center justify-between">
+<div class="flex h-full flex-col p-6">
+	<div class="flex shrink-0 flex-wrap items-center justify-between gap-3">
 		<div>
 			<h1 class="text-xl font-semibold text-zinc-900">{t('instances.title')}</h1>
 			<p class="text-sm text-zinc-500">{t('instances.subtitle')}</p>
@@ -159,7 +159,7 @@
 	</div>
 
 	{#if loadError}
-		<Card class="mt-6">
+		<Card class="mt-4 shrink-0">
 			<CardContent class="flex flex-col items-center gap-3 py-8 text-center">
 				<p class="text-sm text-destructive">
 					{t('instances.loadError')}：{loadError}
@@ -170,42 +170,39 @@
 			</CardContent>
 		</Card>
 	{:else if loading}
-		<Card class="mt-6">
+		<Card class="mt-4 shrink-0">
 			<CardContent class="flex items-center justify-center py-8 text-sm text-zinc-400">
 				{t('common.loading')}
 			</CardContent>
 		</Card>
 	{:else if agents.length === 0}
-		<Card class="mt-6">
+		<Card class="mt-4 shrink-0">
 			<CardContent class="flex flex-col items-center gap-2 py-12 text-center">
 				<p class="text-sm font-medium text-zinc-600">{t('instances.empty')}</p>
 				<p class="text-xs text-zinc-400">{t('instances.emptyDesc')}</p>
 			</CardContent>
 		</Card>
 	{:else}
-		<Card class="mt-6">
-			<CardHeader>
-				<CardTitle>{t('instances.title')}</CardTitle>
-				<CardDescription>{t('instances.subtitle')}</CardDescription>
-			</CardHeader>
-			<CardContent>
+		<Card class="mt-4 min-h-0 flex-1">
+			<CardContent class="flex min-h-0 flex-1 flex-col">
 				{#if actionError}
-					<p class="mb-4 text-sm text-destructive" role="alert">
+					<p class="mb-4 shrink-0 text-sm text-destructive" role="alert">
 						{t('instances.actionError')}：{actionError}
 					</p>
 				{/if}
 
-				<Table>
-					<TableHeader>
-						<TableRow>
-							<TableHead>{t('instances.hostname')}</TableHead>
-							<TableHead>{t('instances.org')}</TableHead>
-							<TableHead>{t('instances.mysqlVersion')}</TableHead>
-							<TableHead>{t('instance.status')}</TableHead>
-							<TableHead>{t('instance.approved')}</TableHead>
-							<TableHead class="text-right">{t('instances.actions')}</TableHead>
-						</TableRow>
-					</TableHeader>
+				<div class="min-h-0 flex-1 overflow-y-auto">
+					<Table>
+						<TableHeader>
+							<TableRow>
+								<TableHead class="sticky top-0 z-10 bg-card">{t('instances.hostname')}</TableHead>
+								<TableHead class="sticky top-0 z-10 bg-card">{t('instances.org')}</TableHead>
+								<TableHead class="sticky top-0 z-10 bg-card">{t('instances.mysqlVersion')}</TableHead>
+								<TableHead class="sticky top-0 z-10 bg-card">{t('instance.status')}</TableHead>
+								<TableHead class="sticky top-0 z-10 bg-card">{t('instance.approved')}</TableHead>
+								<TableHead class="sticky top-0 z-10 bg-card text-right">{t('instances.actions')}</TableHead>
+							</TableRow>
+						</TableHeader>
 					<TableBody>
 						{#each pagedAgents as a (a.id)}
 							<TableRow
@@ -273,9 +270,10 @@
 						{/each}
 					</TableBody>
 				</Table>
+				</div>
 			</CardContent>
 		</Card>
-		<div class="mt-3">
+		<div class="mt-3 shrink-0">
 			<Pagination total={agents.length} bind:page bind:pageSize />
 		</div>
 	{/if}

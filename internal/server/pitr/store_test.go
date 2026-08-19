@@ -266,7 +266,9 @@ func TestSaveStatementsAndSelect_Atomic(t *testing.T) {
 	require.NoError(t, s.SaveStatementsAndSelect("op_atomic", stmts, []string{"tx-1"}))
 	got, err := s.Get("op_atomic")
 	require.NoError(t, err)
-	require.Len(t, got.Statements, 2)
+	saved, err := s.LoadStatements("op_atomic")
+	require.NoError(t, err)
+	require.Len(t, saved, 2)
 	assert.Equal(t, []string{"tx-1"}, got.SelectedTxIDs)
 
 	// Failure of the second step (the operations row is missing, so the
@@ -280,7 +282,7 @@ func TestSaveStatementsAndSelect_Atomic(t *testing.T) {
 	assert.Len(t, none, 0, "statement writes must roll back with the failed selection update")
 }
 
-func TestGet_LoadsPersistedStatements(t *testing.T) {
+func TestGet_DoesNotLoadStatements(t *testing.T) {
 	s := newTestStore(t)
 	op := &Operation{ID: "op_full", OrgID: "org_a", AgentID: "agent_1", Type: "pitr", Mode: "selected", Status: StateReady}
 	require.NoError(t, s.Create(op))
@@ -288,11 +290,17 @@ func TestGet_LoadsPersistedStatements(t *testing.T) {
 		{TxIndex: 0, StmtIndex: 0, SQL: "DELETE FROM t WHERE id = 1;", TxID: "tx-1", TxOrder: 1, Status: "pending"},
 	}))
 
+	// Get is on the authorizeOp hot path (every /status poll) and must not
+	// drag the statement set along; callers load it explicitly.
 	got, err := s.Get("op_full")
 	require.NoError(t, err)
-	require.Len(t, got.Statements, 1)
-	assert.Equal(t, "DELETE FROM t WHERE id = 1;", got.Statements[0].SQL)
-	assert.Equal(t, "tx-1", got.Statements[0].TxID)
+	assert.Empty(t, got.Statements)
+
+	stmts, err := s.LoadStatements("op_full")
+	require.NoError(t, err)
+	require.Len(t, stmts, 1)
+	assert.Equal(t, "DELETE FROM t WHERE id = 1;", stmts[0].SQL)
+	assert.Equal(t, "tx-1", stmts[0].TxID)
 }
 
 func TestFilter_EmptyFilterRoundTrip(t *testing.T) {

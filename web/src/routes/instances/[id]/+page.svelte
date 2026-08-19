@@ -112,7 +112,7 @@
 	</title>
 </svelte:head>
 
-<div class="p-6">
+<div class="h-full overflow-y-auto p-6">
 	{#if loadError}
 		<Card>
 			<CardContent class="flex flex-col items-center gap-3 py-8 text-center">

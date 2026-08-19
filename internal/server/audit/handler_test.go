@@ -269,7 +269,7 @@ func TestExport_Success(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, "text/csv", w.Header().Get("Content-Type"))
 	assert.Contains(t, w.Header().Get("Content-Disposition"), "attachment; filename=")
-	assert.Contains(t, string(w.Body.Bytes()), "operationId,operator,timestamp")
+	assert.Contains(t, string(w.Body.Bytes()), "操作ID,操作人,时间")
 	assert.Contains(t, string(w.Body.Bytes()), "op_001")
 	assert.Contains(t, string(w.Body.Bytes()), "op_004")
 }

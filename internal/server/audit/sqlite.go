@@ -82,9 +82,10 @@ func (s *SQLiteAuditStore) Query(filter AuditFilter) ([]AuditEntry, error) {
 		args = append(args, filter.OperationID)
 	}
 
-	// id is AUTOINCREMENT: ascending id is insertion order.
+	// id is AUTOINCREMENT: descending id is newest-first — the audit page
+	// shows the latest state transitions at the top.
 	rows, err := s.db.Query(
-		"SELECT "+entryColumns+" FROM audit_logs WHERE "+strings.Join(where, " AND ")+" ORDER BY id",
+		"SELECT "+entryColumns+" FROM audit_logs WHERE "+strings.Join(where, " AND ")+" ORDER BY id DESC",
 		args...)
 	if err != nil {
 		return nil, err

@@ -67,6 +67,17 @@
 	/** operationId of the row whose detail (errorDetails etc.) is expanded. */
 	let expandedId = $state<string | null>(null);
 
+	/**
+	 * Unique key of one audit row. The audit trail stores one entry per state
+	 * transition, so operationId alone repeats (ready → done → … of the same
+	 * operation are separate rows) — a keyed each over operationId would
+	 * collide and break rendering. Timestamp is stored with nanosecond
+	 * precision, making the composite unique in practice.
+	 */
+	function rowKey(e: AuditEntry): string {
+		return `${e.operationId}:${e.timestamp}:${e.status}`;
+	}
+
 	let page = $state(1);
 	let pageSize = $state(10);
 
@@ -202,8 +213,8 @@
 	<title>{t('audit.title')} · {t('app.name')}</title>
 </svelte:head>
 
-<div class="p-6">
-	<div class="flex flex-wrap items-center justify-between gap-3">
+<div class="flex h-full flex-col p-6">
+	<div class="flex shrink-0 flex-wrap items-center justify-between gap-3">
 		<div>
 			<h1 class="text-xl font-semibold text-zinc-900">{t('audit.title')}</h1>
 			<p class="text-sm text-zinc-500">{t('audit.subtitle')}</p>
@@ -220,11 +231,11 @@
 	</div>
 
 	{#if exportError}
-		<p class="mt-3 text-sm text-destructive" role="alert">{t('audit.exportError')}：{exportError}</p>
+		<p class="mt-3 shrink-0 text-sm text-destructive" role="alert">{t('audit.exportError')}：{exportError}</p>
 	{/if}
 
 	{#if orgs.length > 0}
-		<Card class="mt-4">
+		<Card class="mt-4 shrink-0">
 			<CardContent>
 				<form
 					onsubmit={(e) => {
@@ -284,7 +295,7 @@
 	{/if}
 
 	{#if loadError}
-		<Card class="mt-4">
+		<Card class="mt-4 shrink-0">
 			<CardContent class="flex flex-col items-center gap-3 py-8 text-center">
 				<p class="text-sm text-destructive">{t('audit.loadError')}：{loadError}</p>
 				<Button variant="outline" size="sm" onclick={load} disabled={loading}>
@@ -293,49 +304,50 @@
 			</CardContent>
 		</Card>
 	{:else if orgs.length === 0}
-		<Card class="mt-4">
+		<Card class="mt-4 shrink-0">
 			<CardContent class="flex flex-col items-center gap-2 py-10 text-center">
 				<p class="text-sm text-zinc-500">{t('audit.noOrg')}</p>
 			</CardContent>
 		</Card>
 	{:else if loading}
-		<Card class="mt-4">
+		<Card class="mt-4 shrink-0">
 			<CardContent class="flex items-center justify-center py-8 text-sm text-zinc-400">
 				{t('common.loading')}
 			</CardContent>
 		</Card>
 	{:else if entries.length === 0}
-		<Card class="mt-4">
+		<Card class="mt-4 shrink-0">
 			<CardContent class="flex flex-col items-center gap-2 py-10 text-center">
 				<p class="text-sm font-medium text-zinc-600">{t('audit.empty')}</p>
 				<p class="text-xs text-zinc-400">{t('audit.emptyDesc')}</p>
 			</CardContent>
 		</Card>
 	{:else}
-		<Card class="mt-4">
-			<CardHeader>
+		<Card class="mt-4 min-h-0 flex-1">
+			<CardHeader class="shrink-0">
 				<CardTitle>{t('audit.title')}</CardTitle>
 				<CardDescription>{t('audit.subtitle')}</CardDescription>
 			</CardHeader>
-			<CardContent>
+			<CardContent class="min-h-0 flex-1 overflow-y-auto">
 				<Table>
 					<TableHeader>
 						<TableRow>
-							<TableHead class="w-8"></TableHead>
-							<TableHead>{t('audit.operationId')}</TableHead>
-							<TableHead>{t('audit.operator')}</TableHead>
-							<TableHead>{t('audit.timestamp')}</TableHead>
-							<TableHead>{t('audit.targetTable')}</TableHead>
-							<TableHead class="text-right">{t('audit.rowsAffected')}</TableHead>
-							<TableHead>{t('audit.status')}</TableHead>
+							<TableHead class="sticky top-0 z-10 w-8 bg-card"></TableHead>
+							<TableHead class="sticky top-0 z-10 bg-card">{t('audit.operationId')}</TableHead>
+							<TableHead class="sticky top-0 z-10 bg-card">{t('audit.operator')}</TableHead>
+							<TableHead class="sticky top-0 z-10 bg-card">{t('audit.timestamp')}</TableHead>
+							<TableHead class="sticky top-0 z-10 bg-card">{t('audit.targetTable')}</TableHead>
+							<TableHead class="sticky top-0 z-10 bg-card text-right">{t('audit.rowsAffected')}</TableHead>
+							<TableHead class="sticky top-0 z-10 bg-card">{t('audit.status')}</TableHead>
 						</TableRow>
 					</TableHeader>
 					<TableBody>
-						{#each pagedEntries as e (e.operationId)}
-							{@const expanded = expandedId === e.operationId}
+						{#each pagedEntries as e (rowKey(e))}
+							{@const rowId = rowKey(e)}
+							{@const expanded = expandedId === rowId}
 							<TableRow
 								class="cursor-pointer"
-								onclick={() => (expandedId = expanded ? null : e.operationId)}
+								onclick={() => (expandedId = expanded ? null : rowId)}
 							>
 								<TableCell>
 									{#if expanded}
@@ -395,7 +407,7 @@
 				</Table>
 			</CardContent>
 		</Card>
-		<div class="mt-3">
+		<div class="mt-3 shrink-0">
 			<Pagination total={entries.length} bind:page bind:pageSize />
 		</div>
 	{/if}

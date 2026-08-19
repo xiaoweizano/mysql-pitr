@@ -89,7 +89,11 @@ func (s *SQLiteOperationStore) Create(op *Operation) error {
 	return err
 }
 
-// Get retrieves an operation by ID, including its persisted statements.
+// Get retrieves an operation by ID. Statement rows are NOT included — Get is
+// on the hot path (authorizeOp runs it for every /status poll and stream
+// event), and loading an operation's full statement set on each call would
+// drag megabytes through SQLite for large selections. Call LoadStatements
+// explicitly where statements are needed (e.g. sendExecute).
 func (s *SQLiteOperationStore) Get(id string) (*Operation, error) {
 	op, err := scanOperation(s.db.QueryRow("SELECT "+opColumns+" FROM operations WHERE id = ?", id))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -98,11 +102,6 @@ func (s *SQLiteOperationStore) Get(id string) (*Operation, error) {
 	if err != nil {
 		return nil, err
 	}
-	stmts, err := s.LoadStatements(id)
-	if err != nil {
-		return nil, err
-	}
-	op.Statements = stmts
 	return op, nil
 }
 

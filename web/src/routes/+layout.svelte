@@ -61,7 +61,7 @@
 </script>
 
 {#if isAuthed && !isPublic}
-	<div class="flex min-h-screen bg-background">
+	<div class="flex h-screen overflow-hidden bg-background">
 		<aside class="flex h-screen w-60 shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground">
 			<div class="flex items-center gap-2 px-4 py-4">
 				<img src="/favicon.svg" alt={t('app.name')} class="h-8 w-8" />
@@ -101,7 +101,7 @@
 			</div>
 		</aside>
 
-		<main class="min-w-0 flex-1">
+		<main class="flex h-screen min-w-0 flex-1 flex-col overflow-hidden">
 			{@render children()}
 		</main>
 	</div>

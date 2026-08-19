@@ -43,6 +43,7 @@
 	let loadError = $state<string | null>(null);
 	let status = $state<OperationStatus | null>(null);
 	let txs = $state<TxPreview[]>([]);
+	let txsLoading = $state(true);
 	let previewTruncated = $state(false);
 	let progress = $state<ProgressPayload | null>(null);
 	let execErrors = $state<ExecError[]>([]);
@@ -77,16 +78,20 @@
 
 		loading = true;
 		loadError = null;
+		txsLoading = true;
 		sseConnected = false;
 		sseReconnecting = false;
 
 		void (async () => {
 			try {
-				const [st, txResp] = await Promise.all([getStatus(id), getTransactions(id)]);
+				// /status first: the page shell (meta + execution panel) renders
+				// as soon as it lands. /transactions can carry the operation's
+				// full staged SQL (a mass-delete flashback easily stages tens of
+				// thousands of statements), so it must never gate the whole
+				// page — it loads into its own section below.
+				const st = await getStatus(id);
 				if (stale) return;
 				status = st;
-				txs = txResp.transactions;
-				previewTruncated = txResp.previewTruncated ?? false;
 				if (isTerminalState(st.status)) {
 					// 终态预览已释放 — nothing more to stream.
 					// Initialize progress from checkpoint data so the done/total
@@ -99,6 +104,16 @@
 				if (!stale) loadError = e instanceof Error ? e.message : String(e);
 			} finally {
 				if (!stale) loading = false;
+			}
+			try {
+				const txResp = await getTransactions(id);
+				if (stale) return;
+				txs = txResp.transactions;
+				previewTruncated = txResp.previewTruncated ?? false;
+			} catch {
+				// transient — SSE keeps streaming; scan_done retries the snapshot
+			} finally {
+				if (!stale) txsLoading = false;
 			}
 		})();
 
@@ -150,6 +165,7 @@
 			status = { ...(status ?? ({} as OperationStatus)), status: resp.status } as OperationStatus;
 			txs = resp.transactions;
 			previewTruncated = resp.previewTruncated ?? false;
+			txsLoading = false;
 		} catch {
 			// transient
 		}
@@ -281,7 +297,7 @@
 	<title>{t('pitr.detail.title')} · {t('app.name')}</title>
 </svelte:head>
 
-<div class="p-6">
+<div class="h-full overflow-y-auto p-6">
 	<div class="flex flex-wrap items-center justify-between gap-3">
 		<div class="flex items-center gap-3">
 			<Button variant="outline" size="sm" href="/operations">
@@ -377,7 +393,14 @@
 			</Card>
 		</div>
 
-		{#if txs.length > 0}
+		{#if txsLoading}
+			<Card class="mt-6">
+				<CardContent class="flex items-center justify-center gap-2 py-6 text-sm text-zinc-400">
+					<LoaderCircle class="size-4 animate-spin" />
+					{t('common.loading')}
+				</CardContent>
+			</Card>
+		{:else if txs.length > 0}
 			<Card class="mt-6">
 				<CardHeader>
 					<CardTitle>{t('pitr.detail.transactions')}</CardTitle>
@@ -399,6 +422,12 @@
 			<Card class="mt-6">
 				<CardContent class="py-6 text-center text-sm text-zinc-400">
 					{t('pitr.detail.terminalNoPreview')}
+				</CardContent>
+			</Card>
+		{:else}
+			<Card class="mt-6">
+				<CardContent class="py-6 text-center text-sm text-zinc-400">
+					{t('pitr.detail.noPreviewYet')}
 				</CardContent>
 			</Card>
 		{/if}

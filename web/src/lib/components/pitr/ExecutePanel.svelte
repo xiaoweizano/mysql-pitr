@@ -125,6 +125,12 @@
 		<Square class="size-4 shrink-0" />
 		<span>{t('pitr.exec.cancelled')}</span>
 	</div>
+{:else if status === 'ready'}
+	<p class="text-sm text-zinc-500">{t('pitr.exec.readyHint')}</p>
+{:else if status === 'scanning' || status === 'created'}
+	<p class="flex items-center gap-2 text-sm text-zinc-500">
+		{t('pitr.exec.scanningHint')}
+	</p>
 {/if}
 
 {#if showErrors}

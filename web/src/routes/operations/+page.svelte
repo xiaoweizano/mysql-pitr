@@ -94,8 +94,8 @@
 	<title>{t('operations.title')} · {t('app.name')}</title>
 </svelte:head>
 
-<div class="p-6">
-	<div class="flex flex-wrap items-center justify-between gap-3">
+<div class="flex h-full flex-col p-6">
+	<div class="flex shrink-0 flex-wrap items-center justify-between gap-3">
 		<div>
 			<h1 class="text-xl font-semibold text-zinc-900">{t('operations.title')}</h1>
 			<p class="text-sm text-zinc-500">{t('operations.subtitle')}</p>
@@ -104,7 +104,7 @@
 	</div>
 
 	{#if loadError}
-		<Card class="mt-4">
+		<Card class="mt-4 shrink-0">
 			<CardContent class="flex flex-col items-center gap-3 py-8 text-center">
 				<p class="text-sm text-destructive">{t('operations.loadError')}：{loadError}</p>
 				<Button variant="outline" size="sm" onclick={load} disabled={loading}>
@@ -113,76 +113,74 @@
 			</CardContent>
 		</Card>
 	{:else if loading}
-		<Card class="mt-4">
+		<Card class="mt-4 shrink-0">
 			<CardContent class="flex items-center justify-center py-8 text-sm text-zinc-400">
 				{t('common.loading')}
 			</CardContent>
 		</Card>
 	{:else if operations.length === 0}
-		<Card class="mt-4">
+		<Card class="mt-4 shrink-0">
 			<CardContent class="flex flex-col items-center gap-2 py-10 text-center">
 				<History class="size-8 text-zinc-300" />
 				<p class="text-sm text-zinc-500">{t('operations.empty')}</p>
 			</CardContent>
 		</Card>
 	{:else}
-		<Card class="mt-4">
-			<CardContent class="p-0">
-				<div class="overflow-x-auto">
-					<table class="w-full text-sm">
-						<thead>
-							<tr class="border-b text-left text-xs text-zinc-500">
-								<th class="px-4 py-2.5 font-medium">{t('operations.status')}</th>
-								<th class="px-4 py-2.5 font-medium">{t('operations.type')}</th>
-								<th class="px-4 py-2.5 font-medium">{t('operations.mode')}</th>
-								<th class="px-4 py-2.5 font-medium">{t('operations.agent')}</th>
-								<th class="px-4 py-2.5 font-medium">{t('operations.filter')}</th>
-								<th class="px-4 py-2.5 font-medium">{t('operations.createdAt')}</th>
-								<th class="px-4 py-2.5 text-right font-medium">{t('operations.actions')}</th>
+		<Card class="mt-4 min-h-0 flex-1">
+			<CardContent class="min-h-0 flex-1 overflow-y-auto p-0">
+				<table class="w-full text-sm">
+					<thead>
+						<tr class="text-left text-xs text-zinc-500">
+							<th class="sticky top-0 z-10 bg-card px-4 py-2.5 font-medium">{t('operations.status')}</th>
+							<th class="sticky top-0 z-10 bg-card px-4 py-2.5 font-medium">{t('operations.type')}</th>
+							<th class="sticky top-0 z-10 bg-card px-4 py-2.5 font-medium">{t('operations.mode')}</th>
+							<th class="sticky top-0 z-10 bg-card px-4 py-2.5 font-medium">{t('operations.agent')}</th>
+							<th class="sticky top-0 z-10 bg-card px-4 py-2.5 font-medium">{t('operations.filter')}</th>
+							<th class="sticky top-0 z-10 bg-card px-4 py-2.5 font-medium">{t('operations.createdAt')}</th>
+							<th class="sticky top-0 z-10 bg-card px-4 py-2.5 text-right font-medium">{t('operations.actions')}</th>
+						</tr>
+					</thead>
+					<tbody>
+						{#each pagedOps as op (op.id)}
+							<tr class="border-b border-zinc-100 align-middle">
+								<td class="px-4 py-2.5">
+									<div class="flex items-center gap-2">
+										<span
+											class={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${badgeClass(op.status)}`}
+										>
+											{t(`pitr.status.${op.status}`)}
+										</span>
+										<span
+											class={`inline-block size-1.5 rounded-full ${op.agentConnected ? 'bg-emerald-500' : 'bg-zinc-300'}`}
+											title={op.agentConnected
+												? t('operations.agentConnected')
+												: t('operations.agentDisconnected')}
+										></span>
+									</div>
+								</td>
+								<td class="px-4 py-2.5 text-zinc-700">{t(`pitr.type.short.${op.type}`)}</td>
+								<td class="px-4 py-2.5 text-zinc-500">{t(`pitr.mode.${op.mode}`)}</td>
+								<td class="max-w-40 truncate px-4 py-2.5 font-mono text-xs text-zinc-600" title={op.agentId}>
+									{op.agentId}
+								</td>
+								<td class="max-w-72 truncate px-4 py-2.5 text-xs text-zinc-600" title={filterSummary(op)}>
+									{filterSummary(op) || '—'}
+								</td>
+								<td class="whitespace-nowrap px-4 py-2.5 text-zinc-500">
+									{formatDateTime(op.createdAt)}
+								</td>
+								<td class="px-4 py-2.5 text-right">
+									<Button variant="ghost" size="sm" href={`/pitr/${encodeURIComponent(op.id)}`}>
+										{t('operations.view')}
+									</Button>
+								</td>
 							</tr>
-						</thead>
-						<tbody>
-							{#each pagedOps as op (op.id)}
-								<tr class="border-b border-zinc-100 align-middle">
-									<td class="px-4 py-2.5">
-										<div class="flex items-center gap-2">
-											<span
-												class={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${badgeClass(op.status)}`}
-											>
-												{t(`pitr.status.${op.status}`)}
-											</span>
-											<span
-												class={`inline-block size-1.5 rounded-full ${op.agentConnected ? 'bg-emerald-500' : 'bg-zinc-300'}`}
-												title={op.agentConnected
-													? t('operations.agentConnected')
-													: t('operations.agentDisconnected')}
-											></span>
-										</div>
-									</td>
-									<td class="px-4 py-2.5 text-zinc-700">{t(`pitr.type.short.${op.type}`)}</td>
-									<td class="px-4 py-2.5 text-zinc-500">{t(`pitr.mode.${op.mode}`)}</td>
-									<td class="max-w-40 truncate px-4 py-2.5 font-mono text-xs text-zinc-600" title={op.agentId}>
-										{op.agentId}
-									</td>
-									<td class="max-w-72 truncate px-4 py-2.5 text-xs text-zinc-600" title={filterSummary(op)}>
-										{filterSummary(op) || '—'}
-									</td>
-									<td class="whitespace-nowrap px-4 py-2.5 text-zinc-500">
-										{formatDateTime(op.createdAt)}
-									</td>
-									<td class="px-4 py-2.5 text-right">
-										<Button variant="ghost" size="sm" href={`/pitr/${encodeURIComponent(op.id)}`}>
-											{t('operations.view')}
-										</Button>
-									</td>
-								</tr>
-							{/each}
-						</tbody>
-					</table>
-				</div>
+						{/each}
+					</tbody>
+				</table>
 			</CardContent>
 		</Card>
-		<div class="mt-3">
+		<div class="mt-3 shrink-0">
 			<Pagination total={operations.length} bind:page bind:pageSize />
 		</div>
 	{/if}

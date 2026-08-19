@@ -624,7 +624,7 @@
 	<title>{t('pitr.title')} · {t('app.name')}</title>
 </svelte:head>
 
-<div class="p-6">
+<div class="h-full overflow-y-auto p-6">
 	<div class="flex flex-wrap items-center justify-between gap-3">
 		<div>
 			<h1 class="text-xl font-semibold text-zinc-900">{t('pitr.title')}</h1>

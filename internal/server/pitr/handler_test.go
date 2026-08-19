@@ -329,6 +329,82 @@ func TestStart_ScanDoneTransitionsToReady(t *testing.T) {
 	assert.Equal(t, "ready", entries[0].Status)
 }
 
+// TestStart_ScanDoneRacesCreatedToScanningCAS reproduces the stuck-scan bug:
+// the hub processes each agent stream event in its own goroutine, so a fast
+// scan can deliver scan_done before the Start handler's created->scanning
+// transition lands. scan_done on a `created` op used to be rejected
+// (created->ready is invalid); Start's CAS then moved the op to scanning, and
+// with no second scan_done coming the operation was stuck in scanning forever
+// (wizard spinner at step 3, /status polling without end).
+func TestStart_ScanDoneRacesCreatedToScanningCAS(t *testing.T) {
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+
+	// The agent acks the scan AND finishes it before Start's CAS: scan_done
+	// is interleaved into the command round-trip, while the op record on disk
+	// is still `created`.
+	f.commander.onSend = func(cmd ws.Command) {
+		if cmd.Type == ws.CmdScan {
+			f.injectStreamEvent(t, agentID, cmd.Cmd, ws.EvScanDone, map[string]interface{}{})
+		}
+	}
+
+	req := f.authenticatedRequest(t, http.MethodPost, "/api/pitr/start", startBody(agentID), userID)
+	w := httptest.NewRecorder()
+	f.handler.Start(w, req)
+	require.Equal(t, http.StatusCreated, w.Code)
+	resp := startResponseBody(t, w)
+
+	op, err := f.opStore.Get(resp.OperationID)
+	require.NoError(t, err)
+	assert.Equal(t, StateReady, op.Status,
+		"scan_done raced the created->scanning CAS — the operation must still reach ready")
+}
+
+func TestStart_ScanDoneRacesCreatedToScanningCAS_TxMetaAlsoRacing(t *testing.T) {
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+
+	// tx_meta and scan_done both land while the op is `created` — the full
+	// happy-path race window of a fast scan.
+	f.commander.onSend = func(cmd ws.Command) {
+		if cmd.Type != ws.CmdScan {
+			return
+		}
+		f.injectStreamEvent(t, agentID, cmd.Cmd, ws.EvTxMeta,
+			txMetaData("tx-race-1", "2026-07-08T10:00:00Z", 3))
+		f.injectStreamEvent(t, agentID, cmd.Cmd, ws.EvScanDone, map[string]interface{}{})
+	}
+
+	req := f.authenticatedRequest(t, http.MethodPost, "/api/pitr/start", startBody(agentID), userID)
+	w := httptest.NewRecorder()
+	f.handler.Start(w, req)
+	require.Equal(t, http.StatusCreated, w.Code)
+	resp := startResponseBody(t, w)
+
+	op, err := f.opStore.Get(resp.OperationID)
+	require.NoError(t, err)
+	assert.Equal(t, StateReady, op.Status)
+
+	// The racing tx_meta must still be visible in the preview.
+	tReq := f.authenticatedRouteRequest(t, http.MethodGet, "/api/pitr/{id}/transactions", resp.OperationID, nil, userID)
+	tW := httptest.NewRecorder()
+	f.handler.Transactions(tW, tReq)
+	require.Equal(t, http.StatusOK, tW.Code)
+	var txResp struct {
+		Transactions []struct {
+			TxID string `json:"txId"`
+		} `json:"transactions"`
+	}
+	require.NoError(t, json.NewDecoder(tW.Body).Decode(&txResp))
+	require.Len(t, txResp.Transactions, 1)
+	assert.Equal(t, "tx-race-1", txResp.Transactions[0].TxID)
+}
+
 func TestStart_MissingAgentID(t *testing.T) {
 	f := setupTest(t)
 	userID := f.createUser(t)
