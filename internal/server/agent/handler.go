@@ -262,6 +262,11 @@ func (h *Handler) Approve(w http.ResponseWriter, r *http.Request) {
 
 	agent.Approved = true
 	agent.CertSerial = generateCertSerial() // placeholder for CA signing
+	// Reset status from "rejected" to "offline" so the next OnConnect sets it
+	// to "online" when the agent reconnects.
+	if agent.Status == "rejected" {
+		agent.Status = "offline"
+	}
 
 	if err := h.agentStore.Update(agent); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
