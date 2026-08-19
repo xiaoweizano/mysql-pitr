@@ -1,6 +1,19 @@
+<div align="center">
+
 # MySQL PITR Platform
 
 A point-in-time recovery (PITR) platform for MySQL built on [go-mysql](https://github.com/go-mysql-org/go-mysql). It continuously archives binary logs, lets you browse transactions from any point in time, and generates reverse SQL to undo accidental changes — with a web console, a multi-agent architecture, and a single-binary server.
+
+[![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![MySQL](https://img.shields.io/badge/MySQL-8.0-4479A1?logo=mysql&logoColor=white)](https://www.mysql.com)
+[![SvelteKit](https://img.shields.io/badge/SvelteKit-2-FF3E00?logo=svelte&logoColor=white)](https://kit.svelte.dev)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/xiaoweizano/mysql-pitr?include_prereleases)](https://github.com/xiaoweizano/mysql-pitr/releases)
+[![Stars](https://img.shields.io/github/stars/xiaoweizano/mysql-pitr)](https://github.com/xiaoweizano/mysql-pitr/stargazers)
+
+English | [简体中文](README.zh-CN.md)
+
+</div>
 
 ![PITR v3 architecture](docs/diagrams/pitr-architecture.png)
 
@@ -101,12 +114,47 @@ docker compose up -d
 
 The SvelteKit frontend is embedded in the server binary at build time (the Dockerfile's multi-stage build copies `web/build` into the `go:embed` tree) — there is no separate web container.
 
-> **Low-memory servers (2C2G)**: the compose build uses a **pre-built frontend** (`FRONTEND_FROM=prebuilt`) so `npm ci` / Vite never runs inside the container — it OOMs under 2 GB RAM. Build the frontend locally and upload it before `docker compose up -d --build`:
-> ```bash
-> cd web && npm run build                # local (Node 22+)
-> scp -r web/build user@<server>:/path/to/project/web/build
-> ```
-> Plain `docker build --target server .` stays self-contained (builds the frontend in-container).
+#### Low-memory servers (2C2G)
+
+2 GB is enough to **run** the stack, but a naive `docker compose up -d --build` can take the box down: the Go compile/link peak, plus the host MySQL and the still-running old containers, exceeds available RAM — the kernel freezes and only a reboot recovers. Deploy in this order:
+
+**1. Add swap (one-time)** — without swap, memory exhaustion kills the box; with it, builds just run slower:
+
+```bash
+fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+echo '/swapfile none swap sw 0 0' >> /etc/fstab   # persist across reboots
+free -h                                           # Swap should show 2.0Gi
+```
+
+> `fallocate failed: Text file busy` means the swapfile is already active — nothing to do (also check `/etc/fstab` for a duplicated line).
+
+**2. Build the frontend locally and upload it** — the compose build uses `FRONTEND_FROM=prebuilt` so `npm ci` / Vite never run inside the container (they OOM under 2 GB). Plain `docker build --target server .` stays self-contained, but needs more than 2 GB RAM.
+
+```bash
+cd web && npm run build                # local (Node 22+)
+scp -r web/build user@<server>:/path/to/project/web/build
+```
+
+**3. Build and start as separate steps** — `up -d --build` rebuilds while the old containers still hold their memory:
+
+```bash
+docker compose down
+docker compose build server            # the shared builder stage fills the cache
+docker compose build agent provision   # mostly cache hits
+docker compose up -d
+```
+
+A build that gets OOM-killed mid-way never writes its final layers into the cache, so every retry recompiles the same step — finish one full build and later builds are fast again.
+
+**Docker cache cleanup** — build cache grows quickly (several GB after a few iterations):
+
+```bash
+docker system df                            # see what's reclaimable
+docker builder prune -a -f                  # reclaim all build cache
+docker builder prune --keep-storage 1GB -f  # or cap the cache instead of wiping it
+```
+
+> ⚠️ While the stack is stopped, `docker system prune -a -f` also deletes the built `mysql-pitr` images, forcing a full rebuild on next start. Prune the **builder cache** only.
 
 ### Run the server
 

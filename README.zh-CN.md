@@ -1,6 +1,19 @@
+<div align="center">
+
 # MySQL PITR 平台
 
 基于 [go-mysql](https://github.com/go-mysql-org/go-mysql) 的 MySQL 时间点恢复（PITR）平台。它持续归档二进制日志，让你浏览任意时间点的事务，并生成逆向 SQL 撤销误操作——自带 Web 控制台、多 agent 架构与单二进制 server。
+
+[![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![MySQL](https://img.shields.io/badge/MySQL-8.0-4479A1?logo=mysql&logoColor=white)](https://www.mysql.com)
+[![SvelteKit](https://img.shields.io/badge/SvelteKit-2-FF3E00?logo=svelte&logoColor=white)](https://kit.svelte.dev)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/xiaoweizano/mysql-pitr?include_prereleases)](https://github.com/xiaoweizano/mysql-pitr/releases)
+[![Stars](https://img.shields.io/github/stars/xiaoweizano/mysql-pitr)](https://github.com/xiaoweizano/mysql-pitr/stargazers)
+
+[English](README.md) | 简体中文
+
+</div>
 
 ![PITR v3 架构](docs/diagrams/pitr-architecture.png)
 
@@ -101,12 +114,47 @@ docker compose up -d
 
 前端已由 Dockerfile 多阶段构建在编译期内嵌进 server 二进制（`web/build` 拷入 `go:embed` 树）——无需单独的前端容器。
 
-> **低内存服务器（2C2G）**：compose 构建默认使用**预构建前端**（`FRONTEND_FROM=prebuilt`），避免在容器内跑 `npm ci` / Vite —— 2GB 内存下那一步会 OOM。构建前请在本机生成产物并上传：
-> ```bash
-> cd web && npm run build                # 本机（Node 22+）
-> scp -r web/build root@<服务器>:/path/to/project/web/build
-> ```
-> 标准 `docker build --target server .` 仍是自包含构建（容器内编译前端）。
+#### 低内存服务器（2C2G）部署
+
+2 GB 内存**跑运行时**够用，但直接 `docker compose up -d --build` 可能把机器打挂：Go 编译/链接的内存峰值，叠加宿主机 MySQL 与仍在运行的旧容器，超出可用内存——内核假死，只能重启恢复。按以下顺序部署：
+
+**1. 加 swap（一次性）**——没有 swap 时内存耗尽直接假死；有了 swap 构建只是慢一点：
+
+```bash
+fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+echo '/swapfile none swap sw 0 0' >> /etc/fstab   # 重启后自动挂载
+free -h                                           # Swap 应显示 2.0Gi
+```
+
+> `fallocate failed: Text file busy` 说明 swapfile 已在启用中，无需重复操作（顺带检查 `/etc/fstab` 是否写了重复行）。
+
+**2. 本机构建前端并上传**——compose 构建默认 `FRONTEND_FROM=prebuilt`，容器内不会跑 `npm ci` / Vite（2 GB 下必 OOM）。标准 `docker build --target server .` 仍是自包含构建（容器内编译前端），但需要 2 GB 以上内存。
+
+```bash
+cd web && npm run build                # 本机（Node 22+）
+scp -r web/build root@<服务器>:/path/to/project/web/build
+```
+
+**3. 分步构建、分步启动**——`up -d --build` 会一边重建一边让旧容器占着内存：
+
+```bash
+docker compose down
+docker compose build server            # 共享的 builder 阶段先填满缓存
+docker compose build agent provision   # 基本全命中缓存
+docker compose up -d
+```
+
+被 OOM 打断的构建不会把最后的层写入缓存，于是每次重试都在同一步重编——完整跑成功一次后，后续构建就快了。
+
+**Docker 缓存清理**——构建缓存涨得很快（几轮迭代就能到数 GB）：
+
+```bash
+docker system df                            # 查看可回收空间
+docker builder prune -a -f                  # 清掉全部构建缓存
+docker builder prune --keep-storage 1GB -f  # 或只保留 1GB 缓存上限
+```
+
+> ⚠️ 栈停着的时候跑 `docker system prune -a -f` 会连已构建的 `mysql-pitr` 镜像一起删掉，下次启动就得全量重编。只清 **builder cache** 即可。
 
 ### 启动 server
 
