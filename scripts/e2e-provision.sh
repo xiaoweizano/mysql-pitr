@@ -66,10 +66,14 @@ print("[provision] wrote ca.pem and ca-key.pem")
 PY
 
 echo "[provision] registering agent via API..."
-# Fixed credentials shared with scripts/e2e-test.sh so the host-side script
-# can log in as the same user and see this org and agent.
-EMAIL="e2e-provision@example.com"
-PASS="e2e-pass-123"
+# Provisioning account: configurable via .env (PROVISION_EMAIL /
+# PROVISION_PASSWORD / PROVISION_ORG). The agent is registered under this
+# account's org — log into the web console with these credentials to see it.
+# Defaults are shared with scripts/e2e-test.sh so the host-side script can
+# log in as the same user and see this org and agent.
+EMAIL="${PROVISION_EMAIL:-e2e-provision@example.com}"
+PASS="${PROVISION_PASSWORD:-e2e-pass-123}"
+ORG_NAME="${PROVISION_ORG:-E2E Org}"
 
 curl -fsS -X POST "$SERVER_URL/api/auth/register" \
   -H 'Content-Type: application/json' \
@@ -82,7 +86,7 @@ TOKEN=$(curl -fsS -X POST "$SERVER_URL/api/auth/login" \
 ORG_ID=$(curl -fsS -X POST "$SERVER_URL/api/orgs" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"name":"E2E Org"}' | jq -r .organization.id)
+  -d "{\"name\":\"$ORG_NAME\"}" | jq -r .organization.id)
 
 AGENT_ID=$(curl -fsS -X POST "$SERVER_URL/api/agents/register" \
   -H "Authorization: Bearer $TOKEN" \

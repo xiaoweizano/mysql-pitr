@@ -30,6 +30,11 @@ services:
       MYSQL_BINLOG_DIR: /var/lib/mysql
       ARCHIVE_SERVER_ID: ${ARCHIVE_SERVER_ID:-424242}
       ARCHIVE_RETENTION_DAYS: ${ARCHIVE_RETENTION_DAYS:-0}
+      # provision 注册用的平台账号：agent 会注册到该账号的组织下，
+      # 用这组凭据登录 Web 控制台才能看到该 agent（可在 .env 覆盖）
+      PROVISION_EMAIL: ${PROVISION_EMAIL:-e2e-provision@example.com}
+      PROVISION_PASSWORD: ${PROVISION_PASSWORD:-e2e-pass-123}
+      PROVISION_ORG: ${PROVISION_ORG:-E2E Org}
     depends_on:
       server:
         condition: service_started
