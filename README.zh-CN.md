@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/diagrams/logo.svg" width="110" alt="MySQL PITR logo"/>
+
 # MySQL PITR 平台
 
 基于 [go-mysql](https://github.com/go-mysql-org/go-mysql) 的 MySQL 时间点恢复（PITR）平台。它持续归档二进制日志，让你浏览任意时间点的事务，并生成逆向 SQL 撤销误操作——自带 Web 控制台、多 agent 架构与单二进制 server。
@@ -111,6 +113,7 @@ docker compose up -d
 - `server` → http://localhost:8080（注册账号、创建组织、在界面上审批 agent）
 - `agent` → 只读挂载宿主机 binlog 目录（`MYSQL_BINLOG_DIR_HOST`）并运行归档循环；归档状态存于 `agent-data` 卷
 - `ARCHIVE_SERVER_ID`（syncer id，每 agent 唯一）与 `ARCHIVE_RETENTION_DAYS`（0 = 永久保留）可在 `.env` 配置
+- `PROVISION_EMAIL` / `PROVISION_PASSWORD` / `PROVISION_ORG`——一次性 `provision` 服务注册 agent 所用的账号（默认 `e2e-provision@example.com` / `e2e-pass-123` / `E2E Org`）。**agent 注册在该账号的组织下**——用这组凭据登录控制台才能看到它。在 `.env` 里改成你自己的账号即可挂到你名下，然后重新 provision：`docker compose down && docker volume rm <项目名>_agent-config && docker compose up -d`（旧 agent 记录留在旧组织下，可在控制台 reject 删除）。
 
 前端已由 Dockerfile 多阶段构建在编译期内嵌进 server 二进制（`web/build` 拷入 `go:embed` 树）——无需单独的前端容器。
 

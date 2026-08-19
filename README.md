@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/diagrams/logo.svg" width="110" alt="MySQL PITR logo"/>
+
 # MySQL PITR Platform
 
 A point-in-time recovery (PITR) platform for MySQL built on [go-mysql](https://github.com/go-mysql-org/go-mysql). It continuously archives binary logs, lets you browse transactions from any point in time, and generates reverse SQL to undo accidental changes — with a web console, a multi-agent architecture, and a single-binary server.
@@ -111,6 +113,7 @@ docker compose up -d
 - `server` → http://localhost:8080 (register, create an organisation, approve the agent in the UI)
 - `agent` → mounts the host binlog directory read-only (`MYSQL_BINLOG_DIR_HOST`) and runs the archive loop; archive state lives in the `agent-data` volume
 - `ARCHIVE_SERVER_ID` (syncer id, unique per agent) and `ARCHIVE_RETENTION_DAYS` (0 = keep forever) are configurable via `.env`
+- `PROVISION_EMAIL` / `PROVISION_PASSWORD` / `PROVISION_ORG` — the account the one-shot `provision` service registers the agent under (defaults: `e2e-provision@example.com` / `e2e-pass-123` / `E2E Org`). **The agent lives in this account's org** — log into the console with these credentials to see it. Set your own values in `.env` to register it under your account, then re-provision: `docker compose down && docker volume rm <project>_agent-config && docker compose up -d` (the old agent record stays under the old org until rejected in the UI).
 
 The SvelteKit frontend is embedded in the server binary at build time (the Dockerfile's multi-stage build copies `web/build` into the `go:embed` tree) — there is no separate web container.
 
