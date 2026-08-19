@@ -14,7 +14,7 @@ type AgentRecord struct {
 	OrgID             string    `json:"orgId"`
 	Hostname          string    `json:"hostname"`
 	MySQLVersion      string    `json:"mySQLVersion,omitempty"`
-	Status            string    `json:"status"` // online, offline, error
+	Status            string    `json:"status"` // online, offline, rejected, error
 	LastSeen          time.Time `json:"lastSeen"`
 	CreatedAt         time.Time `json:"createdAt"`
 	CertSerial        string    `json:"certSerial,omitempty"`
@@ -108,15 +108,18 @@ func (s *InMemoryAgentStore) Update(agent *AgentRecord) error {
 	return nil
 }
 
-// Delete removes an agent record by ID.
+// Delete soft-deletes an agent record: unapproves it and marks it rejected.
+// The record stays in the store so the UI can show it and allow re-approval.
 func (s *InMemoryAgentStore) Delete(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, ok := s.agents[id]; !ok {
+	agent, ok := s.agents[id]
+	if !ok {
 		return fmt.Errorf("agent not found: %s", id)
 	}
-	delete(s.agents, id)
+	agent.Approved = false
+	agent.Status = "rejected"
 	return nil
 }
 

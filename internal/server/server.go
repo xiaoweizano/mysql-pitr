@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -126,6 +128,35 @@ func newServer(dataDir string, commander pitr.AgentCommander) (*Server, error) {
 			if rec, err := agentStore.Get(agentID); err == nil {
 				rec.Status = "online"
 				rec.LastSeen = time.Now()
+
+				// Async: fetch MySQL version via CmdPreflight.
+				// Non-blocking: version stays empty on failure.
+				go func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cancel()
+					resp, err := agentHub.SendToAgent(ctx, agentID, ws.Command{
+						Cmd:    agentID,
+						Type:   ws.CmdPreflight,
+						Params: map[string]interface{}{},
+					})
+					if err != nil || resp.Status == ws.StatusError {
+						return
+					}
+					b, _ := json.Marshal(resp.Result)
+					var pf struct {
+						Preflight *struct {
+							Version string `json:"version"`
+						} `json:"preflight"`
+					}
+					if err := json.Unmarshal(b, &pf); err != nil || pf.Preflight == nil || pf.Preflight.Version == "" {
+						return
+					}
+					if rec, err := agentStore.Get(agentID); err == nil {
+						rec.MySQLVersion = pf.Preflight.Version
+						_ = agentStore.Update(rec)
+					}
+				}()
+
 				_ = agentStore.Update(rec)
 				return
 			}

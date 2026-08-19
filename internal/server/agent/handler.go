@@ -457,6 +457,12 @@ func (h *Handler) ArchiveStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Return 204 No Content when the archive loop has never run (empty state).
+	if state.LastFile == "" && state.UpdatedAt.IsZero() {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	writeJSON(w, http.StatusOK, archiveStateResponse{
 		LastFile:  state.LastFile,
 		LastPos:   state.LastPos,

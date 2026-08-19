@@ -76,6 +76,8 @@
 				return 'bg-emerald-100 text-emerald-700';
 			case 'error':
 				return 'bg-red-100 text-red-700';
+			case 'rejected':
+				return 'bg-rose-100 text-rose-700';
 			case 'offline':
 			default:
 				return 'bg-zinc-100 text-zinc-600';
@@ -88,6 +90,8 @@
 				return t('instances.status.online');
 			case 'error':
 				return t('instances.status.error');
+			case 'rejected':
+				return '已拒绝';
 			case 'offline':
 			default:
 				return t('instances.status.offline');

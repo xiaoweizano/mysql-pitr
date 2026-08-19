@@ -43,7 +43,7 @@
 	"instances.status.error": "异常",
 	"instances.approve": "审批",
 	"instances.reject": "拒绝",
-	"instances.rejectConfirm": "确定拒绝并移除该实例吗？此操作不可撤销。",
+	"instances.rejectConfirm": "确定拒绝该实例吗？拒绝后仍可重新审批。",
 	"instances.detail": "详情",
 	"instances.actions": "操作",
 	"instances.org": "组织",

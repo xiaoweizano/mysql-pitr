@@ -110,9 +110,10 @@ func (s *SQLiteAgentStore) Update(agent *AgentRecord) error {
 	return nil
 }
 
-// Delete removes an agent record by ID.
+// Delete soft-deletes an agent record: unapproves it and marks it rejected.
+// The record stays in the DB so the UI can show it and allow re-approval.
 func (s *SQLiteAgentStore) Delete(id string) error {
-	res, err := s.db.Exec("DELETE FROM agents WHERE id = ?", id)
+	res, err := s.db.Exec("UPDATE agents SET approved = 0, status = 'rejected' WHERE id = ?", id)
 	if err != nil {
 		return err
 	}
