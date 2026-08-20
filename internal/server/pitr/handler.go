@@ -603,6 +603,13 @@ func (h *Handler) stageTxMeta(opID string, meta txMetaWire) {
 	p := h.previewFor(opID)
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// 同一 TxID 只入列一次：selected 模式的定向二次扫描会重推所选事务的
+	// meta，归档同步重叠也可能让一次扫描两次读到同一事务。重复条目经
+	// /transactions 下发后，前端 keyed each（tx.txId）会抛
+	// each_key_duplicate 冻结整个页面。
+	if _, dup := p.known[meta.TxID]; dup {
+		return
+	}
 	if len(p.metas) >= p.maxEntries {
 		p.truncated = true
 		return
@@ -626,6 +633,19 @@ func (h *Handler) stageSQL(opID string, wires []ws.StatementWire) {
 			continue
 		}
 		if _, ok := p.known[w.TxID]; !ok {
+			continue
+		}
+		// 按 TxOrder 去重：同一事务的语句集在一次扫描内只推一次，但
+		// selected 模式换选后重扫、或重复投递，会让同一 TxOrder 的语句
+		// 再次到达——重复语句会被执行两遍。
+		dup := false
+		for _, ex := range p.sqlByTx[w.TxID] {
+			if ex.TxOrder == w.TxOrder {
+				dup = true
+				break
+			}
+		}
+		if dup {
 			continue
 		}
 		p.sqlByTx[w.TxID] = append(p.sqlByTx[w.TxID], w)

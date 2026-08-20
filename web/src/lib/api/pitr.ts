@@ -238,9 +238,20 @@ export function getStatus(id: string): Promise<OperationStatus> {
  * `GET /api/pitr/{id}/transactions` — the in-memory scan preview (partial
  * while the scan still runs; empty once the operation reached a terminal
  * state and the preview was released).
+ *
+ * Duplicate TxIDs are dropped client-side (first wins): a duplicate would
+ * crash every keyed `{#each ... (tx.txId)}` with each_key_duplicate and
+ * freeze the whole wizard/detail page.
  */
-export function getTransactions(id: string): Promise<TransactionsResponse> {
-	return apiFetch<TransactionsResponse>(`/pitr/${encodeURIComponent(id)}/transactions`);
+export async function getTransactions(id: string): Promise<TransactionsResponse> {
+	const resp = await apiFetch<TransactionsResponse>(`/pitr/${encodeURIComponent(id)}/transactions`);
+	const seen = new Set<string>();
+	resp.transactions = resp.transactions.filter((tx) => {
+		if (!tx.txId || seen.has(tx.txId)) return false;
+		seen.add(tx.txId);
+		return true;
+	});
+	return resp;
 }
 
 /**

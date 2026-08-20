@@ -836,6 +836,46 @@ func TestTransactions_EmptyPreview(t *testing.T) {
 	assert.Empty(t, resp.Transactions)
 }
 
+// TestTransactions_DeduplicatesRedeliveredEntries 校验 preview 对重复投递的
+// 容错：同一 TxID 的 tx_meta 重推（selected 模式定向二次扫描重推所选事务、
+// 归档重叠导致的重复读取）不得产生重复条目；同一 TxOrder 的语句重推不得
+// 重复入列（重复语句会被执行两遍；重复 TxID 会让前端 keyed each 抛
+// each_key_duplicate 冻结页面）。
+func TestTransactions_DeduplicatesRedeliveredEntries(t *testing.T) {
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	op := f.createOp(t, "op_dedup", orgID, agentID, StateScanning)
+
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvTxMeta, txMetaData("aaa:1", "2026-07-08T12:00:00Z", 2))
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvTxMeta, txMetaData("aaa:2", "2026-07-08T12:01:00Z", 1))
+	// 重推 aaa:1 的 meta：必须被忽略。
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvTxMeta, txMetaData("aaa:1", "2026-07-08T12:00:00Z", 2))
+
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvSQL, []ws.StatementWire{
+		{SQL: "DELETE FROM shop.orders WHERE id=1", TxID: "aaa:1", TxOrder: 0},
+		{SQL: "DELETE FROM shop.orders WHERE id=2", TxID: "aaa:1", TxOrder: 1},
+	})
+	// 重推 aaa:1 的两条语句（同 TxOrder）：必须被忽略。
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvSQL, []ws.StatementWire{
+		{SQL: "DELETE FROM shop.orders WHERE id=1", TxID: "aaa:1", TxOrder: 0},
+		{SQL: "DELETE FROM shop.orders WHERE id=2", TxID: "aaa:1", TxOrder: 1},
+	})
+
+	req := f.authenticatedRouteRequest(t, http.MethodGet, "/api/pitr/op_dedup/transactions", "op_dedup", nil, userID)
+	w := httptest.NewRecorder()
+	f.handler.Transactions(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var resp struct {
+		Transactions []txPreview `json:"transactions"`
+	}
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	require.Len(t, resp.Transactions, 2, "重复 tx_meta 不得产生重复条目")
+	require.Len(t, resp.Transactions[0].SQL, 2, "重复语句（同 TxOrder）不得重复入列")
+}
+
 func TestPreview_MemoryBound(t *testing.T) {
 	// Plan deliverable: the in-memory scan preview is capped at the operation's
 	// MaxPreview (server-side), dropping tx_meta entries beyond the cap and
