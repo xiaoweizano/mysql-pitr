@@ -56,7 +56,7 @@ web
 ## Brand Commitments
 
 - 产品名称：**MySQL PITR**（不预设特定品牌名，README 中称为"MySQL PITR 平台"）
-- 当前 logo：`docs/diagrams/logo.svg`（纯图标无文字：字母 M 化作双峰山形——前峰紫青渐变（#863bff→#47bfff）、后峰紫色拖尾，白色恢复点落在谷底；与 web favicon 的紫青配色同族，favicon 就绪）
+- 当前 logo：`docs/diagrams/logo.svg` = `web/static/favicon.svg`（深色双峰 M：#10131a 深底圆角卡，字母 M 化作双峰山形——前峰紫青渐变 #863bff→#47bfff、后峰紫色拖尾，白色恢复点落在谷底；深浅色主题下均清晰）
 - 默认界面语言：简体中文（zh-CN 为第一语言，英文为第二语言）
 - 视觉风格定位：现代、精致、专业的产品感
 - 开源协议：MIT
