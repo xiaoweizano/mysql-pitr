@@ -86,3 +86,38 @@ export function syncPreviewCounts<T extends { sql?: unknown[] }>(
 		sqlReceived: Math.max(sqlReceived, sqlTotal)
 	};
 }
+
+/**
+ * Infer the ORIGINAL operation type from a reverse-SQL statement's verb:
+ * reverse INSERT undoes a DELETE, reverse DELETE undoes an INSERT, reverse
+ * UPDATE undoes an UPDATE. Anything else returns null.
+ */
+export function stmtOpKind(stmtSql: string): 'delete' | 'insert' | 'update' | null {
+	const sql = stmtSql.trimStart().toUpperCase();
+	if (sql.startsWith('INSERT')) return 'delete';
+	if (sql.startsWith('DELETE')) return 'insert';
+	if (sql.startsWith('UPDATE')) return 'update';
+	return null;
+}
+
+/**
+ * Whether a transaction carries reverse SQL relevant to the recovery type —
+ * the exact rule SqlPreview applies to its displayed groups:
+ *   flashback         → transactions containing reverse INSERT (undo DELETE)
+ *   update_rollback   → transactions containing reverse UPDATE
+ *   pitr / pitr_tx / gtid → every transaction with SQL
+ *
+ * The wizard's DEFAULT selection must use the same rule: selecting hidden
+ * transactions silently executes SQL the operator never saw (the "preview
+ * shows 2 but the button says 33" bug).
+ */
+export function txMatchesOpType(
+	tx: { sql?: { sql: string }[] | null },
+	opType: string
+): boolean {
+	if (opType !== 'flashback' && opType !== 'update_rollback') {
+		return !!tx.sql && tx.sql.length > 0;
+	}
+	const want = opType === 'flashback' ? 'delete' : 'update';
+	return !!tx.sql && tx.sql.some((s) => stmtOpKind(s.sql) === want);
+}

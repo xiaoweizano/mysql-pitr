@@ -37,7 +37,7 @@
 	import { listAgents, type AgentInfo } from '$lib/api/agents.js';
 	import { listOrgs } from '$lib/api/orgs.js';
 	import { connectSSE, type SSEClient, type SSEEventKind } from '$lib/sse.js';
-	import { decideScanDone, selectionChanged, syncPreviewCounts, type ScanFlowMode } from '$lib/pitr/scan-flow.js';
+	import { decideScanDone, selectionChanged, syncPreviewCounts, txMatchesOpType, type ScanFlowMode } from '$lib/pitr/scan-flow.js';
 	import TxTable from '$lib/components/pitr/TxTable.svelte';
 	import SqlPreview from '$lib/components/pitr/SqlPreview.svelte';
 	import ExecutePanel from '$lib/components/pitr/ExecutePanel.svelte';
@@ -383,7 +383,14 @@
 	}
 
 	function initSqlChecked() {
-		const withSql = txs.filter((tx) => tx.sql && tx.sql.length > 0).map((tx) => tx.txId);
+		// Default selection = what the preview SHOWS: apply the same
+		// recovery-type filter SqlPreview uses (e.g. update_rollback → only
+		// transactions carrying UPDATE statements). Selecting hidden
+		// transactions would execute SQL the operator never reviewed.
+		const withSql = txs
+			.filter((tx) => txMatchesOpType(tx, opType))
+			.map((tx) => tx.txId);
+		// selected 模式默认勾选步骤 3 所选事务。
 		sqlChecked =
 			mode === 'selected' ? [...selected.filter((id) => withSql.includes(id))] : [...withSql];
 	}

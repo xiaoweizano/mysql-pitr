@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { t } from '$lib/i18n.svelte.js';
 	import type { PitrType, SqlStatement, TxPreview } from '$lib/api/pitr.js';
+	import { stmtOpKind } from '$lib/pitr/scan-flow.js';
 	import { formatDateTime, shortId } from '$lib/format.js';
 	import { Check, AlertTriangle } from '@lucide/svelte';
 
@@ -39,22 +40,16 @@
 		opType?: PitrType;
 	} = $props();
 
-	/** Infer the original operation type from a reverse SQL statement. */
-	function stmtOpType(stmt: SqlStatement): 'delete' | 'insert' | 'update' | null {
-		const sql = stmt.sql.trimStart().toUpperCase();
-		if (sql.startsWith('INSERT')) return 'delete';  // reverse of DELETE
-		if (sql.startsWith('DELETE')) return 'insert';   // reverse of INSERT
-		if (sql.startsWith('UPDATE')) return 'update';   // reverse of UPDATE
-		return null;
-	}
-
-	/** Flatten transactions into individual stmts with their inferred op type. */
+	/** Flatten transactions into individual stmts with their inferred op type.
+	 * stmtOpKind is the shared rule — the wizard's default selection applies
+	 * the same one via txMatchesOpType, so display and selection cannot
+	 * diverge. */
 	type TxStmt = { txId: string; commitTime: string; rowCount: number; stmt: SqlStatement; opType: string | null };
 	const allStmts = $derived(
 		transactions
 			.filter((tx) => tx.sql && tx.sql.length > 0)
 			.flatMap((tx) =>
-				tx.sql!.map((s) => ({ txId: tx.txId, commitTime: tx.commitTime, rowCount: tx.rowCount, stmt: s, opType: stmtOpType(s) }))
+				tx.sql!.map((s) => ({ txId: tx.txId, commitTime: tx.commitTime, rowCount: tx.rowCount, stmt: s, opType: stmtOpKind(s.sql) }))
 			)
 	);
 
