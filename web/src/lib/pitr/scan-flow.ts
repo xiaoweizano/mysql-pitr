@@ -121,3 +121,16 @@ export function txMatchesOpType(
 	const want = opType === 'flashback' ? 'delete' : 'update';
 	return !!tx.sql && tx.sql.some((s) => stmtOpKind(s.sql) === want);
 }
+
+/**
+ * Idempotent wizard-step resolution. SSE events (op_done / scan_done), the
+ * POST responses, and the /status polling safety net can each fire the same
+ * transition — a fast operation's op_done races startExecute's advance, and
+ * an incrementing transition overshoots (4 → 5 → 6), where no step branch
+ * matches and the summary falls back to the scan-total text. Explicit
+ * targets with this rule make duplicates no-ops; target 3 is the only legal
+ * backward move (the selected-mode directed rescan).
+ */
+export function resolveStepTransition(current: number, target: number): number {
+	return target > current || target === 3 ? target : current;
+}

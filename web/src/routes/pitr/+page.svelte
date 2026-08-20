@@ -37,7 +37,7 @@
 	import { listAgents, type AgentInfo } from '$lib/api/agents.js';
 	import { listOrgs } from '$lib/api/orgs.js';
 	import { connectSSE, type SSEClient, type SSEEventKind } from '$lib/sse.js';
-	import { decideScanDone, selectionChanged, syncPreviewCounts, txMatchesOpType, type ScanFlowMode } from '$lib/pitr/scan-flow.js';
+	import { decideScanDone, selectionChanged, syncPreviewCounts, txMatchesOpType, resolveStepTransition, type ScanFlowMode } from '$lib/pitr/scan-flow.js';
 	import TxTable from '$lib/components/pitr/TxTable.svelte';
 	import SqlPreview from '$lib/components/pitr/SqlPreview.svelte';
 	import ExecutePanel from '$lib/components/pitr/ExecutePanel.svelte';
@@ -86,11 +86,21 @@
 		}
 	}
 
-	function advanceStep() {
+	/**
+	 * 幂等的目标步骤切换。op_done / scan_done SSE、POST 响应与 /status 轮询
+	 * 安全网可能对同一次转换各触发一次——自增式推进会在快速事务上过冲
+	 * （4→5→6，第 6 步无分支，摘要条落回"已接收"）。显式目标 + 幂等规则
+	 * （resolveStepTransition）让重复触发无副作用；目标 3 是唯一合法的
+	 * 回退（selected 模式定向二次扫描）。
+	 */
+	function setStep(n: number) {
 		transitioning = true;
 		setTimeout(() => {
-			step = step + 1;
-			stepKey = step;
+			const next = resolveStepTransition(step, n);
+			if (next !== step) {
+				step = next;
+				stepKey = next;
+			}
 			setTimeout(() => { transitioning = false; }, 20);
 		}, 150);
 	}
@@ -186,11 +196,11 @@
 					opStatus = st.status;
 					if (isTerminalState(st.status)) {
 						clearInterval(iv);
-						if (step === 4) advanceStep();
+						if (step === 4) setStep(5);
 						return;
 					}
 					if (st.status === 'executing' || st.status === 'paused') {
-						if (step === 4) advanceStep();
+						if (step === 4) setStep(5);
 						return;
 					}
 				}
@@ -320,7 +330,7 @@
 				txs = [];
 				progress = null;
 				execErrors = [];
-				advanceStep();
+				setStep(3);
 			} finally {
 				starting = false;
 			}
@@ -374,7 +384,7 @@
 		if (d.initSqlChecked) initSqlChecked();
 		if (d.advanceStep) {
 			rescanning = false;
-			advanceStep();
+			setStep(4);
 		}
 		if (d.continueExecute) {
 			pendingExecute = false;
@@ -429,13 +439,13 @@
 				if (opStatus === 'cancelled') terminalMessage = t('pitr.error.cancelled');
 				if (payload?.done !== undefined) progress = { done: payload.done, total: payload.total ?? 0 };
 				mergeErrors(payload?.errors);
-				advanceStep();
+				setStep(5);
 				break;
 			}
 			case 'op_error': {
 				opStatus = 'failed';
 				terminalMessage = extractErrorMessage(data);
-				advanceStep();
+				setStep(5);
 				break;
 			}
 		}
@@ -487,13 +497,13 @@
 					pendingExecute = true;
 					rescanning = true;
 					opStatus = sel.status;
-					advanceStep();
+					setStep(3);
 					return;
 				}
 			}
 			const ex = await executeOp(opId);
 			opStatus = ex.status;
-			advanceStep();
+			setStep(5);
 		} catch (e) {
 			flowError = e instanceof Error ? e.message : String(e);
 			await reconcileAfterExecuteFailure();
@@ -737,7 +747,7 @@
 					{#if formError}
 						<p class="text-xs text-destructive">{formError}</p>
 					{/if}
-					<Button onclick={() => { advanceStep(); formError = null; }} disabled={!agentId || !selectedAgentOnline()}>
+					<Button onclick={() => { setStep(2); formError = null; }} disabled={!agentId || !selectedAgentOnline()}>
 						{t('pitr.next')}
 						<ArrowRight class="size-3.5" />
 					</Button>
