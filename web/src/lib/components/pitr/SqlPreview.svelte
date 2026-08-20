@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { t } from '$lib/i18n.svelte.js';
-	import type { SqlStatement, TxPreview } from '$lib/api/pitr.js';
+	import type { PitrType, SqlStatement, TxPreview } from '$lib/api/pitr.js';
 	import { formatDateTime, shortId } from '$lib/format.js';
 	import { Check, AlertTriangle } from '@lucide/svelte';
 
@@ -20,20 +20,85 @@
 	 * - `checked`: bindable txId array of selected transactions.
 	 * - `readonly`: hide all checkboxes (detail page / after execution).
 	 * - `expandedByDefault`: render every group open (default true).
+	 * - `opType`: recovery type for auto-filtering the displayed SQL.
+	 *   flashback → only INSERT (reverse of DELETE);
+	 *   update_rollback → only UPDATE;
+	 *   pitr/pitr_tx/gtid → show all.
 	 */
 	let {
 		transactions,
 		checked = $bindable([] as string[]),
 		readonly = false,
-		expandedByDefault = true
+		expandedByDefault = true,
+		opType = 'pitr'
 	}: {
 		transactions: TxPreview[];
 		checked?: string[];
 		readonly?: boolean;
 		expandedByDefault?: boolean;
+		opType?: PitrType;
 	} = $props();
 
-	const groups = $derived(transactions.filter((tx) => tx.sql && tx.sql.length > 0));
+	/** Infer the original operation type from a reverse SQL statement. */
+	function stmtOpType(stmt: SqlStatement): 'delete' | 'insert' | 'update' | null {
+		const sql = stmt.sql.trimStart().toUpperCase();
+		if (sql.startsWith('INSERT')) return 'delete';  // reverse of DELETE
+		if (sql.startsWith('DELETE')) return 'insert';   // reverse of INSERT
+		if (sql.startsWith('UPDATE')) return 'update';   // reverse of UPDATE
+		return null;
+	}
+
+	/** Flatten transactions into individual stmts with their inferred op type. */
+	type TxStmt = { txId: string; commitTime: string; rowCount: number; stmt: SqlStatement; opType: string | null };
+	const allStmts = $derived(
+		transactions
+			.filter((tx) => tx.sql && tx.sql.length > 0)
+			.flatMap((tx) =>
+				tx.sql!.map((s) => ({ txId: tx.txId, commitTime: tx.commitTime, rowCount: tx.rowCount, stmt: s, opType: stmtOpType(s) }))
+			)
+	);
+
+	/** Filter by recovery type. */
+	const filteredStmts = $derived.by(() => {
+		if (opType === 'flashback') return allStmts.filter((s) => s.opType === 'delete');
+		if (opType === 'update_rollback') return allStmts.filter((s) => s.opType === 'update');
+		return allStmts; // pitr / pitr_tx / gtid → show all
+	});
+
+	/** Re-group filtered statements by transaction, sorted by commitTime descending. */
+	const groups = $derived.by(() => {
+		const byTx = new Map<string, TxStmt[]>();
+		for (const s of filteredStmts) {
+			const list = byTx.get(s.txId);
+			if (list) list.push(s);
+			else byTx.set(s.txId, [s]);
+		}
+		// Sort by commitTime descending, using the first stmt's time per tx.
+		return [...byTx.entries()]
+			.sort((a, b) => new Date(b[1][0].commitTime).getTime() - new Date(a[1][0].commitTime).getTime())
+			.map(([txId, stmts]) => ({
+				txId,
+				commitTime: stmts[0].commitTime,
+				rowCount: stmts[0].rowCount,
+				sql: stmts.map((s) => s.stmt)
+			}));
+	});
+
+	/** All txIds in the filtered group (for select-all / deselect-all). */
+	const groupTxIds = $derived(groups.map((g) => g.txId));
+
+	const allChecked = $derived(groupTxIds.length > 0 && groupTxIds.every((id) => checked.includes(id)));
+
+	function toggleAll() {
+		if (allChecked) {
+			const set = new Set(groupTxIds);
+			checked = checked.filter((id) => !set.has(id));
+		} else {
+			const set = new Set(checked);
+			for (const id of groupTxIds) set.add(id);
+			checked = [...set];
+		}
+	}
 
 	/** Expanded state per txId; a Set mutated in place is not reactive, so we reassign. */
 	let collapsed = $state<Set<string>>(new Set());
@@ -44,11 +109,8 @@
 
 	function toggleCollapse(txId: string) {
 		const next = new Set(collapsed);
-		if (next.has(txId)) {
-			next.delete(txId);
-		} else {
-			next.add(txId);
-		}
+		if (next.has(txId)) next.delete(txId);
+		else next.add(txId);
 		collapsed = next;
 	}
 
@@ -68,7 +130,7 @@
 	}
 
 	const checkedCount = $derived(checked.length);
-	const totalSql = $derived(groups.reduce((n, tx) => n + (tx.sql?.length ?? 0), 0));
+	const totalSql = $derived(groups.reduce((n, g) => n + (g.sql?.length ?? 0), 0));
 </script>
 
 {#if !readonly}
@@ -80,6 +142,14 @@
 				sql: String(totalSql)
 			})}
 		</span>
+		<button
+			type="button"
+			class="text-primary hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+			onclick={toggleAll}
+			disabled={groups.length === 0}
+		>
+			{allChecked ? t('pitr.tx.uncheckAll') : t('pitr.tx.checkAll')}
+		</button>
 	</div>
 {/if}
 

@@ -916,7 +916,7 @@
 				</CardDescription>
 			</CardHeader>
 			<CardContent>
-				<SqlPreview transactions={txs} bind:checked={sqlChecked} />
+				<SqlPreview transactions={txs} bind:checked={sqlChecked} opType={opType} />
 			</CardContent>
 			<CardFooter class="justify-between">
 				<Button variant="outline" onclick={handleCancel} disabled={busy || isTerminal}>
