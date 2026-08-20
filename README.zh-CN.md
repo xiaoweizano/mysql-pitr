@@ -6,18 +6,17 @@
 
 基于 [go-mysql](https://github.com/go-mysql-org/go-mysql) 的 MySQL 时间点恢复（PITR）平台。它持续归档二进制日志，让你浏览任意时间点的事务，并生成逆向 SQL 撤销误操作——自带 Web 控制台、多 agent 架构与单二进制 server。
 
+[![CI](https://img.shields.io/github/actions/workflow/status/xiaoweizano/mysql-pitr/ci.yml?branch=main&logo=github&logoColor=white&label=CI)](https://github.com/xiaoweizano/mysql-pitr/actions/workflows/ci.yml)
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![MySQL](https://img.shields.io/badge/MySQL-8.0-4479A1?logo=mysql&logoColor=white)](https://www.mysql.com)
 [![SvelteKit](https://img.shields.io/badge/SvelteKit-2-FF3E00?logo=svelte&logoColor=white)](https://kit.svelte.dev)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Release](https://img.shields.io/github/v/release/xiaoweizano/mysql-pitr?include_prereleases)](https://github.com/xiaoweizano/mysql-pitr/releases)
-[![Stars](https://img.shields.io/github/stars/xiaoweizano/mysql-pitr)](https://github.com/xiaoweizano/mysql-pitr/stargazers)
+[![Release](https://img.shields.io/github/v/release/xiaoweizano/mysql-pitr?include_prereleases&logo=github&logoColor=white)](https://github.com/xiaoweizano/mysql-pitr/releases)
+[![Stars](https://img.shields.io/github/stars/xiaoweizano/mysql-pitr?logo=github&logoColor=white)](https://github.com/xiaoweizano/mysql-pitr/stargazers)
 
 [English](README.md) | 简体中文
 
 </div>
-
-![PITR v3 架构](docs/diagrams/pitr-architecture.png)
 
 ## 功能特性
 
@@ -84,14 +83,14 @@ stateDiagram-v2
 ### 环境要求
 
 - Go 1.25+（go-mysql v1.16.0 经 goproxy.cn 或直接源获取）
-- Node.js 22+（仅构建前端时需要；运行时前端已内嵌进二进制）
+- Node.js 20+（仅构建前端时需要；运行时前端已内嵌进二进制）
 - MySQL 8.0（建议 `binlog_format=ROW`；GTID 恢复需要 `gtid_mode=ON`）
 
 ### 构建
 
 ```bash
 make build-web   # 构建 SvelteKit 前端并拷入 embed_build
-make build       # 产出 bin/server 与 bin/agent
+make build       # 产出 bin/mysql-pitr-server 与 bin/mysql-pitr-agent
 ```
 
 或 Docker：`docker build --target server .` / `docker build --target agent .`
@@ -165,7 +164,7 @@ docker builder prune --keep-storage 1GB -f  # 或只保留 1GB 缓存上限
 export AGENT_DATA_DIR=./data      # SQLite + CA 存放目录（默认 ./data）
 export LISTEN_ADDR=:8080          # Web 控制台 + REST
 export AGENT_LISTEN_ADDR=:9443    # agent mTLS 端点
-./bin/server
+./bin/mysql-pitr-server
 ```
 
 打开 <http://localhost:8080>，注册账号、创建组织，并在 agent 接入后审批它。
@@ -174,13 +173,13 @@ export AGENT_LISTEN_ADDR=:9443    # agent mTLS 端点
 
 ```bash
 # 1. 生成加密配置（交互输入 MySQL 连接信息与归档目录）
-./bin/agent config encrypt -o agent.json
+./bin/mysql-pitr-agent config encrypt -o agent.json
 
 # 2. 后台服务：连接 server + 启动归档循环
-./bin/agent serve --config agent.json --passphrase '...'
+./bin/mysql-pitr-agent serve --config agent.json --passphrase '...'
 
 # 3. 或命令行直接闪回（不依赖 server）
-./bin/agent flashback --mysql-dsn 'user:pass@tcp(127.0.0.1:3306)/' \
+./bin/mysql-pitr-agent flashback --mysql-dsn 'user:pass@tcp(127.0.0.1:3306)/' \
   --target-table shop.orders --recovery-time '2026-08-01T00:00:00Z' --dry-run
 ```
 
@@ -199,6 +198,18 @@ MySQL 账号需要 `SELECT`、`REPLICATION SLAVE`、`REPLICATION CLIENT`（以�
 
 ## Web 控制台
 
+**登录**——默认深色主题，侧边栏可切换浅色：
+
+![登录页](docs/screenshots/login.png)
+
+**实例**——agent 状态、审批流程、归档健康度：
+
+![实例列表](docs/screenshots/instances.png)
+
+**PITR 向导**——经 SSE 实时流式扫描事务：
+
+![PITR 向导](docs/screenshots/pitr-wizard.png)
+
 - **实例**——agent 列表、在线/离线状态、审批流程、每实例归档健康度
 - **PITR 向导**——5 步：选恢复类型（误删恢复 / UPDATE 回滚 / 指定时间 / 指定事务 / GTID 定位）→ 设过滤（表、时间区间、GTID 集）→ 经 SSE 实时查看扫描 → 按事务分组审阅并勾选逆向 SQL → 执行并实时查看进度（pause / resume / cancel）
 - **操作历史**——历史操作的状态、过滤摘要与审计条目
@@ -216,7 +227,7 @@ MySQL 账号需要 `SELECT`、`REPLICATION SLAVE`、`REPLICATION CLIENT`（以�
 ```bash
 make test          # 单元测试（24 个包）
 make test-race     # race detector（建议在 amd64 CI 上跑）
-make lint          # go vet + golangci-lint
+make lint          # golangci-lint
 ```
 
 集成测试（`integration` tag，需真实 MySQL 8.0——见 `scripts/e2e/README.md`）：
@@ -249,7 +260,7 @@ docs/diagrams      架构图源文件（.mmd / .svg / .png / .excalidraw）
 
 ## 参考资料
 
-- [go-mysql](https://github.com/go-mysql-org/go-mysql) —— `git@github.com:go-mysql-org/go-mysql.git` —— binlog 解析与复制协议（Apache-2.0）
+- [go-mysql](https://github.com/go-mysql-org/go-mysql) —— binlog 解析与复制协议（Apache-2.0）
 - [SvelteKit](https://kit.svelte.dev) —— MIT
 - [shadcn-svelte](https://shadcn-svelte.com) —— MIT
 - [Tailwind CSS](https://tailwindcss.com) —— MIT
@@ -258,6 +269,12 @@ docs/diagrams      架构图源文件（.mmd / .svg / .png / .excalidraw）
 - [gorilla/websocket](https://github.com/gorilla/websocket) —— BSD-2-Clause
 - [golang-jwt/jwt](https://github.com/golang-jwt/jwt) —— MIT
 - [testify](https://github.com/stretchr/testify) —— MIT
+
+## 已知限制
+
+- 仅支持 **DML 逆向**（`DELETE` / `UPDATE`）；DDL 变更不在恢复范围内。
+- 要求 MySQL 8.0+ 且 `binlog_format=ROW`、`binlog_row_image=FULL`；GTID 定位额外要求 `gtid_mode=ON`。
+- 逆向 SQL 经 agent 在 MySQL 主机上执行；`resume` 要求 agent（及其 MySQL）在线。
 
 ## 许可证
 

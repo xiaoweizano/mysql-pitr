@@ -6,29 +6,28 @@
 
 A point-in-time recovery (PITR) platform for MySQL built on [go-mysql](https://github.com/go-mysql-org/go-mysql). It continuously archives binary logs, lets you browse transactions from any point in time, and generates reverse SQL to undo accidental changes — with a web console, a multi-agent architecture, and a single-binary server.
 
+[![CI](https://img.shields.io/github/actions/workflow/status/xiaoweizano/mysql-pitr/ci.yml?branch=main&logo=github&logoColor=white&label=CI)](https://github.com/xiaoweizano/mysql-pitr/actions/workflows/ci.yml)
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![MySQL](https://img.shields.io/badge/MySQL-8.0-4479A1?logo=mysql&logoColor=white)](https://www.mysql.com)
 [![SvelteKit](https://img.shields.io/badge/SvelteKit-2-FF3E00?logo=svelte&logoColor=white)](https://kit.svelte.dev)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Release](https://img.shields.io/github/v/release/xiaoweizano/mysql-pitr?include_prereleases)](https://github.com/xiaoweizano/mysql-pitr/releases)
-[![Stars](https://img.shields.io/github/stars/xiaoweizano/mysql-pitr)](https://github.com/xiaoweizano/mysql-pitr/stargazers)
+[![Release](https://img.shields.io/github/v/release/xiaoweizano/mysql-pitr?include_prereleases&logo=github&logoColor=white)](https://github.com/xiaoweizano/mysql-pitr/releases)
+[![Stars](https://img.shields.io/github/stars/xiaoweizano/mysql-pitr?logo=github&logoColor=white)](https://github.com/xiaoweizano/mysql-pitr/stargazers)
 
 English | [简体中文](README.zh-CN.md)
 
 </div>
 
-![PITR v3 architecture](docs/diagrams/pitr-architecture.png)
-
 ## Features
 
-- **误删恢复 (accidental DELETE recovery)** — reverse DELETE into INSERT from the row image
-- **UPDATE 回滚** — reverse UPDATE restores the before-image values
-- **指定时间恢复 (point-in-time recovery)** — scan binlogs up to an arbitrary timestamp
-- **指定事务恢复 (transaction-level recovery)** — pick exact transactions by GTID or XID
-- **GTID 定位** — filter candidates by a GTID set
-- **大 binlog 增量归档 (incremental archiving)** — a local archive keeps a complete binlog mirror independent of MySQL's purge window, so recovery works weeks later
-- **多实例管理** — one server manages many agents (one per MySQL host) over mTLS
-- **检查点化执行 (checkpointed execution)** — rollbacks resume from the last committed batch after interruption
+- **Accidental DELETE recovery** — reverse DELETE into INSERT from the row image
+- **UPDATE rollback** — reverse UPDATE restores the before-image values
+- **Point-in-time recovery** — scan binlogs up to an arbitrary timestamp
+- **Transaction-level recovery** — pick exact transactions by GTID or XID
+- **GTID targeting** — filter candidates by a GTID set
+- **Incremental binlog archiving** — a local archive keeps a complete binlog mirror independent of MySQL's purge window, so recovery works weeks later
+- **Multi-instance management** — one server manages many agents (one per MySQL host) over mTLS
+- **Checkpointed execution** — rollbacks resume from the last committed batch after interruption
 
 ## Architecture
 
@@ -83,15 +82,15 @@ The full flow: `start` scans the archive through the agent and streams transacti
 
 ### Prerequisites
 
-- Go 1.25+（工具链经 goproxy.cn 或直接源获取 go-mysql v1.16.0）
-- Node.js 22+（仅构建前端时需要；运行时前端已内嵌进二进制）
-- MySQL 8.0（建议 `binlog_format=ROW`；GTID 恢复需要 `gtid_mode=ON`）
+- Go 1.25+ (go-mysql v1.16.0 resolves through your Go proxy or a direct source)
+- Node.js 20+ (only needed to build the frontend; at runtime it is already embedded in the binary)
+- MySQL 8.0 (`binlog_format=ROW` recommended; GTID recovery requires `gtid_mode=ON`)
 
 ### Build
 
 ```bash
-make build-web   # 构建 SvelteKit 前端并拷入 embed_build
-make build       # 产出 bin/server 与 bin/agent
+make build-web   # build the SvelteKit frontend and copy it into embed_build
+make build       # produces bin/mysql-pitr-server and bin/mysql-pitr-agent
 ```
 
 or Docker: `docker build --target server .` / `docker build --target agent .`
@@ -162,10 +161,10 @@ docker builder prune --keep-storage 1GB -f  # or cap the cache instead of wiping
 ### Run the server
 
 ```bash
-export AGENT_DATA_DIR=./data      # SQLite + CA 存放目录（默认 ./data）
-export LISTEN_ADDR=:8080          # Web 控制台 + REST
-export AGENT_LISTEN_ADDR=:9443    # agent mTLS 端点
-./bin/server
+export AGENT_DATA_DIR=./data      # SQLite + CA storage dir (default ./data)
+export LISTEN_ADDR=:8080          # web console + REST
+export AGENT_LISTEN_ADDR=:9443    # agent mTLS endpoint
+./bin/mysql-pitr-server
 ```
 
 Open <http://localhost:8080>, register, create an organisation, and approve the agent once it connects.
@@ -173,14 +172,14 @@ Open <http://localhost:8080>, register, create an organisation, and approve the 
 ### Run the agent (on the MySQL host)
 
 ```bash
-# 1. 生成加密配置（交互输入 MySQL 连接信息与归档目录）
-./bin/agent config encrypt -o agent.json
+# 1. Generate the encrypted config (interactive: MySQL connection + archive dir)
+./bin/mysql-pitr-agent config encrypt -o agent.json
 
-# 2. 后台服务：连接 server + 启动归档循环
-./bin/agent serve --config agent.json --passphrase '...'
+# 2. Daemon mode: connect to the server + run the archive loop
+./bin/mysql-pitr-agent serve --config agent.json --passphrase '...'
 
-# 3. 或命令行直接闪回（不依赖 server）
-./bin/agent flashback --mysql-dsn 'user:pass@tcp(127.0.0.1:3306)/' \
+# 3. Or run a one-shot flashback directly (no server involved)
+./bin/mysql-pitr-agent flashback --mysql-dsn 'user:pass@tcp(127.0.0.1:3306)/' \
   --target-table shop.orders --recovery-time '2026-08-01T00:00:00Z' --dry-run
 ```
 
@@ -199,10 +198,24 @@ The MySQL account needs `SELECT`, `REPLICATION SLAVE`, `REPLICATION CLIENT` (and
 
 ## Web Console
 
-- **实例** — agent list, online/offline status, approval workflow, archive health per instance
-- **PITR 向导** — 5 steps: pick recovery type (误删恢复 / UPDATE 回滚 / 指定时间 / 指定事务 / GTID 定位) → set filters (tables, time range, GTID set) → watch the live scan over SSE → review and check reverse SQL grouped by transaction → execute with live progress and pause/resume/cancel
-- **操作历史** — past operations with status, filter summary, and audit entries
-- **审计 / 组织** — audit log with CSV export; organisations, members, invites
+The console ships Chinese-first (zh-CN).
+
+**Login** — dark theme by default, light theme via the sidebar toggle:
+
+![Login](docs/screenshots/login.png)
+
+**Instances** — agent status, approval workflow, archive health:
+
+![Instances](docs/screenshots/instances.png)
+
+**PITR wizard** — live transaction scan streaming over SSE:
+
+![PITR wizard](docs/screenshots/pitr-wizard.png)
+
+- **Instances** — agent list, online/offline status, approval workflow, archive health per instance
+- **PITR wizard** — 5 steps: pick a recovery type → set filters (tables, time range, GTID set) → watch the live scan over SSE → review and check reverse SQL grouped by transaction → execute with live progress and pause/resume/cancel
+- **Operations** — past operations with status, filter summary, and audit entries
+- **Audit / Orgs** — audit log with CSV export; organisations, members, invites
 
 ## Execution semantics
 
@@ -214,50 +227,56 @@ The MySQL account needs `SELECT`, `REPLICATION SLAVE`, `REPLICATION CLIENT` (and
 ## Testing
 
 ```bash
-make test          # 单元测试（24 个包）
-make test-race     # race detector（建议在 amd64 CI 上跑）
-make lint          # go vet + golangci-lint
+make test          # unit tests (24 packages)
+make test-race     # race detector (recommended on amd64 CI)
+make lint          # golangci-lint
 ```
 
 Integration tests (tagged `integration`, run against a real MySQL 8.0 — see `scripts/e2e/README.md`):
 
 ```bash
-go test -tags integration ./internal/binlog/ -run TestE2E        # 8 个回滚场景
-go test -tags integration ./internal/collector/ -run TestE2E     # 归档循环完整性
-go test -tags integration ./internal/server/ -run TestE2E        # server-agent-mysql 黄金路径
+go test -tags integration ./internal/binlog/ -run TestE2E        # 8 rollback scenarios
+go test -tags integration ./internal/collector/ -run TestE2E     # archive loop integrity
+go test -tags integration ./internal/server/ -run TestE2E        # server-agent-mysql golden path
 ```
 
 ## Project Layout
 
 ```
-cmd/agent          agent CLI: serve（daemon）/ flashback / config
-cmd/server         server 入口（Web + mTLS agent 端点）
-internal/binlog    go-mysql 封装：Source 事件流、事务聚合、GTID
-internal/scan      扫描模式（META_ONLY / WITH_SQL / SELECTED_SQL）
-internal/archive   归档写入（raw 事件还原、封口验证、缺口检测）
-internal/collector 归档循环（回填、增量、reconcile、状态持久化）
-internal/reverse   逆向 SQL 纯函数库（agent 端生成）
-internal/executor  检查点化批量执行 + 文件检查点存储
-internal/stream    binlogsyncer 事件源封装
-internal/daemon    agent 命令层（scan/execute/resume/cancel）
-internal/ws        WebSocket 协议 + hub + mTLS CA + agent 客户端
-internal/server    REST/SSE、SQLite 仓储、操作状态机、embed 前端
-internal/connector MySQL 连接、schema 拉取、preflight
-web                SvelteKit SPA（adapter-static）
-docs/diagrams      架构图源文件（.mmd / .svg / .png / .excalidraw）
+cmd/agent          agent CLI: serve (daemon) / flashback / config
+cmd/server         server entrypoint (web + mTLS agent endpoint)
+internal/binlog    go-mysql wrapper: source event stream, transaction aggregation, GTID
+internal/scan      scan modes (META_ONLY / WITH_SQL / SELECTED_SQL)
+internal/archive   archive writing (raw event reconstruction, seal verification, gap detection)
+internal/collector archive loop (backfill, incremental, reconcile, state persistence)
+internal/reverse   pure reverse-SQL library (generated agent-side)
+internal/executor  checkpointed batch execution + file checkpoint store
+internal/stream    binlogsyncer event-source wrapper
+internal/daemon    agent command layer (scan/execute/resume/cancel)
+internal/ws        WebSocket protocol + hub + mTLS CA + agent client
+internal/server    REST/SSE, SQLite repositories, operation state machine, embedded frontend
+internal/connector MySQL connection, schema fetch, preflight
+web                SvelteKit SPA (adapter-static)
+docs/diagrams      architecture diagram sources (.mmd / .svg / .png / .excalidraw)
 ```
 
 ## References
 
-- [go-mysql](https://github.com/go-mysql-org/go-mysql) — `git@github.com:go-mysql-org/go-mysql.git` — binlog 解析与复制协议（Apache-2.0）
+- [go-mysql](https://github.com/go-mysql-org/go-mysql) — binlog parsing and the replication protocol (Apache-2.0)
 - [SvelteKit](https://kit.svelte.dev) — MIT
 - [shadcn-svelte](https://shadcn-svelte.com) — MIT
 - [Tailwind CSS](https://tailwindcss.com) — MIT
-- [modernc.org/sqlite](https://gitlab.com/cznic/sqlite) — BSD-3-Clause（`github.com/modernc.org/sqlite` 镜像）
+- [modernc.org/sqlite](https://gitlab.com/cznic/sqlite) — BSD-3-Clause (`github.com/modernc.org/sqlite` mirror)
 - [go-chi/chi](https://github.com/go-chi/chi) — MIT
 - [gorilla/websocket](https://github.com/gorilla/websocket) — BSD-2-Clause
 - [golang-jwt/jwt](https://github.com/golang-jwt/jwt) — MIT
 - [testify](https://github.com/stretchr/testify) — MIT
+
+## Limitations
+
+- Recovery reverses **DML only** (`DELETE` / `UPDATE`); DDL changes are not reversed.
+- Requires MySQL 8.0+ with `binlog_format=ROW` and `binlog_row_image=FULL`; GTID targeting additionally requires `gtid_mode=ON`.
+- Reverse SQL executes through the agent on the MySQL host; `resume` requires the agent (and its MySQL) to be online.
 
 ## License
 
