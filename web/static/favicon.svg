@@ -1,9 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96">
   <defs>
-    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#1C2739"/>
-      <stop offset="1" stop-color="#0D1220"/>
-    </linearGradient>
     <linearGradient id="mc" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#863bff"/>
       <stop offset="1" stop-color="#47bfff"/>
@@ -14,15 +10,13 @@
     </radialGradient>
   </defs>
 
-  <!-- dark tile: keeps the white restore point visible on light browser chrome -->
-  <rect x="2" y="2" width="92" height="92" rx="24" fill="url(#tile)"/>
+  <!-- dark-mode card, as in the preview board -->
+  <rect width="96" height="96" rx="12" fill="#10131a"/>
 
-  <g transform="translate(48 48) scale(0.8) translate(-48 -48)">
-    <circle cx="50" cy="52" r="44" fill="url(#mg)"/>
-    <!-- M as twin peaks -->
-    <path d="M16 76 L40 24 L56 51 L43.5 51 Z" fill="url(#mc)"/>
-    <path d="M42 76 L64 30 L82 66 L71 66 L64 49 Z" fill="#863bff" opacity="0.7"/>
-    <!-- restore point in the valley -->
-    <circle cx="38" cy="78" r="5" fill="#ede6ff"/>
-  </g>
+  <circle cx="50" cy="52" r="44" fill="url(#mg)"/>
+  <!-- M as twin peaks -->
+  <path d="M16 76 L40 24 L56 51 L43.5 51 Z" fill="url(#mc)"/>
+  <path d="M42 76 L64 30 L82 66 L71 66 L64 49 Z" fill="#863bff" opacity="0.7"/>
+  <!-- restore point in the valley -->
+  <circle cx="38" cy="78" r="5" fill="#ede6ff"/>
 </svg>
