@@ -59,3 +59,30 @@ export function sameSelection(a: string[], b: string[]): boolean {
 	const key = (xs: string[]) => [...xs].sort().join('|');
 	return key(a) === key(b);
 }
+
+/**
+ * Sync the live SSE counters up from the authoritative /transactions snapshot.
+ *
+ * The live counters (received / sqlReceived) only grow on tx_meta / sql SSE
+ * events, and the backend event bus is non-blocking with no replay: a scan
+ * that finishes before the SSE subscription lands publishes to zero
+ * subscribers and the events are discarded. The polling safety net then
+ * advances the wizard from the snapshot, so the snapshot — never the live
+ * stream — is the only source the counters can trust after any refresh.
+ * Math.max keeps the larger side: a snapshot truncated at the preview cap
+ * (default 500) must not shrink counts that live events already grew past.
+ */
+export function syncPreviewCounts<T extends { sql?: unknown[] }>(
+	received: number,
+	sqlReceived: number,
+	txs: T[]
+): { received: number; sqlReceived: number } {
+	let sqlTotal = 0;
+	for (const tx of txs) {
+		if (tx.sql) sqlTotal += tx.sql.length;
+	}
+	return {
+		received: Math.max(received, txs.length),
+		sqlReceived: Math.max(sqlReceived, sqlTotal)
+	};
+}
