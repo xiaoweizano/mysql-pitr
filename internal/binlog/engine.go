@@ -2,6 +2,7 @@ package binlog
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -133,6 +134,14 @@ func (s *scanner) Close() error {
 	return nil
 }
 
+// errPastTimeEnd 是跨越 Filter.TimeRange.End 边界后的提前终止哨兵。
+// binlog 事件时间戳按提交顺序单调不减，一旦某事件时间戳超过 End，后续
+// （含当前未提交）事务的提交时间必然也超过 End，matchesFilter 不可能再命中；
+// 继续解析纯属开销——典型如"只填截止时间"的误删恢复：误删点之后归档里
+// 往往还有大量无关 binlog，全量解析期间界面无任何输出，与扫描卡死无异。
+// runParseLoop 把该哨兵当作正常结束（消费侧收到 io.EOF）。
+var errPastTimeEnd = errors.New("binlog: event timestamp past filter TimeRange.End")
+
 // runParseLoop 是核心解析循环；按文件顺序解析并把事务发到 s.txs。
 func (s *scanner) runParseLoop(ctx context.Context, files []string, f Filter) {
 	defer close(s.txs)
@@ -140,6 +149,9 @@ func (s *scanner) runParseLoop(ctx context.Context, files []string, f Filter) {
 
 	for _, file := range files {
 		if err := s.parseFile(ctx, file, f); err != nil {
+			if errors.Is(err, errPastTimeEnd) {
+				return
+			}
 			s.errs <- err
 			return
 		}
@@ -184,6 +196,12 @@ func (s *scanner) parseFile(ctx context.Context, path string, f Filter) error {
 		// 的事件（恰好结束于边界）仍被处理。
 		if f.EndPos.Name != "" && filepath.Base(path) == f.EndPos.Name && ev.Header.LogPos > f.EndPos.Pos {
 			break
+		}
+		// TimeRange.End 提前终止：事件时间戳超过 End 即整个扫描结束（见
+		// errPastTimeEnd）。时间戳为 0 的事件（如 FDE）不参与判断。
+		if f.TimeRange != nil && ev.Header.Timestamp > 0 &&
+			time.Unix(int64(ev.Header.Timestamp), 0).After(f.TimeRange.End) {
+			return errPastTimeEnd
 		}
 		if err := s.handleEvent(ev, &pending, tableMaps, f); err != nil {
 			return err

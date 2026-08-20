@@ -41,6 +41,16 @@ func MustCraft(ev []byte, err error) Event {
 	return Event{Type: replication.EventType(ev[4]), Raw: ev}
 }
 
+// WithTimestamp 改写已构造事件 header 中的时间戳并重算 CRC32，
+// 供 TimeRange 过滤/提前终止类测试构造差异化提交时间的事务。
+func WithTimestamp(ts uint32, ev []byte) []byte {
+	out := append([]byte(nil), ev...)
+	binary.LittleEndian.PutUint32(out[0:], ts)
+	body := out[:len(out)-replication.BinlogChecksumLength]
+	binary.LittleEndian.PutUint32(out[len(out)-replication.BinlogChecksumLength:], crc32.ChecksumIEEE(body))
+	return out
+}
+
 // craftEvent 构造一个完整 binlog 事件：19 字节 header + body + CRC32。
 // 校验和按 MySQL 规范覆盖 header+body（与 parser.SetVerifyChecksum(true) 一致）。
 func craftEvent(ts uint32, etype replication.EventType, serverID uint32, body []byte) []byte {

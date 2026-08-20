@@ -1,7 +1,9 @@
 package binlog
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -13,6 +15,8 @@ import (
 	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/a-shan/mysql-pitr/internal/binlogtest"
 )
 
 func TestScanner_EmptyFilterReturnsEOF(t *testing.T) {
@@ -349,6 +353,58 @@ func TestScanner_StartPosStartsMidFile(t *testing.T) {
 	require.NotEmpty(t, got, "StartPos.Pos 定位必须仍能产出事务")
 	require.Less(t, len(got), len(all), "StartPos.Pos 必须跳过开头的事务")
 	require.NotEqual(t, all[0].TxID, got[0].TxID, "第一个事务应从第 2 个事务开始")
+}
+
+// TestScanner_TimeRangeEndStopsEarly 校验 TimeRange.End 提前终止：事件时间戳
+// 超过 End 后整个扫描正常结束（io.EOF），不再解析后续文件。构造三个提交时间
+// 递增的事务（T / T+10 / T+20）+ 一个垃圾第二个文件——若提前终止失效，垃圾
+// 文件必被解析并报错。End=T+10 时应恰好返回前两个事务且无错误。
+func TestScanner_TimeRangeEndStopsEarly(t *testing.T) {
+	const sid = "3f9a5c8e1234567890abcdef01234567"
+	base := uint32(1750000000)
+
+	mkTx := func(gno int64, ts uint32) []binlogtest.Event {
+		gtid, e1 := binlogtest.CraftGTID(sid, gno)
+		begin, e2 := binlogtest.CraftQuery("BEGIN", "shop")
+		tmap, e3 := binlogtest.CraftTableMap("shop", "orders", 1)
+		rows, e4 := binlogtest.CraftWriteRowsValues(1, gno)
+		xid, e5 := binlogtest.CraftXID(uint64(gno))
+		require.NoError(t, errors.Join(e1, e2, e3, e4, e5))
+		out := make([]binlogtest.Event, 0, 5)
+		for _, raw := range [][]byte{gtid, begin, tmap, rows, xid} {
+			patched := binlogtest.WithTimestamp(ts, raw)
+			out = append(out, binlogtest.Event{Type: replication.EventType(patched[4]), Raw: patched})
+		}
+		return out
+	}
+
+	dir := t.TempDir()
+	evs := append(append(mkTx(1, base), mkTx(2, base+10)...), mkTx(3, base+20)...)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "mysql-bin.000001"), craftedBinlog(evs...), 0o644))
+	// 垃圾第二个文件：提前终止失效时的判别器（必被解析并报错）。
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "mysql-bin.000002"), bytes.Repeat([]byte{0xDE, 0xAD}, 64), 0o644))
+
+	end := time.Unix(int64(base+10), 0).UTC()
+	got := scanFilter(t, Filter{BinlogDir: dir, TimeRange: &TimeRange{End: end}})
+	require.Len(t, got, 2, "End=T+10 应返回前两个事务并提前结束")
+	for _, tx := range got {
+		require.False(t, tx.CommitTime.After(end), "返回事务的提交时间必须 ≤ End")
+	}
+
+	// 对照组：不设 TimeRange 时垃圾文件被解析 → 报错（证明上面的干净 EOF
+	// 确由提前终止带来，而非垃圾文件碰巧无害）。
+	s := NewScanner(StaticSchemaFetcher{})
+	require.NoError(t, s.Scan(context.Background(), Filter{BinlogDir: dir}))
+	defer s.Close()
+	var lastErr error
+	for {
+		_, err := s.Next()
+		if err != nil {
+			lastErr = err
+			break
+		}
+	}
+	require.Error(t, lastErr, "无 TimeRange 时必须解析到垃圾文件并报错")
 }
 
 // TestScanner_CloseInterruptsMidScan 回归评审发现：Close() 从未关闭 s.done，
