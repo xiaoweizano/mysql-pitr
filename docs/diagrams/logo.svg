@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="300" height="96" viewBox="0 0 300 96" role="img" aria-label="MySQL PITR logo">
+  <!-- counterclockwise recovery ring -->
+  <path d="M80 36.4 A34 34 0 1 0 59.6 16.1"
+        fill="none" stroke="#38BDF8" stroke-width="6" stroke-linecap="round"/>
+  <polygon points="59.6,16.1 73,14.6 68.8,25.8" fill="#38BDF8"/>
+
+  <!-- database cylinder -->
+  <path d="M28 36 v24 a20 7 0 0 0 40 0 V36 Z" fill="#2563EB"/>
+  <ellipse cx="48" cy="48" rx="20" ry="7" fill="none" stroke="#FFFFFF" stroke-opacity="0.3" stroke-width="2"/>
+  <ellipse cx="48" cy="36" rx="20" ry="7" fill="#60A5FA"/>
+
+  <!-- wordmark -->
+  <text x="104" y="58" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="32" font-weight="700" letter-spacing="0.5">
+    <tspan fill="#24292F">MySQL</tspan><tspan fill="#2563EB" dx="9">PITR</tspan>
+  </text>
+</svg>
