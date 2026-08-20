@@ -41,7 +41,7 @@
 	import TxTable from '$lib/components/pitr/TxTable.svelte';
 	import SqlPreview from '$lib/components/pitr/SqlPreview.svelte';
 	import ExecutePanel from '$lib/components/pitr/ExecutePanel.svelte';
-	import { LoaderCircle, CircleAlert, Database, RefreshCcw, ArrowLeft, ArrowRight, Check } from '@lucide/svelte';
+	import { LoaderCircle, CircleAlert, Database, RefreshCcw, ArrowLeft, ArrowRight, Check, History } from '@lucide/svelte';
 
 	// ── 类型 ──
 
@@ -558,6 +558,14 @@
 		const a = agents.find((x) => x.id === agentId);
 		return a ? a.hostname : '—';
 	}
+
+	/** 执行摘要：已勾选事务的语句总数（第 5 步显示实际执行的数量，而非扫描总量）。 */
+	const checkedSqlCount = $derived(
+		txs.reduce(
+			(n, tx) => (sqlChecked.includes(tx.txId) ? n + (tx.sql?.length ?? 0) : n),
+			0
+		)
+	);
 </script>
 
 <svelte:head>
@@ -617,10 +625,20 @@
 			<span class="font-medium text-foreground/70">{t('pitr.type.title')}：{formatTypeLabel()}</span>
 			<span class="text-border">|</span>
 			<span>{t('pitr.agent.title')}：{formatAgentName()}</span>
-			{#if step >= 3}
-				<span class="text-border">|</span>
+			<span class="text-border">|</span>
+			{#if step === 5}
+				<!-- 第 5 步显示实际勾选执行的数量，扫描总量此时只会造成误解 -->
+				<span>{t('pitr.summary.selected', { count: String(sqlChecked.length), sql: String(checkedSqlCount) })}</span>
+			{:else}
 				<span>{t('pitr.scan.received', { count: String(received), sql: String(sqlReceived) })}</span>
 			{/if}
+			<a
+				href="/operations"
+				class="ml-auto inline-flex shrink-0 items-center gap-1 text-primary transition-colors duration-150 hover:underline"
+			>
+				<History class="size-3.5" />
+				{t('pitr.summary.history')}
+			</a>
 		</div>
 	{/if}
 

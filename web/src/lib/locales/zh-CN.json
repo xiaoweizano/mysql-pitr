@@ -164,6 +164,8 @@
 	"pitr.error.blocked": "操作被阻塞（实例离线或服务重启）",
 	"pitr.error.cancelled": "操作已取消",
 	"pitr.sse.reconnecting": "连接已断开，正在自动重连…",
+	"pitr.summary.selected": "已勾选 {count} 个事务，执行 {sql} 条 SQL",
+	"pitr.summary.history": "操作历史",
 	"pitr.status.created": "已创建",
 	"pitr.status.scanning": "扫描中",
 	"pitr.status.ready": "就绪",
