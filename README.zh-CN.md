@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/diagrams/logo.svg" width="110" alt="MySQL PITR logo"/>
+<img src="docs/diagrams/logo.png" alt="MySQL PITR logo"/>
 
 # MySQL PITR 平台
 
