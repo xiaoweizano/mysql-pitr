@@ -1,18 +1,24 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="300" height="96" viewBox="0 0 300 96" role="img" aria-label="MySQL PITR logo">
-  <!-- counterclockwise recovery ring with integral arrowhead
-       (geometry after Lucide "rotate-ccw", ISC license) -->
-  <path d="M12 48a36 36 0 1 0 36-36 39 39 0 0 0-26.96 10.96L12 32"
-        fill="none" stroke="#38BDF8" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M12 12v20h20"
-        fill="none" stroke="#38BDF8" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96" role="img" aria-label="MySQL PITR logo">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1C2739"/>
+      <stop offset="1" stop-color="#0D1220"/>
+    </linearGradient>
+  </defs>
 
-  <!-- database cylinder -->
-  <path d="M31 38v20a17 6 0 0 0 34 0V38Z" fill="#2563EB"/>
-  <ellipse cx="48" cy="48" rx="17" ry="6" fill="none" stroke="#FFFFFF" stroke-opacity="0.3" stroke-width="2"/>
-  <ellipse cx="48" cy="38" rx="17" ry="6" fill="#60A5FA"/>
+  <!-- app-icon tile -->
+  <rect x="2" y="2" width="92" height="92" rx="24" fill="url(#bg)"/>
 
-  <!-- wordmark -->
-  <text x="104" y="58" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="32" font-weight="700" letter-spacing="0.5">
-    <tspan fill="#24292F">MySQL</tspan><tspan fill="#2563EB" dx="9">PITR</tspan>
-  </text>
+  <!-- binlog entries -->
+  <rect x="20" y="30" width="38" height="9" rx="4.5" fill="#3B82F6"/>
+  <rect x="20" y="45" width="48" height="9" rx="4.5" fill="#60A5FA"/>
+  <rect x="20" y="60" width="30" height="9" rx="4.5" fill="#2563EB"/>
+
+  <!-- rewind chevron -->
+  <path d="M72 26 L52 48 L72 70"
+        fill="none" stroke="#38BDF8" stroke-width="9"
+        stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- checkpoint on the recovered entry -->
+  <circle cx="40" cy="49.5" r="5" fill="#FFFFFF"/>
 </svg>

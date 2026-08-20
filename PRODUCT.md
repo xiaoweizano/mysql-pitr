@@ -56,7 +56,7 @@ web
 ## Brand Commitments
 
 - 产品名称：**MySQL PITR**（不预设特定品牌名，README 中称为"MySQL PITR 平台"）
-- 当前 logo：`docs/diagrams/logo.svg`（矢量字标：数据库圆柱 + 逆时针恢复环 + 双色文字，蓝 #2563EB / 天蓝 #38BDF8，与控制台主题一致）
+- 当前 logo：`docs/diagrams/logo.svg`（纯图标无文字：深蓝圆角方块内三条 binlog 条目 + 向左回退箭头 + 白色检查点节点，蓝 #2563EB→#60A5FA / 天蓝 #38BDF8，与控制台主题一致，favicon 就绪）
 - 默认界面语言：简体中文（zh-CN 为第一语言，英文为第二语言）
 - 视觉风格定位：现代、精致、专业的产品感
 - 开源协议：MIT
