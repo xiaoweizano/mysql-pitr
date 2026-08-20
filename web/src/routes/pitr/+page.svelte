@@ -160,15 +160,20 @@
 	//
 	// So the step advance cannot rely on the event alone: watch /status (the
 	// authoritative archive state) and advance the wizard from the snapshot when
-	// it reports ready. Outside step 3 this poll also preserves the original
+	// it reports ready. Outside steps 3–4 this poll also preserves the original
 	// fallback of observing terminal transitions while the stream is down.
+	//
+	// Step 4 is included because executeOp can fail (network blip / 409) while
+	// the server-side state carries on — polling detects the terminal/executing
+	// transition and advances the wizard to step 5, preventing an infinite stall.
 	const SCAN_POLL_MS = 3_000;
 	$effect(() => {
 		const id = opId;
 		if (
 			!id ||
 			isTerminalState(opStatus) ||
-			(step !== 3 && sseConnected && !rescanning && !pendingExecute)
+			(step < 3 && sseConnected) ||
+			(step > 4 && sseConnected)
 		) {
 			return;
 		}
@@ -186,11 +191,30 @@
 					opStatus = st.status;
 					if (isTerminalState(st.status)) {
 						clearInterval(iv);
+						// Step 4: operation completed without wizard knowing — advance.
+						if (step === 4) {
+							step = 5;
+						}
+						return;
+					}
+					// Step 4: server-side state advanced (e.g. execute reached
+					// the server but response was lost) — advance.
+					if (st.status === 'executing' || st.status === 'paused') {
+						if (step === 4) {
+							step = 5;
+						}
 						return;
 					}
 				}
-				if (opStatus === 'ready' && step === 3) {
-					await advanceAfterScanDone();
+				if (opStatus === 'ready') {
+					if (step === 3) {
+						await advanceAfterScanDone();
+					} else if (step === 4) {
+						// Server reverted to ready (selectTx succeeded but
+						// executeOp didn't reach server). Refresh transactions
+						// so the user can retry with fresh state.
+						await refreshTransactions();
+					}
 				}
 			} catch {
 				// transient — keep polling
