@@ -91,9 +91,10 @@
 
 	function toggleAll() {
 		if (allChecked) {
-			const set = new Set(groupTxIds);
-			checked = checked.filter((id) => !set.has(id));
+			// 取消全选：清空所有勾选（被筛选掉的事务也不应残留）
+			checked = [];
 		} else {
+			// 全选：只勾选当前可见的事务
 			const set = new Set(checked);
 			for (const id of groupTxIds) set.add(id);
 			checked = [...set];
@@ -129,7 +130,8 @@
 		return checked.includes(txId);
 	}
 
-	const checkedCount = $derived(checked.length);
+	/** Count of checked transactions within the visible (filtered) group. */
+	const checkedCount = $derived(groupTxIds.filter((id) => checked.includes(id)).length);
 	const totalSql = $derived(groups.reduce((n, g) => n + (g.sql?.length ?? 0), 0));
 </script>
 
