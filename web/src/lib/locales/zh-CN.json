@@ -32,6 +32,8 @@
 	"nav.audit": "审计",
 	"nav.orgs": "组织",
 	"nav.logout": "退出登录",
+	"nav.lightMode": "浅色模式",
+	"nav.darkMode": "深色模式",
 	"instances.title": "实例列表",
 	"instances.subtitle": "管理已注册的 MySQL 实例及其归档状态",
 	"instances.empty": "暂无实例",

@@ -176,26 +176,29 @@
 		}
 	});
 
-	function badgeClass(s: string): string {
+	function badgeDot(s: string): string {
 		switch (s) {
-			case 'done':
-				return 'bg-emerald-100 text-emerald-700';
-			case 'failed':
-				return 'bg-red-100 text-red-700';
-			case 'scanning':
-				return 'bg-sky-100 text-sky-700';
-			case 'executing':
-				return 'bg-violet-100 text-violet-700';
-			case 'paused':
-				return 'bg-amber-100 text-amber-700';
-			case 'ready':
-				return 'bg-teal-100 text-teal-700';
-			case 'blocked':
-				return 'bg-orange-100 text-orange-700';
-			case 'created':
-			case 'cancelled':
-			default:
-				return 'bg-zinc-100 text-zinc-600';
+			case 'done': return 'status-dot status-dot--online';
+			case 'failed': return 'status-dot status-dot--error';
+			case 'scanning': return 'status-dot status-dot--info status-dot--pulse';
+			case 'executing': return 'status-dot status-dot--info status-dot--pulse';
+			case 'paused': return 'status-dot status-dot--paused';
+			case 'ready': return 'status-dot status-dot--info';
+			case 'blocked': return 'status-dot status-dot--warning';
+			default: return 'status-dot status-dot--offline';
+		}
+	}
+
+	function badgeText(s: string): string {
+		switch (s) {
+			case 'done': return 'text-success';
+			case 'failed': return 'text-destructive';
+			case 'scanning': return 'text-info';
+			case 'executing': return 'text-info';
+			case 'paused': return 'text-warning';
+			case 'ready': return 'text-info';
+			case 'blocked': return 'text-warning';
+			default: return 'text-muted-foreground';
 		}
 	}
 
@@ -213,11 +216,11 @@
 	<title>{t('audit.title')} · {t('app.name')}</title>
 </svelte:head>
 
-<div class="flex h-full flex-col p-6">
+<div class="flex h-full flex-col p-6 animate-fade-in">
 	<div class="flex shrink-0 flex-wrap items-center justify-between gap-3">
 		<div>
-			<h1 class="text-xl font-semibold text-zinc-900">{t('audit.title')}</h1>
-			<p class="text-sm text-zinc-500">{t('audit.subtitle')}</p>
+			<h1 class="text-xl font-semibold text-foreground">{t('audit.title')}</h1>
+			<p class="text-sm text-muted-foreground">{t('audit.subtitle')}</p>
 		</div>
 		<Button
 			variant="outline"
@@ -306,20 +309,20 @@
 	{:else if orgs.length === 0}
 		<Card class="mt-4 shrink-0">
 			<CardContent class="flex flex-col items-center gap-2 py-10 text-center">
-				<p class="text-sm text-zinc-500">{t('audit.noOrg')}</p>
+				<p class="text-sm text-muted-foreground">{t('audit.noOrg')}</p>
 			</CardContent>
 		</Card>
 	{:else if loading}
 		<Card class="mt-4 shrink-0">
-			<CardContent class="flex items-center justify-center py-8 text-sm text-zinc-400">
+			<CardContent class="flex items-center justify-center py-8 text-sm text-muted-foreground/70">
 				{t('common.loading')}
 			</CardContent>
 		</Card>
 	{:else if entries.length === 0}
 		<Card class="mt-4 shrink-0">
 			<CardContent class="flex flex-col items-center gap-2 py-10 text-center">
-				<p class="text-sm font-medium text-zinc-600">{t('audit.empty')}</p>
-				<p class="text-xs text-zinc-400">{t('audit.emptyDesc')}</p>
+				<p class="text-sm font-medium text-muted-foreground">{t('audit.empty')}</p>
+				<p class="text-xs text-muted-foreground/70">{t('audit.emptyDesc')}</p>
 			</CardContent>
 		</Card>
 	{:else}
@@ -351,9 +354,9 @@
 							>
 								<TableCell>
 									{#if expanded}
-										<ChevronDown class="size-4 text-zinc-400" />
+										<ChevronDown class="size-4 text-muted-foreground/70" />
 									{:else}
-										<ChevronRight class="size-4 text-zinc-400" />
+										<ChevronRight class="size-4 text-muted-foreground/70" />
 									{/if}
 								</TableCell>
 								<TableCell class="font-mono text-xs" title={e.operationId}>
@@ -364,9 +367,8 @@
 								<TableCell class="font-mono text-xs">{e.targetTable || '—'}</TableCell>
 								<TableCell class="text-right tabular-nums">{e.rowsAffected}</TableCell>
 								<TableCell>
-									<span
-										class={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${badgeClass(e.status)}`}
-									>
+									<span class="status-badge border border-border/50 {badgeText(e.status)}">
+										<span class={badgeDot(e.status)}></span>
 										{t(`pitr.status.${e.status}`)}
 									</span>
 								</TableCell>
@@ -377,23 +379,23 @@
 									<TableCell colspan={6}>
 										<div class="grid grid-cols-1 gap-1.5 py-1 text-xs sm:grid-cols-2">
 											<div>
-												<span class="text-zinc-400">{t('audit.operationId')}：</span>
+												<span class="text-muted-foreground/70">{t('audit.operationId')}：</span>
 												<span class="font-mono">{e.operationId}</span>
 											</div>
 											<div>
-												<span class="text-zinc-400">{t('audit.agent')}：</span>
+												<span class="text-muted-foreground/70">{t('audit.agent')}：</span>
 												<span class="font-mono">{e.agentId || '—'}</span>
 											</div>
 											<div>
-												<span class="text-zinc-400">{t('audit.orgId')}：</span>
+												<span class="text-muted-foreground/70">{t('audit.orgId')}：</span>
 												<span class="font-mono">{e.orgId || '—'}</span>
 											</div>
 											<div>
-												<span class="text-zinc-400">{t('audit.recoveryTime')}：</span>
+												<span class="text-muted-foreground/70">{t('audit.recoveryTime')}：</span>
 												{recoveryLabel(e)}
 											</div>
 											<div class="sm:col-span-2">
-												<span class="text-zinc-400">{t('audit.errorDetails')}：</span>
+												<span class="text-muted-foreground/70">{t('audit.errorDetails')}：</span>
 												<span class="whitespace-pre-wrap break-all font-mono text-destructive">
 													{e.errorDetails || '—'}
 												</span>

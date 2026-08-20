@@ -4,21 +4,6 @@
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { CircleAlert, Pause, Play, Square, CheckCircle2 } from '@lucide/svelte';
 
-	/**
-	 * Execution progress + control panel. Shared by the wizard step 5 and the
-	 * operation detail page. Pure presentation: the parent owns the SSE
-	 * subscription and the API calls, and feeds `status` / `progress` /
-	 * `errors` in.
-	 *
-	 * Props:
-	 * - `status`: current operation state.
-	 * - `progress`: latest SSE progress payload (null until the first event).
-	 * - `errors`: accumulated statement errors (progress + terminal payload).
-	 * - `errorMessage`: terminal failure message (op_error / blocked), null when
-	 *   the operation did not fail.
-	 * - `busy`: a pause/resume/cancel call is in flight (buttons disabled).
-	 * - `onPause` / `onResume` / `onCancel`: control actions.
-	 */
 	let {
 		status,
 		progress = null,
@@ -55,23 +40,27 @@
 
 {#if status === 'executing' || status === 'paused'}
 	<div>
-		<div class="flex items-center justify-between text-xs text-zinc-500">
+		<div class="flex items-center justify-between text-xs text-muted-foreground">
 			<span>{t('pitr.exec.progress')}</span>
-			<span class="font-mono">
+			<span class="font-mono tabular-nums">
 				{done} / {total > 0 ? total : '—'}
 				{#if percent !== null}（{percent}%）{/if}
 			</span>
 		</div>
-		<div class="mt-1.5 h-2 w-full overflow-hidden rounded-full bg-zinc-100">
+		<div class="mt-1.5 h-2 w-full overflow-hidden rounded-full bg-muted">
 			{#if percent !== null}
-				<div class="h-full rounded-full bg-zinc-900 transition-all" style={`width: ${percent}%`}></div>
+				<div
+					class="h-full rounded-full transition-all duration-300 ease-out
+						{status === 'executing' ? 'progress-bar-striped bg-primary' : 'bg-warning'}"
+					style={`width: ${percent}%`}
+				></div>
 			{:else}
-				<div class="h-full w-1/3 animate-pulse rounded-full bg-zinc-300"></div>
+				<div class="h-full w-1/3 animate-pulse rounded-full bg-muted-foreground/30"></div>
 			{/if}
 		</div>
 
 		{#if status === 'paused'}
-			<div class="mt-3 flex items-center gap-2 rounded-md bg-amber-50 px-2.5 py-2 text-sm text-amber-700">
+			<div class="mt-3 flex items-center gap-2 rounded-lg bg-warning/10 px-2.5 py-2 text-sm text-warning">
 				<Pause class="size-4 shrink-0" />
 				<span>{t('pitr.exec.pausedBanner')}</span>
 			</div>
@@ -99,19 +88,19 @@
 		</div>
 	</div>
 {:else if status === 'done'}
-	<div class="flex items-start gap-2 rounded-md bg-emerald-50 px-2.5 py-2 text-sm text-emerald-700">
+	<div class="flex items-start gap-2 rounded-lg bg-success/10 px-2.5 py-2 text-sm text-success animate-scale-in">
 		<CheckCircle2 class="mt-0.5 size-4 shrink-0" />
 		<div>
 			<p class="font-medium">
 				{t('pitr.exec.done', { done: String(done), total: String(total) })}
 			</p>
 			{#if errorMessage}
-				<p class="mt-1 text-red-600">{errorMessage}</p>
+				<p class="mt-1 text-destructive">{errorMessage}</p>
 			{/if}
 		</div>
 	</div>
 {:else if status === 'failed' || status === 'blocked'}
-	<div class="flex items-start gap-2 rounded-md bg-red-50 px-2.5 py-2 text-sm text-red-700">
+	<div class="flex items-start gap-2 rounded-lg bg-destructive/10 px-2.5 py-2 text-sm text-destructive animate-scale-in">
 		<CircleAlert class="mt-0.5 size-4 shrink-0" />
 		<div>
 			<p class="font-medium">{status === 'failed' ? t('pitr.exec.failed') : t('pitr.exec.blocked')}</p>
@@ -121,14 +110,14 @@
 		</div>
 	</div>
 {:else if status === 'cancelled'}
-	<div class="flex items-center gap-2 rounded-md bg-zinc-100 px-2.5 py-2 text-sm text-zinc-600">
+	<div class="flex items-center gap-2 rounded-lg bg-muted px-2.5 py-2 text-sm text-muted-foreground">
 		<Square class="size-4 shrink-0" />
 		<span>{t('pitr.exec.cancelled')}</span>
 	</div>
 {:else if status === 'ready'}
-	<p class="text-sm text-zinc-500">{t('pitr.exec.readyHint')}</p>
+	<p class="text-sm text-muted-foreground">{t('pitr.exec.readyHint')}</p>
 {:else if status === 'scanning' || status === 'created'}
-	<p class="flex items-center gap-2 text-sm text-zinc-500">
+	<p class="flex items-center gap-2 text-sm text-muted-foreground">
 		{t('pitr.exec.scanningHint')}
 	</p>
 {/if}
@@ -139,9 +128,9 @@
 			<CircleAlert class="size-4" />
 			{t('pitr.exec.errorsTitle', { count: String(errors.length) })}
 		</p>
-		<ul class="max-h-56 space-y-1 overflow-y-auto rounded-md bg-red-50 p-2 text-xs">
+		<ul class="max-h-56 space-y-1 overflow-y-auto rounded-lg bg-destructive/10 p-2 text-xs animate-fade-in">
 			{#each errors as err, i (i)}
-				<li class="flex items-start gap-2 text-red-700">
+				<li class="flex items-start gap-2 text-destructive">
 					<span class="shrink-0 font-mono font-semibold">#{err.statement + 1}</span>
 					<span class="min-w-0 break-all">{err.err}</span>
 				</li>

@@ -230,8 +230,8 @@
 <div class="flex h-full flex-col p-6">
 	<div class="flex shrink-0 flex-wrap items-center justify-between gap-3">
 		<div>
-			<h1 class="text-xl font-semibold text-zinc-900">{t('orgs.title')}</h1>
-			<p class="text-sm text-zinc-500">{t('orgs.subtitle')}</p>
+			<h1 class="text-xl font-semibold text-foreground">{t('orgs.title')}</h1>
+			<p class="text-sm text-muted-foreground">{t('orgs.subtitle')}</p>
 		</div>
 		<div class="flex items-center gap-2">
 			<Button variant="outline" onclick={openJoin}>
@@ -256,16 +256,16 @@
 		</Card>
 	{:else if loading}
 		<Card class="mt-4 shrink-0">
-			<CardContent class="flex items-center justify-center py-8 text-sm text-zinc-400">
+			<CardContent class="flex items-center justify-center py-8 text-sm text-muted-foreground/70">
 				{t('common.loading')}
 			</CardContent>
 		</Card>
 	{:else if orgs.length === 0}
 		<Card class="mt-4 shrink-0">
 			<CardContent class="flex flex-col items-center gap-2 py-10 text-center">
-				<Building2 class="size-8 text-zinc-300" />
-				<p class="text-sm font-medium text-zinc-600">{t('orgs.empty')}</p>
-				<p class="text-xs text-zinc-400">{t('orgs.emptyDesc')}</p>
+				<Building2 class="size-8 text-muted-foreground/50" />
+				<p class="text-sm font-medium text-muted-foreground">{t('orgs.empty')}</p>
+				<p class="text-xs text-muted-foreground/70">{t('orgs.emptyDesc')}</p>
 				<div class="mt-2 flex items-center gap-2">
 					<Button variant="outline" size="sm" onclick={openJoin}>{t('orgs.accept')}</Button>
 					<Button size="sm" onclick={openCreate}>{t('orgs.create')}</Button>
@@ -307,20 +307,20 @@
 							>
 								<TableCell>
 									{#if expanded}
-										<ChevronDown class="size-4 text-zinc-400" />
+										<ChevronDown class="size-4 text-muted-foreground/70" />
 									{:else}
-										<ChevronRight class="size-4 text-zinc-400" />
+										<ChevronRight class="size-4 text-muted-foreground/70" />
 									{/if}
 								</TableCell>
 								<TableCell class="font-medium">{o.name}</TableCell>
 								<TableCell>
 									<span class="flex items-center gap-2">
-										<span class="font-mono text-xs text-zinc-500" title={o.id}>
+										<span class="font-mono text-xs text-muted-foreground" title={o.id}>
 											{shortId(o.id)}
 										</span>
 										<button
 											type="button"
-											class="inline-flex shrink-0 items-center gap-1 rounded-md border border-zinc-200 px-1.5 py-0.5 text-xs text-zinc-500 transition-colors hover:border-primary/50 hover:text-primary"
+											class="inline-flex shrink-0 items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-xs text-muted-foreground transition-colors hover:border-primary/50 hover:text-primary"
 											onclick={(e) => {
 												e.stopPropagation();
 												copyValue(o.id, o.id);
@@ -336,8 +336,8 @@
 										</button>
 									</span>
 								</TableCell>
-								<TableCell class="whitespace-nowrap text-zinc-500">{formatDateTime(o.createdAt)}</TableCell>
-								<TableCell class="text-right text-zinc-500">
+								<TableCell class="whitespace-nowrap text-muted-foreground">{formatDateTime(o.createdAt)}</TableCell>
+								<TableCell class="text-right text-muted-foreground">
 									<span class="inline-flex items-center gap-1">
 										<Users class="size-3.5" />
 										{members.length}
@@ -378,11 +378,11 @@
 										<div class="py-1">
 											{#if inviteCodes[o.id]}
 												<div class="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-dashed px-3 py-2">
-													<span class="text-sm text-zinc-500">{t('orgs.inviteCode')}：</span>
-													<code class="break-all font-mono text-sm text-zinc-900">{inviteCodes[o.id]}</code>
+													<span class="text-sm text-muted-foreground">{t('orgs.inviteCode')}：</span>
+													<code class="break-all font-mono text-sm text-foreground">{inviteCodes[o.id]}</code>
 													<button
 														type="button"
-														class="inline-flex shrink-0 items-center gap-1 rounded-md border border-zinc-200 px-1.5 py-0.5 text-xs text-zinc-500 transition-colors hover:border-primary/50 hover:text-primary"
+														class="inline-flex shrink-0 items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-xs text-muted-foreground transition-colors hover:border-primary/50 hover:text-primary"
 														onclick={() => copyValue(`code-${o.id}`, inviteCodes[o.id])}
 														title={inviteCodes[o.id]}
 													>
@@ -394,10 +394,10 @@
 															<span>{t('orgs.copyId')}</span>
 														{/if}
 													</button>
-													<span class="text-xs text-zinc-400">{t('orgs.inviteCodeHint')}</span>
+													<span class="text-xs text-muted-foreground/70">{t('orgs.inviteCodeHint')}</span>
 												</div>
 											{/if}
-											<div class="rounded-lg border border-zinc-100">
+											<div class="rounded-lg border border-border/50">
 												<Table>
 													<TableHeader>
 														<TableRow>
@@ -415,7 +415,7 @@
 															</TableRow>
 														{:else}
 															<TableRow>
-																<TableCell colspan={3} class="text-center text-sm text-zinc-400">
+																<TableCell colspan={3} class="text-center text-sm text-muted-foreground/70">
 																	{t('orgs.membersEmpty')}
 																</TableCell>
 															</TableRow>

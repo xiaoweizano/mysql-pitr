@@ -136,7 +136,7 @@
 </script>
 
 {#if !readonly}
-	<div class="flex items-center justify-between gap-2 text-xs text-zinc-500">
+	<div class="flex items-center justify-between gap-2 text-xs text-muted-foreground">
 		<span>
 			{t('pitr.sql.checkedSummary', {
 				checked: String(checkedCount),
@@ -157,9 +157,9 @@
 
 <div class="mt-2 space-y-2">
 	{#each groups as tx (tx.txId)}
-		<div class="overflow-hidden rounded-lg border border-zinc-200">
+		<div class="overflow-hidden rounded-lg border border-border">
 			<div
-				class="flex cursor-pointer items-center gap-2 bg-zinc-50 px-2.5 py-1.5 text-xs"
+				class="flex cursor-pointer items-center gap-2 bg-muted/50 px-2.5 py-1.5 text-xs"
 				role="button"
 				tabindex="0"
 				aria-expanded={isOpen(tx.txId)}
@@ -174,19 +174,19 @@
 				{#if !readonly}
 					<input
 						type="checkbox"
-						class="accent-zinc-900"
+						class="accent-primary"
 						checked={txChecked(tx.txId)}
 						onchange={() => toggleTx(tx.txId)}
 						onclick={(e) => e.stopPropagation()}
 					/>
 				{/if}
-				<span class="font-mono font-medium text-zinc-700" title={tx.txId}>
+				<span class="font-mono font-medium text-foreground/80" title={tx.txId}>
 					{shortId(tx.txId)}
 				</span>
-				<span class="text-zinc-400">{formatDateTime(tx.commitTime)}</span>
+				<span class="text-muted-foreground/70">{formatDateTime(tx.commitTime)}</span>
 				<span class="ml-auto flex items-center gap-2">
 					{#if tx.rowCount > 0}
-						<span class="text-zinc-500">{tx.rowCount} 行</span>
+						<span class="text-muted-foreground">{tx.rowCount} 行</span>
 					{/if}
 					{#if !readonly}
 						<button
@@ -205,20 +205,20 @@
 			</div>
 
 			{#if isOpen(tx.txId)}
-				<div class="border-t border-zinc-100">
+				<div class="border-t border-border/50">
 					{#each tx.sql ?? [] as stmt, i (i)}
-						<div class="flex items-start gap-2 border-b border-zinc-100 px-2.5 py-1.5 last:border-b-0">
+						<div class="flex items-start gap-2 border-b border-border/50 px-2.5 py-1.5 last:border-b-0">
 							{#if !readonly}
 								<input
 									type="checkbox"
-									class="mt-1.5 accent-zinc-900"
+									class="mt-1.5 accent-primary"
 									checked={txChecked(tx.txId)}
 									onchange={() => toggleTx(tx.txId)}
 								/>
 							{/if}
 							<div class="min-w-0 flex-1">
 								<pre
-									class="overflow-x-auto whitespace-pre-wrap break-all font-mono text-xs leading-relaxed text-zinc-700"
+									class="overflow-x-auto whitespace-pre-wrap break-all font-mono text-xs leading-relaxed text-foreground/80"
 								>{stmt.sql}</pre
 								>
 								{#if stmt.warnings && stmt.warnings.length > 0}
@@ -240,6 +240,6 @@
 	{/each}
 
 	{#if groups.length === 0}
-		<p class="py-6 text-center text-sm text-zinc-400">{t('pitr.sql.empty')}</p>
+		<p class="py-6 text-center text-sm text-muted-foreground/70">{t('pitr.sql.empty')}</p>
 	{/if}
 </div>

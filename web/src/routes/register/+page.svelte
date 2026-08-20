@@ -54,12 +54,35 @@
 	<title>{t('auth.register.title')} · {t('app.name')}</title>
 </svelte:head>
 
-<div class="flex min-h-screen items-center justify-center bg-zinc-50 p-4">
-	<Card class="w-full max-w-sm">
+<div class="relative flex min-h-screen items-center justify-center overflow-hidden bg-background p-4">
+	<!-- 背景网格 -->
+	<div class="login-grid-bg absolute inset-0 opacity-30 animate-fade-in"></div>
+
+	<!-- 浮动光晕 -->
+	<div
+		class="pointer-events-none absolute -left-32 -top-32 size-96 rounded-full bg-primary/10 blur-3xl animate-float"
+		style="animation-delay: -3s;"
+	></div>
+	<div
+		class="pointer-events-none absolute -bottom-40 -right-24 size-80 rounded-full bg-info/10 blur-3xl animate-float"
+		style="animation-delay: -11s;"
+	></div>
+
+	<!-- 注册卡片 -->
+	<Card class="relative w-full max-w-sm animate-fade-slide-up shadow-xl">
 		<CardHeader class="text-center">
-			<img src="/favicon.svg" alt={t('app.name')} class="mx-auto mb-2 h-10 w-10" />
-			<CardTitle>{t('auth.register.title')}</CardTitle>
-			<CardDescription>{t('auth.register.subtitle')}</CardDescription>
+			<img
+				src="/favicon.svg"
+				alt={t('app.name')}
+				class="mx-auto mb-3 h-10 w-10 animate-fade-in"
+				style="animation-delay: 200ms;"
+			/>
+			<CardTitle class="animate-fade-in" style="animation-delay: 300ms;">
+				{t('auth.register.title')}
+			</CardTitle>
+			<CardDescription class="animate-fade-in" style="animation-delay: 400ms;">
+				{t('auth.register.subtitle')}
+			</CardDescription>
 		</CardHeader>
 		<CardContent>
 			<form
@@ -110,7 +133,7 @@
 				</Button>
 			</form>
 
-			<p class="mt-4 text-center text-sm text-zinc-500">
+			<p class="mt-4 text-center text-sm text-muted-foreground">
 				{t('auth.hasAccount')}
 				<a href="/login" class="font-medium text-primary hover:underline">
 					{t('auth.login.link')}

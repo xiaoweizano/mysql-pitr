@@ -41,7 +41,7 @@
 </script>
 
 {#if total > 0}
-	<div class="flex flex-wrap items-center justify-between gap-3 text-xs text-zinc-500">
+	<div class="flex flex-wrap items-center justify-between gap-3 text-xs text-muted-foreground">
 		<div class="flex items-center gap-3">
 			<span>{t('common.pagination.total', { total: String(total) })}</span>
 			<span>{startItem}–{endItem}</span>

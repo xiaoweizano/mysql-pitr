@@ -269,26 +269,29 @@
 
 	// ---------- presentation ----------
 
-	function badgeClass(s: string): string {
+	function badgeDot(s: string): string {
 		switch (s) {
-			case 'done':
-				return 'bg-emerald-100 text-emerald-700';
-			case 'failed':
-				return 'bg-red-100 text-red-700';
-			case 'scanning':
-				return 'bg-sky-100 text-sky-700';
-			case 'executing':
-				return 'bg-violet-100 text-violet-700';
-			case 'paused':
-				return 'bg-amber-100 text-amber-700';
-			case 'ready':
-				return 'bg-teal-100 text-teal-700';
-			case 'blocked':
-				return 'bg-orange-100 text-orange-700';
-			case 'created':
-			case 'cancelled':
-			default:
-				return 'bg-zinc-100 text-zinc-600';
+			case 'done': return 'status-dot status-dot--online';
+			case 'failed': return 'status-dot status-dot--error';
+			case 'scanning': return 'status-dot status-dot--info status-dot--pulse';
+			case 'executing': return 'status-dot status-dot--info status-dot--pulse';
+			case 'paused': return 'status-dot status-dot--paused';
+			case 'ready': return 'status-dot status-dot--info';
+			case 'blocked': return 'status-dot status-dot--warning';
+			default: return 'status-dot status-dot--offline';
+		}
+	}
+
+	function badgeText(s: string): string {
+		switch (s) {
+			case 'done': return 'text-success';
+			case 'failed': return 'text-destructive';
+			case 'scanning': return 'text-info';
+			case 'executing': return 'text-info';
+			case 'paused': return 'text-warning';
+			case 'ready': return 'text-info';
+			case 'blocked': return 'text-warning';
+			default: return 'text-muted-foreground';
 		}
 	}
 </script>
@@ -297,7 +300,7 @@
 	<title>{t('pitr.detail.title')} · {t('app.name')}</title>
 </svelte:head>
 
-<div class="h-full overflow-y-auto p-6">
+<div class="h-full overflow-y-auto p-6 animate-fade-in">
 	<div class="flex flex-wrap items-center justify-between gap-3">
 		<div class="flex items-center gap-3">
 			<Button variant="outline" size="sm" href="/operations">
@@ -305,12 +308,13 @@
 				{t('pitr.detail.back')}
 			</Button>
 			<div>
-				<h1 class="text-xl font-semibold text-zinc-900">{t('pitr.detail.title')}</h1>
-				<p class="font-mono text-xs text-zinc-400">{opId}</p>
+				<h1 class="text-xl font-semibold text-foreground">{t('pitr.detail.title')}</h1>
+				<p class="font-mono text-xs text-muted-foreground/70">{opId}</p>
 			</div>
 		</div>
 		{#if status}
-			<span class={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${badgeClass(opState)}`}>
+			<span class="status-badge border border-border/50 {badgeText(opState)}">
+				<span class={badgeDot(opState)}></span>
 				{t(`pitr.status.${opState}`)}
 			</span>
 		{/if}
@@ -324,19 +328,19 @@
 		</Card>
 	{:else if loading || !status}
 		<Card class="mt-4">
-			<CardContent class="flex items-center justify-center py-8 text-sm text-zinc-400">
+			<CardContent class="flex items-center justify-center py-8 text-sm text-muted-foreground/70">
 				{t('common.loading')}
 			</CardContent>
 		</Card>
 	{:else}
 		{#if flowError}
-			<div class="mt-4 flex items-start gap-2 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">
+			<div class="mt-4 flex items-start gap-2 rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">
 				<CircleAlert class="mt-0.5 size-4 shrink-0" />
 				<span class="break-all">{flowError}</span>
 			</div>
 		{/if}
 		{#if sseReconnecting && !isTerminal}
-			<div class="mt-4 flex items-center gap-2 rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-700">
+			<div class="mt-4 flex items-center gap-2 rounded-lg bg-warning/10 px-3 py-2 text-sm text-warning">
 				<LoaderCircle class="size-4 animate-spin" />
 				<span>{t('pitr.sse.reconnecting')}</span>
 			</div>
@@ -348,20 +352,20 @@
 					<CardTitle>{t('pitr.detail.meta')}</CardTitle>
 				</CardHeader>
 				<CardContent class="grid grid-cols-[max-content_1fr] gap-x-6 gap-y-3 text-sm">
-					<span class="text-zinc-500">{t('pitr.detail.type')}</span>
+					<span class="text-muted-foreground">{t('pitr.detail.type')}</span>
 					<span>{t(`pitr.type.short.${status.type}`)}</span>
 
-					<span class="text-zinc-500">{t('pitr.detail.mode')}</span>
+					<span class="text-muted-foreground">{t('pitr.detail.mode')}</span>
 					<span>{t(`pitr.mode.${status.mode}`)}</span>
 
-					<span class="text-zinc-500">{t('pitr.detail.agent')}</span>
-					<span class="break-all font-mono text-xs text-zinc-700">{status.agentId}</span>
+					<span class="text-muted-foreground">{t('pitr.detail.agent')}</span>
+					<span class="break-all font-mono text-xs text-foreground/80">{status.agentId}</span>
 
-					<span class="text-zinc-500">{t('pitr.detail.createdAt')}</span>
+					<span class="text-muted-foreground">{t('pitr.detail.createdAt')}</span>
 					<span>{formatDateTime(status.createdAt)}</span>
 
-					<span class="text-zinc-500">{t('pitr.detail.createdBy')}</span>
-					<span class="break-all font-mono text-xs text-zinc-700">{status.createdBy}</span>
+					<span class="text-muted-foreground">{t('pitr.detail.createdBy')}</span>
+					<span class="break-all font-mono text-xs text-foreground/80">{status.createdBy}</span>
 				</CardContent>
 				<CardFooter class="justify-end">
 					{#if (opState === 'scanning' || opState === 'ready') && !isTerminal}
@@ -395,7 +399,7 @@
 
 		{#if txsLoading}
 			<Card class="mt-6">
-				<CardContent class="flex items-center justify-center gap-2 py-6 text-sm text-zinc-400">
+				<CardContent class="flex items-center justify-center gap-2 py-6 text-sm text-muted-foreground/70">
 					<LoaderCircle class="size-4 animate-spin" />
 					{t('common.loading')}
 				</CardContent>
@@ -420,13 +424,13 @@
 			</Card>
 		{:else if isTerminal}
 			<Card class="mt-6">
-				<CardContent class="py-6 text-center text-sm text-zinc-400">
+				<CardContent class="py-6 text-center text-sm text-muted-foreground/70">
 					{t('pitr.detail.terminalNoPreview')}
 				</CardContent>
 			</Card>
 		{:else}
 			<Card class="mt-6">
-				<CardContent class="py-6 text-center text-sm text-zinc-400">
+				<CardContent class="py-6 text-center text-sm text-muted-foreground/70">
 					{t('pitr.detail.noPreviewYet')}
 				</CardContent>
 			</Card>

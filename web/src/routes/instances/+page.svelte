@@ -27,13 +27,9 @@
 	} from '$lib/api/agents.js';
 	import Pagination from '$lib/components/Pagination.svelte';
 
-	// State (Svelte 5 runes). Everything optional → no blank flash: an empty
-	// list renders the empty state, a failed fetch renders an inline error with
-	// a retry button — never a white screen.
 	let loading = $state(true);
 	let loadError = $state<string | null>(null);
 	let agents = $state<AgentInfo[]>([]);
-	/** orgId → org name, for the table column. */
 	let orgNames = $state<Record<string, string>>({});
 
 	let actionError = $state<string | null>(null);
@@ -43,12 +39,6 @@
 
 	const pagedAgents = $derived(agents.slice((page - 1) * pageSize, page * pageSize));
 
-	/**
-	 * Load orgs, then agents per org. `GET /api/agents` requires an `orgId`
-	 * query param, so we fetch the user's orgs first and query each in turn.
-	 * Archive state is deliberately NOT fetched here — the detail page owns
-	 * archive monitoring, so the list page avoids a per-row N+1 request.
-	 */
 	async function load() {
 		loading = true;
 		loadError = null;
@@ -77,31 +67,24 @@
 
 	onMount(load);
 
-	function badgeClass(status: string): string {
+	/** Status badge styling — uses the global status-badge / status-dot system. */
+	function statusDot(status: string): string {
 		switch (status) {
-			case 'online':
-				return 'bg-emerald-100 text-emerald-700';
-			case 'error':
-				return 'bg-red-100 text-red-700';
-			case 'rejected':
-				return 'bg-rose-100 text-rose-700';
+			case 'online': return 'status-dot status-dot--online status-dot--pulse';
+			case 'error': return 'status-dot status-dot--error';
+			case 'rejected': return 'status-dot status-dot--warning';
 			case 'offline':
-			default:
-				return 'bg-zinc-100 text-zinc-600';
+			default: return 'status-dot status-dot--offline';
 		}
 	}
 
 	function statusLabel(status: string): string {
 		switch (status) {
-			case 'online':
-				return t('instances.status.online');
-			case 'error':
-				return t('instances.status.error');
-			case 'rejected':
-				return '已拒绝';
+			case 'online': return t('instances.status.online');
+			case 'error': return t('instances.status.error');
+			case 'rejected': return '已拒绝';
 			case 'offline':
-			default:
-				return t('instances.status.offline');
+			default: return t('instances.status.offline');
 		}
 	}
 
@@ -147,11 +130,11 @@
 	<title>{t('instances.title')} · {t('app.name')}</title>
 </svelte:head>
 
-<div class="flex h-full flex-col p-6">
+<div class="flex h-full flex-col p-6 animate-fade-in">
 	<div class="flex shrink-0 flex-wrap items-center justify-between gap-3">
 		<div>
-			<h1 class="text-xl font-semibold text-zinc-900">{t('instances.title')}</h1>
-			<p class="text-sm text-zinc-500">{t('instances.subtitle')}</p>
+			<h1 class="text-xl font-semibold text-foreground">{t('instances.title')}</h1>
+			<p class="text-sm text-muted-foreground">{t('instances.subtitle')}</p>
 		</div>
 		<Button variant="outline" size="sm" onclick={load} disabled={loading}>
 			{loading ? t('common.loading') : t('common.retry')}
@@ -170,16 +153,25 @@
 			</CardContent>
 		</Card>
 	{:else if loading}
+		<!-- 骨架屏 -->
 		<Card class="mt-4 shrink-0">
-			<CardContent class="flex items-center justify-center py-8 text-sm text-zinc-400">
-				{t('common.loading')}
+			<CardContent class="space-y-3 py-6">
+				{#each [1, 2, 3, 4, 5] as _}
+					<div class="flex items-center gap-4">
+						<div class="skeleton h-5 w-40"></div>
+						<div class="skeleton h-5 w-24"></div>
+						<div class="skeleton h-5 w-20"></div>
+						<div class="skeleton h-5 w-16"></div>
+						<div class="skeleton ml-auto h-5 w-32"></div>
+					</div>
+				{/each}
 			</CardContent>
 		</Card>
 	{:else if agents.length === 0}
 		<Card class="mt-4 shrink-0">
 			<CardContent class="flex flex-col items-center gap-2 py-12 text-center">
-				<p class="text-sm font-medium text-zinc-600">{t('instances.empty')}</p>
-				<p class="text-xs text-zinc-400">{t('instances.emptyDesc')}</p>
+				<p class="text-sm font-medium text-foreground/80">{t('instances.empty')}</p>
+				<p class="text-xs text-muted-foreground">{t('instances.emptyDesc')}</p>
 			</CardContent>
 		</Card>
 	{:else}
@@ -203,46 +195,45 @@
 								<TableHead class="sticky top-0 z-10 bg-card text-right">{t('instances.actions')}</TableHead>
 							</TableRow>
 						</TableHeader>
-					<TableBody>
-						{#each pagedAgents as a (a.id)}
-							<TableRow
-								class="cursor-pointer"
-								onclick={() => goDetail(a.id)}
-							>
-								<TableCell class="font-medium">{a.hostname}</TableCell>
-								<TableCell>{orgNames[a.orgId] ?? a.orgId}</TableCell>
-								<TableCell class="text-zinc-500">{a.mySQLVersion || '—'}</TableCell>
-								<TableCell>
-									<span
-										class={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${badgeClass(a.status)}`}
-									>
-										{statusLabel(a.status)}
-									</span>
-								</TableCell>
-								<TableCell>
-									{#if a.approved}
-										<span class="text-xs text-zinc-500">{t('instance.approved.yes')}</span>
-									{:else}
-										<span class="text-xs font-medium text-amber-600">
-											{t('instance.approved.no')}
+						<TableBody>
+							{#each pagedAgents as a (a.id)}
+								<TableRow
+									class="cursor-pointer transition-colors duration-150 hover:bg-muted/50"
+									onclick={() => goDetail(a.id)}
+								>
+									<TableCell class="font-medium">{a.hostname}</TableCell>
+									<TableCell>{orgNames[a.orgId] ?? a.orgId}</TableCell>
+									<TableCell class="text-muted-foreground">{a.mySQLVersion || '—'}</TableCell>
+									<TableCell>
+										<span class="status-badge border border-border/50">
+											<span class={statusDot(a.status)}></span>
+											{statusLabel(a.status)}
 										</span>
-									{/if}
-								</TableCell>
-								<TableCell class="text-right">
-									<div class="flex items-center justify-end gap-2" role="group">
-										{#if !a.approved}
-											<Button
-												variant="outline"
-												size="xs"
-												disabled={pendingId !== null}
-												onclick={(e) => {
-													e.stopPropagation();
-													void handleApprove(a);
-												}}
-											>
-												{t('instances.approve')}
-											</Button>
+									</TableCell>
+									<TableCell>
+										{#if a.approved}
+											<span class="text-xs text-muted-foreground">{t('instance.approved.yes')}</span>
+										{:else}
+											<span class="text-xs font-medium text-warning">
+												{t('instance.approved.no')}
+											</span>
 										{/if}
+									</TableCell>
+									<TableCell class="text-right">
+										<div class="flex items-center justify-end gap-2" role="group">
+											{#if !a.approved}
+												<Button
+													variant="outline"
+													size="xs"
+													disabled={pendingId !== null}
+													onclick={(e) => {
+														e.stopPropagation();
+														void handleApprove(a);
+													}}
+												>
+													{t('instances.approve')}
+												</Button>
+											{/if}
 											<Button
 												variant={a.approved ? 'outline' : 'destructive'}
 												size="xs"
@@ -254,22 +245,22 @@
 											>
 												{t('instances.reject')}
 											</Button>
-										<Button
-											variant="ghost"
-											size="xs"
-											onclick={(e) => {
-												e.stopPropagation();
-												goDetail(a.id);
-											}}
-										>
-											{t('instances.detail')}
-										</Button>
-									</div>
-								</TableCell>
-							</TableRow>
-						{/each}
-					</TableBody>
-				</Table>
+											<Button
+												variant="ghost"
+												size="xs"
+												onclick={(e) => {
+													e.stopPropagation();
+													goDetail(a.id);
+												}}
+											>
+												{t('instances.detail')}
+											</Button>
+										</div>
+									</TableCell>
+								</TableRow>
+							{/each}
+						</TableBody>
+					</Table>
 				</div>
 			</CardContent>
 		</Card>

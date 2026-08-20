@@ -4,23 +4,13 @@
 	import { Button } from '$lib/components/ui/button/index.js';
 	import {
 		Card,
-		CardContent,
-		CardDescription,
-		CardHeader,
-		CardTitle
+		CardContent
 	} from '$lib/components/ui/card/index.js';
 	import { listOperations, type OperationListItem } from '$lib/api/pitr.js';
 	import { listOrgs } from '$lib/api/orgs.js';
 	import { formatDateTime, tablesLabel } from '$lib/format.js';
 	import { History } from '@lucide/svelte';
 	import Pagination from '$lib/components/Pagination.svelte';
-
-	/**
-	 * Operation history list — all PITR operations of the user's
-	 * organisations, newest first. Each row links to the operation detail page.
-	 * `GET /api/pitr?org_id=X` requires the org query param, so we list the
-	 * user's orgs first and merge (same pattern as the instances page).
-	 */
 
 	let loading = $state(true);
 	let loadError = $state<string | null>(null);
@@ -52,30 +42,36 @@
 		void load();
 	});
 
-	function badgeClass(s: string): string {
+	/** 状态徽章：圆点样式映射 */
+	function statusDot(s: string): string {
 		switch (s) {
-			case 'done':
-				return 'bg-emerald-100 text-emerald-700';
-			case 'failed':
-				return 'bg-red-100 text-red-700';
-			case 'scanning':
-				return 'bg-sky-100 text-sky-700';
-			case 'executing':
-				return 'bg-violet-100 text-violet-700';
-			case 'paused':
-				return 'bg-amber-100 text-amber-700';
-			case 'ready':
-				return 'bg-teal-100 text-teal-700';
-			case 'blocked':
-				return 'bg-orange-100 text-orange-700';
+			case 'done': return 'status-dot status-dot--online';
+			case 'failed': return 'status-dot status-dot--error';
+			case 'scanning': return 'status-dot status-dot--info status-dot--pulse';
+			case 'executing': return 'status-dot status-dot--info status-dot--pulse';
+			case 'paused': return 'status-dot status-dot--paused';
+			case 'ready': return 'status-dot status-dot--info';
+			case 'blocked': return 'status-dot status-dot--warning';
 			case 'created':
 			case 'cancelled':
-			default:
-				return 'bg-zinc-100 text-zinc-600';
+			default: return 'status-dot status-dot--offline';
 		}
 	}
 
-	/** Filter summary from the lowercase-key DTO (Task 5). */
+	/** 状态文字颜色 */
+	function statusText(s: string): string {
+		switch (s) {
+			case 'done': return 'text-success';
+			case 'failed': return 'text-destructive';
+			case 'scanning': return 'text-info';
+			case 'executing': return 'text-info';
+			case 'paused': return 'text-warning';
+			case 'ready': return 'text-info';
+			case 'blocked': return 'text-warning';
+			default: return 'text-muted-foreground';
+		}
+	}
+
 	function filterSummary(op: OperationListItem): string {
 		const parts: string[] = [];
 		const f = op.filter ?? {};
@@ -94,11 +90,11 @@
 	<title>{t('operations.title')} · {t('app.name')}</title>
 </svelte:head>
 
-<div class="flex h-full flex-col p-6">
+<div class="flex h-full flex-col p-6 animate-fade-in">
 	<div class="flex shrink-0 flex-wrap items-center justify-between gap-3">
 		<div>
-			<h1 class="text-xl font-semibold text-zinc-900">{t('operations.title')}</h1>
-			<p class="text-sm text-zinc-500">{t('operations.subtitle')}</p>
+			<h1 class="text-xl font-semibold text-foreground">{t('operations.title')}</h1>
+			<p class="text-sm text-muted-foreground">{t('operations.subtitle')}</p>
 		</div>
 		<Button href="/pitr">{t('operations.new')}</Button>
 	</div>
@@ -114,15 +110,23 @@
 		</Card>
 	{:else if loading}
 		<Card class="mt-4 shrink-0">
-			<CardContent class="flex items-center justify-center py-8 text-sm text-zinc-400">
-				{t('common.loading')}
+			<CardContent class="space-y-3 py-6">
+				{#each [1, 2, 3, 4, 5] as _}
+					<div class="flex items-center gap-4">
+						<div class="skeleton h-5 w-20"></div>
+						<div class="skeleton h-5 w-24"></div>
+						<div class="skeleton h-5 w-16"></div>
+						<div class="skeleton h-5 w-40"></div>
+						<div class="skeleton ml-auto h-5 w-28"></div>
+					</div>
+				{/each}
 			</CardContent>
 		</Card>
 	{:else if operations.length === 0}
 		<Card class="mt-4 shrink-0">
 			<CardContent class="flex flex-col items-center gap-2 py-10 text-center">
-				<History class="size-8 text-zinc-300" />
-				<p class="text-sm text-zinc-500">{t('operations.empty')}</p>
+				<History class="size-8 text-muted-foreground/40" />
+				<p class="text-sm text-muted-foreground">{t('operations.empty')}</p>
 			</CardContent>
 		</Card>
 	{:else}
@@ -130,7 +134,7 @@
 			<CardContent class="min-h-0 flex-1 overflow-y-auto p-0">
 				<table class="w-full text-sm">
 					<thead>
-						<tr class="text-left text-xs text-zinc-500">
+						<tr class="text-left text-xs text-muted-foreground">
 							<th class="sticky top-0 z-10 bg-card px-4 py-2.5 font-medium">{t('operations.status')}</th>
 							<th class="sticky top-0 z-10 bg-card px-4 py-2.5 font-medium">{t('operations.type')}</th>
 							<th class="sticky top-0 z-10 bg-card px-4 py-2.5 font-medium">{t('operations.mode')}</th>
@@ -142,31 +146,24 @@
 					</thead>
 					<tbody>
 						{#each pagedOps as op (op.id)}
-							<tr class="border-b border-zinc-100 align-middle">
+							<tr class="border-b border-border/50 align-middle transition-colors duration-150 hover:bg-muted/40">
 								<td class="px-4 py-2.5">
 									<div class="flex items-center gap-2">
-										<span
-											class={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${badgeClass(op.status)}`}
-										>
+										<span class="status-badge border border-border/50 {statusText(op.status)}">
+											<span class={statusDot(op.status)}></span>
 											{t(`pitr.status.${op.status}`)}
 										</span>
-										<span
-											class={`inline-block size-1.5 rounded-full ${op.agentConnected ? 'bg-emerald-500' : 'bg-zinc-300'}`}
-											title={op.agentConnected
-												? t('operations.agentConnected')
-												: t('operations.agentDisconnected')}
-										></span>
 									</div>
 								</td>
-								<td class="px-4 py-2.5 text-zinc-700">{t(`pitr.type.short.${op.type}`)}</td>
-								<td class="px-4 py-2.5 text-zinc-500">{t(`pitr.mode.${op.mode}`)}</td>
-								<td class="max-w-40 truncate px-4 py-2.5 font-mono text-xs text-zinc-600" title={op.agentId}>
+								<td class="px-4 py-2.5 text-foreground/80">{t(`pitr.type.short.${op.type}`)}</td>
+								<td class="px-4 py-2.5 text-muted-foreground">{t(`pitr.mode.${op.mode}`)}</td>
+								<td class="max-w-40 truncate px-4 py-2.5 font-mono text-xs text-muted-foreground" title={op.agentId}>
 									{op.agentId}
 								</td>
-								<td class="max-w-72 truncate px-4 py-2.5 text-xs text-zinc-600" title={filterSummary(op)}>
+								<td class="max-w-72 truncate px-4 py-2.5 text-xs text-muted-foreground" title={filterSummary(op)}>
 									{filterSummary(op) || '—'}
 								</td>
-								<td class="whitespace-nowrap px-4 py-2.5 text-zinc-500">
+								<td class="whitespace-nowrap px-4 py-2.5 text-muted-foreground">
 									{formatDateTime(op.createdAt)}
 								</td>
 								<td class="px-4 py-2.5 text-right">
