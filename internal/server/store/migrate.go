@@ -10,7 +10,7 @@ import (
 // schemaVersion is the latest schema version, tracked via PRAGMA user_version.
 // Each migration appends one script that upgrades the previous version to the
 // next; the versioned skeleton leaves room for future scripts.
-const schemaVersion = 2
+const schemaVersion = 3
 
 // schemaV1 is the full platform schema (version 1). Every statement is
 // idempotent (CREATE TABLE IF NOT EXISTS), so re-running is a no-op.
@@ -91,10 +91,20 @@ ALTER TABLE audit_logs ADD COLUMN rows_affected INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE audit_logs ADD COLUMN status TEXT NOT NULL DEFAULT '';
 `
 
+// schemaV3 adds the operations.target_tables column: the deduplicated union of
+// tables touched by the selected transactions, derived at selection time so
+// audit entries can report what a recovery actually targets (the filter's table
+// list is only the user's optional scan constraint). Additive column with a
+// default, so v2 data is preserved.
+const schemaV3 = `
+ALTER TABLE operations ADD COLUMN target_tables TEXT NOT NULL DEFAULT '[]';
+`
+
 // migrations maps each schema version to its upgrade script.
 var migrations = map[int]string{
 	1: schemaV1,
 	2: schemaV2,
+	3: schemaV3,
 }
 
 // Migrate idempotently brings db up to the current schema version: applied

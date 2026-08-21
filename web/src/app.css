@@ -276,6 +276,28 @@
 .status-dot--paused { background-color: var(--warning); }
 .status-dot--pulse { animation: pulse-dot 2s ease-in-out infinite; }
 
+/* 表名标签：审计/操作列表里的 schema.table 气泡（数据标识，区别于状态徽章的圆角胶囊） */
+.table-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.0625rem 0.4375rem;
+  border: 1px solid color-mix(in oklch, var(--border) 80%, transparent);
+  border-radius: 0.375rem;
+  background-color: color-mix(in oklch, var(--muted) 55%, transparent);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.6875rem;
+  line-height: 1.125rem;
+  color: var(--foreground);
+  white-space: nowrap;
+}
+
+/* +N 溢出气泡：弱化为次要提示 */
+.table-tag--more {
+  background-color: transparent;
+  color: var(--muted-foreground);
+  font-weight: 500;
+}
+
 /* 骨架屏 */
 .skeleton {
   background: linear-gradient(

@@ -70,7 +70,12 @@ func TestOpenAndMigrate_IsIdempotent(t *testing.T) {
 	// version (schemaVersion in migrate.go), so a re-run is a no-op.
 	var version int
 	require.NoError(t, db.QueryRow("PRAGMA user_version").Scan(&version))
-	require.Equal(t, 2, version)
+	require.Equal(t, 3, version)
+	// v3 column is present after the full migration chain.
+	var n int
+	require.NoError(t, db.QueryRow(
+		"SELECT count(*) FROM pragma_table_info('operations') WHERE name='target_tables'").Scan(&n))
+	require.Equal(t, 1, n)
 	require.NoError(t, db.Close())
 }
 
@@ -214,7 +219,7 @@ func TestMigrate_FailedVersion_RollsBack(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, store.Migrate(db), "re-run after resolving the conflict must succeed")
 	require.NoError(t, db.QueryRow("PRAGMA user_version").Scan(&version))
-	require.Equal(t, 2, version)
+	require.Equal(t, 3, version)
 	require.NoError(t, db.QueryRow(
 		"SELECT count(*) FROM pragma_table_info('members') WHERE name='joined_at'").Scan(&n))
 	require.Equal(t, 1, n)

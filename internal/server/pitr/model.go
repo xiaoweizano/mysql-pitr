@@ -30,6 +30,11 @@ type Operation struct {
 	// by a re-scan; only the selected transactions (and their statements) are
 	// stored.
 	SelectedTxIDs []string `json:"selectedTxIds,omitempty"`
+	// TargetTables is the deduplicated union of tables touched by the selected
+	// transactions, derived from the scan metadata at selection time. Unlike
+	// Filter.Tables (the user's optional scan constraint) it reflects what the
+	// recovery actually targets, so audit entries prefer it.
+	TargetTables []binlog.TableRef `json:"targetTables,omitempty"`
 	// Statements are the persisted per-transaction statements (filled after
 	// selection, and loaded by Get).
 	Statements []Statement `json:"statements,omitempty"`
@@ -70,10 +75,11 @@ type OperationStore interface {
 	// given set (selection re-runs overwrite previous selections).
 	SaveStatements(opID string, stmts []Statement) error
 	// SaveStatementsAndSelect replaces the operation's statements and records
-	// its selected transaction IDs in a single transaction: either both writes
-	// commit or neither does. The sql-mode Select path uses it so a failed
-	// selection update can never leave orphaned statements behind.
-	SaveStatementsAndSelect(opID string, stmts []Statement, txIDs []string) error
+	// its selected transaction IDs (plus the selection's derived target tables)
+	// in a single transaction: either all writes commit or none does. The
+	// sql-mode Select path uses it so a failed selection update can never leave
+	// orphaned statements behind.
+	SaveStatementsAndSelect(opID string, stmts []Statement, txIDs []string, tables []binlog.TableRef) error
 	LoadStatements(opID string) ([]Statement, error)
 	// SaveCheckpoint upserts the operation's execution checkpoint (server-side
 	// double-write of the agent's per-batch progress, keyed by op_id in the

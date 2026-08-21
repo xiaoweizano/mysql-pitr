@@ -208,6 +208,18 @@
 		return formatDateTime(e.recoveryTime);
 	}
 
+	/**
+	 * Split the backend's joined target-table string ("shop.orders, shop.items")
+	 * into individual refs for tag rendering. Schema-qualified names cannot
+	 * contain ", " so the split is deterministic.
+	 */
+	function tableTags(e: AuditEntry): string[] {
+		return e.targetTable ? e.targetTable.split(',').map((s) => s.trim()).filter(Boolean) : [];
+	}
+
+	/** Pills visible in the row cell before the +N overflow pill. */
+	const MAX_TABLE_TAGS = 2;
+
 	const selectClass =
 		'h-8 w-full rounded-lg border border-input bg-background px-2.5 text-sm transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:opacity-50';
 </script>
@@ -364,7 +376,21 @@
 								</TableCell>
 								<TableCell>{e.operator || '—'}</TableCell>
 								<TableCell>{formatDateTime(e.timestamp)}</TableCell>
-								<TableCell class="font-mono text-xs">{e.targetTable || '—'}</TableCell>
+								<TableCell>
+									{@const tags = tableTags(e)}
+									{#if tags.length === 0}
+										—
+									{:else}
+										<div class="flex max-w-[300px] flex-wrap items-center gap-1" title={e.targetTable}>
+											{#each tags.slice(0, MAX_TABLE_TAGS) as tag (tag)}
+												<span class="table-tag">{tag}</span>
+											{/each}
+											{#if tags.length > MAX_TABLE_TAGS}
+												<span class="table-tag table-tag--more">+{tags.length - MAX_TABLE_TAGS}</span>
+											{/if}
+										</div>
+									{/if}
+								</TableCell>
 								<TableCell class="text-right tabular-nums">{e.rowsAffected > 0 ? e.rowsAffected : '—'}</TableCell>
 								<TableCell>
 									<span class="status-badge border border-border/50 {badgeText(e.status)}">
@@ -393,6 +419,18 @@
 											<div>
 												<span class="text-muted-foreground/70">{t('audit.recoveryTime')}：</span>
 												{recoveryLabel(e)}
+											</div>
+											<div class="sm:col-span-2">
+												<span class="text-muted-foreground/70">{t('audit.targetTable')}：</span>
+												{#if tableTags(e).length > 0}
+													<span class="mt-0.5 inline-flex flex-wrap gap-1 align-middle">
+														{#each tableTags(e) as tag (tag)}
+															<span class="table-tag">{tag}</span>
+														{/each}
+													</span>
+												{:else}
+													—
+												{/if}
 											</div>
 											<div class="sm:col-span-2">
 												<span class="text-muted-foreground/70">{t('audit.errorDetails')}：</span>

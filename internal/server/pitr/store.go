@@ -55,7 +55,7 @@ func parseStoreTime(s string) (time.Time, error) {
 	return time.Parse(time.RFC3339Nano, s)
 }
 
-const opColumns = "id, org_id, agent_id, type, mode, filter, selected_tx_ids, status, created_by, created_at, updated_at"
+const opColumns = "id, org_id, agent_id, type, mode, filter, selected_tx_ids, target_tables, status, created_by, created_at, updated_at"
 
 // Create stores a new operation, generating an ID and defaulting Status /
 // timestamps when not set. Statements are not persisted here — use
@@ -81,10 +81,14 @@ func (s *SQLiteOperationStore) Create(op *Operation) error {
 	if err != nil {
 		return fmt.Errorf("pitr: marshal selected_tx_ids: %w", err)
 	}
+	tables, err := json.Marshal(op.TargetTables)
+	if err != nil {
+		return fmt.Errorf("pitr: marshal target_tables: %w", err)
+	}
 	_, err = s.db.Exec(
-		"INSERT INTO operations ("+opColumns+") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		"INSERT INTO operations ("+opColumns+") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		op.ID, op.OrgID, op.AgentID, op.Type, op.Mode, filterJSON, string(sel),
-		string(op.Status), op.CreatedBy,
+		string(tables), string(op.Status), op.CreatedBy,
 		formatStoreTime(op.CreatedAt), formatStoreTime(op.UpdatedAt))
 	return err
 }
@@ -120,12 +124,16 @@ func (s *SQLiteOperationStore) Update(op *Operation) error {
 	if err != nil {
 		return fmt.Errorf("pitr: marshal selected_tx_ids: %w", err)
 	}
+	tables, err := json.Marshal(op.TargetTables)
+	if err != nil {
+		return fmt.Errorf("pitr: marshal target_tables: %w", err)
+	}
 	res, err := s.db.Exec(
 		"UPDATE operations SET org_id = ?, agent_id = ?, type = ?, mode = ?, "+
-			"filter = ?, selected_tx_ids = ?, status = ?, created_by = ?, "+
+			"filter = ?, selected_tx_ids = ?, target_tables = ?, status = ?, created_by = ?, "+
 			"created_at = ?, updated_at = ? WHERE id = ?",
 		op.OrgID, op.AgentID, op.Type, op.Mode, filterJSON, string(sel),
-		string(op.Status), op.CreatedBy,
+		string(tables), string(op.Status), op.CreatedBy,
 		formatStoreTime(op.CreatedAt), formatStoreTime(op.UpdatedAt), op.ID)
 	if err != nil {
 		return err
@@ -243,10 +251,14 @@ func (s *SQLiteOperationStore) SaveStatements(opID string, stmts []Statement) er
 // the statements were persisted but the selection was not; both writes now
 // commit (or roll back) together, so a failed selection update can never leave
 // orphaned statements behind.
-func (s *SQLiteOperationStore) SaveStatementsAndSelect(opID string, stmts []Statement, txIDs []string) error {
+func (s *SQLiteOperationStore) SaveStatementsAndSelect(opID string, stmts []Statement, txIDs []string, tables []binlog.TableRef) error {
 	sel, err := json.Marshal(txIDs)
 	if err != nil {
 		return fmt.Errorf("pitr: marshal selected_tx_ids: %w", err)
+	}
+	tablesJSON, err := json.Marshal(tables)
+	if err != nil {
+		return fmt.Errorf("pitr: marshal target_tables: %w", err)
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -271,8 +283,8 @@ func (s *SQLiteOperationStore) SaveStatementsAndSelect(opID string, stmts []Stat
 		}
 	}
 	res, err := tx.Exec(
-		"UPDATE operations SET selected_tx_ids = ?, updated_at = ? WHERE id = ?",
-		string(sel), formatStoreTime(time.Now()), opID)
+		"UPDATE operations SET selected_tx_ids = ?, target_tables = ?, updated_at = ? WHERE id = ?",
+		string(sel), string(tablesJSON), formatStoreTime(time.Now()), opID)
 	if err != nil {
 		return err
 	}
@@ -337,9 +349,9 @@ func (s *SQLiteOperationStore) LoadCheckpoint(opID string) (lastStmt, total int,
 // scanOperation reads one operations row (in opColumns order) from a scanner.
 func scanOperation(row interface{ Scan(...any) error }) (*Operation, error) {
 	var op Operation
-	var filterJSON, sel, status, createdAt, updatedAt string
+	var filterJSON, sel, tables, status, createdAt, updatedAt string
 	err := row.Scan(&op.ID, &op.OrgID, &op.AgentID, &op.Type, &op.Mode,
-		&filterJSON, &sel, &status, &op.CreatedBy, &createdAt, &updatedAt)
+		&filterJSON, &sel, &tables, &status, &op.CreatedBy, &createdAt, &updatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -350,6 +362,9 @@ func scanOperation(row interface{ Scan(...any) error }) (*Operation, error) {
 	}
 	if err := json.Unmarshal([]byte(sel), &op.SelectedTxIDs); err != nil {
 		return nil, fmt.Errorf("pitr: op %s: parse selected_tx_ids: %w", op.ID, err)
+	}
+	if err := json.Unmarshal([]byte(tables), &op.TargetTables); err != nil {
+		return nil, fmt.Errorf("pitr: op %s: parse target_tables: %w", op.ID, err)
 	}
 	op.CreatedAt, err = parseStoreTime(createdAt)
 	if err != nil {

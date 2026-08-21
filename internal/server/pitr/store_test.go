@@ -263,18 +263,20 @@ func TestSaveStatementsAndSelect_Atomic(t *testing.T) {
 	}
 
 	// Success: statements and the selection land in the same commit.
-	require.NoError(t, s.SaveStatementsAndSelect("op_atomic", stmts, []string{"tx-1"}))
+	tables := []binlog.TableRef{{Schema: "shop", Table: "orders"}}
+	require.NoError(t, s.SaveStatementsAndSelect("op_atomic", stmts, []string{"tx-1"}, tables))
 	got, err := s.Get("op_atomic")
 	require.NoError(t, err)
 	saved, err := s.LoadStatements("op_atomic")
 	require.NoError(t, err)
 	require.Len(t, saved, 2)
 	assert.Equal(t, []string{"tx-1"}, got.SelectedTxIDs)
+	assert.Equal(t, tables, got.TargetTables)
 
 	// Failure of the second step (the operations row is missing, so the
 	// selection update fails) rolls back the statement writes: nothing is
 	// persisted, and a previous selection stays intact.
-	err = s.SaveStatementsAndSelect("op_missing", stmts, []string{"tx-1"})
+	err = s.SaveStatementsAndSelect("op_missing", stmts, []string{"tx-1"}, tables)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "operation not found")
 	none, err := s.LoadStatements("op_missing")

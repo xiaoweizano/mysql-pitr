@@ -413,13 +413,19 @@ func (h *Handler) transitionTo(op *Operation, to OperationState) (bool, error) {
 
 // appendAudit records an audit entry for an operation state change. Stream
 // events record the agent as the operator; HTTP actions record the user.
-// TargetTable / RecoveryTime derive from the operation's filter (static
-// properties known since creation); rows is the execution result where the
+// TargetTable prefers the tables derived from the selection at Select time
+// (what the recovery actually targets) and falls back to the filter's table
+// constraint for entries written before any selection exists; RecoveryTime
+// derives from the operation's filter. Rows is the execution result where the
 // triggering event carries it (done / paused), 0 otherwise.
 func (h *Handler) appendAudit(op *Operation, state OperationState, operator, errorDetails string, rows int64) {
 	var recovery time.Time
 	if op.Filter.TimeRange != nil {
 		recovery = op.Filter.TimeRange.End
+	}
+	tables := op.TargetTables
+	if len(tables) == 0 {
+		tables = op.Filter.Tables
 	}
 	_ = h.auditStore.Append(&audit.AuditEntry{
 		OperationID:  op.ID,
@@ -427,12 +433,39 @@ func (h *Handler) appendAudit(op *Operation, state OperationState, operator, err
 		Timestamp:    time.Now(),
 		OrgID:        op.OrgID,
 		AgentID:      op.AgentID,
-		TargetTable:  joinTableRefs(op.Filter.Tables),
+		TargetTable:  joinTableRefs(tables),
 		RecoveryTime: recovery,
 		RowsAffected: rows,
 		Status:       string(state),
 		ErrorDetails: errorDetails,
 	})
+}
+
+// tablesOfSelected derives the deduplicated union of tables touched by the
+// selected transactions from the scan metadata, in first-seen order. This is
+// the ground truth for what a recovery targets — the filter's table list is
+// only the user's optional scan constraint.
+func tablesOfSelected(metas []txMetaWire, txIDs []string) []binlog.TableRef {
+	selected := make(map[string]struct{}, len(txIDs))
+	for _, id := range txIDs {
+		selected[id] = struct{}{}
+	}
+	seen := make(map[binlog.TableRef]struct{})
+	var out []binlog.TableRef
+	for _, m := range metas {
+		if _, ok := selected[m.TxID]; !ok {
+			continue
+		}
+		for _, t := range m.Tables {
+			ref := binlog.TableRef{Schema: t.Schema, Table: t.Table}
+			if _, dup := seen[ref]; dup {
+				continue
+			}
+			seen[ref] = struct{}{}
+			out = append(out, ref)
+		}
+	}
+	return out
 }
 
 // joinTableRefs renders the filter's table list as "schema.table" entries
@@ -1321,10 +1354,13 @@ func (h *Handler) Select(w http.ResponseWriter, r *http.Request) {
 
 	// Persist the statements and the selection in one transaction: a failed
 	// selection update rolls the statement writes back, so the store can never
-	// hold statements without the selection that produced them.
+	// hold statements without the selection that produced them. TargetTables
+	// records what the recovery actually targets (audit entries prefer it over
+	// the filter's table constraint).
 	op.SelectedTxIDs = req.TxIDs
+	op.TargetTables = tablesOfSelected(snap.metas, req.TxIDs)
 	op.UpdatedAt = time.Now()
-	if err := h.opStore.SaveStatementsAndSelect(op.ID, stmts, req.TxIDs); err != nil {
+	if err := h.opStore.SaveStatementsAndSelect(op.ID, stmts, req.TxIDs, op.TargetTables); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -1373,7 +1409,11 @@ func (h *Handler) selectRescan(w http.ResponseWriter, r *http.Request, op *Opera
 
 	// Persist the selection before the command goes out so a scan_done racing
 	// the ready -> scanning transition knows which transactions to persist.
+	// TargetTables is derived from the first scan's metadata here — after the
+	// rescan the preview is repopulated, but the selection's tables are already
+	// known now and survive preview loss.
 	op.SelectedTxIDs = txIDs
+	op.TargetTables = tablesOfSelected(snap.metas, txIDs)
 	op.UpdatedAt = time.Now()
 	if err := h.opStore.Update(op); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

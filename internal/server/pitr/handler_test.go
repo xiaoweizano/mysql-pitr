@@ -217,12 +217,23 @@ func decodeParams(t *testing.T, cmd ws.Command, v interface{}) {
 }
 
 func txMetaData(txID, commitTime string, rowCount int) map[string]interface{} {
+	return txMetaWithTables(txID, commitTime, rowCount, "shop.orders")
+}
+
+// txMetaWithTables builds a tx_meta payload touching the given
+// "schema.table" refs (the default helper's generalisation).
+func txMetaWithTables(txID, commitTime string, rowCount int, tables ...string) map[string]interface{} {
+	wire := make([]map[string]string, 0, len(tables))
+	for _, ref := range tables {
+		schema, table, _ := strings.Cut(ref, ".")
+		wire = append(wire, map[string]string{"schema": schema, "table": table})
+	}
 	return map[string]interface{}{
 		"txId":       txID,
 		"gtid":       txID,
 		"commitTime": commitTime,
 		"schema":     "shop",
-		"tables":     []map[string]string{{"schema": "shop", "table": "orders"}},
+		"tables":     wire,
 		"rowCount":   rowCount,
 	}
 }
@@ -1263,6 +1274,93 @@ func TestStreamEvent_OpDone_NoFilterFieldsEmpty(t *testing.T) {
 	assert.Empty(t, entries[0].TargetTable)
 	assert.True(t, entries[0].RecoveryTime.IsZero())
 	assert.Equal(t, int64(0), entries[0].RowsAffected)
+}
+
+func TestSelect_PersistsTargetTablesFromSelectedTxs(t *testing.T) {
+	// 目标表必须来自被选中事务实际触到的表（选定时已知），而不是只来自
+	// 创建时的表过滤——时间/GTID 定位的操作没有表过滤，却照样知道要恢复
+	// 哪些表。选定后持久化在操作上，后续 done/paused 等审计条目据此展示。
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+
+	op := &Operation{
+		ID: "op_sel_tables", OrgID: orgID, AgentID: agentID,
+		Type: "pitr", Mode: "sql", Status: StateReady,
+		Filter: binlog.Filter{TimeRange: &binlog.TimeRange{
+			Start: time.Date(2026, 8, 21, 8, 0, 0, 0, time.UTC),
+			End:   time.Date(2026, 8, 21, 9, 0, 0, 0, time.UTC),
+		}},
+	}
+	require.NoError(t, f.opStore.Create(op))
+
+	// 两个事务共触三张表（shop.orders 重复出现 → 去重），选定即覆盖全部。
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvTxMeta,
+		txMetaWithTables("aaa:1", "2026-08-21T08:30:00Z", 2, "shop.orders", "shop.items"))
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvTxMeta,
+		txMetaWithTables("aaa:2", "2026-08-21T08:40:00Z", 1, "shop.orders", "shop.users"))
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvSQL, []ws.StatementWire{
+		{SQL: "DELETE FROM shop.orders WHERE id=1", TxID: "aaa:1", TxOrder: 0},
+		{SQL: "DELETE FROM shop.items WHERE id=2", TxID: "aaa:1", TxOrder: 1},
+		{SQL: "DELETE FROM shop.users WHERE id=3", TxID: "aaa:2", TxOrder: 0},
+	})
+
+	req := f.authenticatedRouteRequest(t, http.MethodPost, "/api/pitr/op_sel_tables/select", "op_sel_tables",
+		map[string]interface{}{"txIds": []string{"aaa:1", "aaa:2"}}, userID)
+	w := httptest.NewRecorder()
+	f.handler.Select(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	got, err := f.opStore.Get(op.ID)
+	require.NoError(t, err)
+	require.Equal(t, []binlog.TableRef{
+		{Schema: "shop", Table: "orders"},
+		{Schema: "shop", Table: "items"},
+		{Schema: "shop", Table: "users"},
+	}, got.TargetTables)
+
+	// 执行完成后，done 审计条目展示实际触到的表（而非空的表过滤）。
+	op.Status = StateExecuting
+	ok, err := f.opStore.UpdateIfStatus(op, StateReady)
+	require.NoError(t, err)
+	require.True(t, ok)
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvOpDone,
+		map[string]interface{}{"done": 3, "total": 3, "rowsAffected": 3, "paused": false})
+
+	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "done", entries[0].Status)
+	assert.Equal(t, "shop.orders, shop.items, shop.users", entries[0].TargetTable)
+}
+
+func TestSelect_SelectedMode_PersistsTargetTables(t *testing.T) {
+	// selected 模式：选定即触发定向重扫，目标表同样在选定时刻从首轮扫描
+	// 的元数据推导并随选择一起持久化。
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	op := f.createOp(t, "op_rescan_tables", orgID, agentID, StateReady)
+	op.Mode = "selected"
+	require.NoError(t, f.opStore.Update(op))
+
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvTxMeta,
+		txMetaWithTables("aaa:1", "2026-08-21T08:30:00Z", 2, "shop.orders", "shop.items"))
+
+	req := f.authenticatedRouteRequest(t, http.MethodPost, "/api/pitr/op_rescan_tables/select", "op_rescan_tables",
+		map[string]interface{}{"txIds": []string{"aaa:1"}}, userID)
+	w := httptest.NewRecorder()
+	f.handler.Select(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	got, err := f.opStore.Get(op.ID)
+	require.NoError(t, err)
+	require.Equal(t, []binlog.TableRef{
+		{Schema: "shop", Table: "orders"},
+		{Schema: "shop", Table: "items"},
+	}, got.TargetTables)
 }
 
 func TestStreamEvent_OpError_Failed(t *testing.T) {
