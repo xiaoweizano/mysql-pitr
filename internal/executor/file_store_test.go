@@ -56,5 +56,5 @@ func TestFileCheckpointStore_AtomicWrite(t *testing.T) {
 
 	data, err := os.ReadFile(filepath.Join(dir, "op-atomic.json"))
 	require.NoError(t, err)
-	assert.JSONEq(t, `{"OperationID":"op-atomic","LastCompletedStatement":3,"Total":10,"Errors":null}`, string(data))
+	assert.JSONEq(t, `{"OperationID":"op-atomic","LastCompletedStatement":3,"Total":10,"RowsAffected":0,"Errors":null}`, string(data))
 }

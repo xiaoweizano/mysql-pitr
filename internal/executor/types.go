@@ -33,10 +33,11 @@ type Progress struct {
 
 // FinalReport 是 Run/Resume 的返回值。
 type FinalReport struct {
-	Done   int         `json:"done"`
-	Total  int         `json:"total"`
-	Errors []ExecError `json:"errors,omitempty"`
-	Paused bool        `json:"paused"` // true = ctx 取消导致暂停；false = 正常完成或失败
+	Done         int         `json:"done"`
+	Total        int         `json:"total"`
+	RowsAffected int64       `json:"rowsAffected"` // 成功提交语句的累计影响行数
+	Errors       []ExecError `json:"errors,omitempty"`
+	Paused       bool        `json:"paused"` // true = ctx 取消导致暂停；false = 正常完成或失败
 }
 
 // ProgressCallback 由调用方提供，每条 SQL 执行后调用。
@@ -47,6 +48,7 @@ type Checkpoint struct {
 	OperationID            string
 	LastCompletedStatement int
 	Total                  int
+	RowsAffected           int64
 	Errors                 []ExecError
 }
 

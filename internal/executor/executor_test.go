@@ -25,12 +25,26 @@ type fakeDB struct {
 	rollbacks  int
 	// blockExec 非 nil 时，每条 Exec 在记录 SQL 后阻塞直到通道关闭（用于确定性的取消测试）。
 	blockExec chan struct{}
+	// rowsOn：全局语句下标 → RowsAffected 返回值；缺省 1（保持旧行为）。
+	rowsOn map[int]int64
+	// rowsErrOn：命中的语句 RowsAffected 返回 error（driver 不支持），行数按 0 计。
+	rowsErrOn map[int]bool
+	// blockFromIdx：blockExec 非 nil 时从该全局语句下标起阻塞（0 = 全部阻塞，旧行为）。
+	blockFromIdx int
 }
 
-type fakeResult struct{}
+type fakeResult struct {
+	rows    int64
+	errRows bool
+}
 
-func (fakeResult) LastInsertId() (int64, error) { return 0, nil }
-func (fakeResult) RowsAffected() (int64, error) { return 1, nil }
+func (r fakeResult) LastInsertId() (int64, error) { return 0, nil }
+func (r fakeResult) RowsAffected() (int64, error) {
+	if r.errRows {
+		return 0, fmt.Errorf("RowsAffected not supported (injected)")
+	}
+	return r.rows, nil
+}
 
 type fakeTx struct {
 	db         *fakeDB
@@ -44,13 +58,20 @@ func (t *fakeTx) Exec(query string, args ...interface{}) (Result, error) {
 	t.db.executed = append(t.db.executed, query)
 	err := t.db.failOn[idx]
 	t.db.mu.Unlock()
-	if t.db.blockExec != nil {
+	if t.db.blockExec != nil && idx >= t.db.blockFromIdx {
 		<-t.db.blockExec
 	}
 	if err != nil {
 		return nil, err
 	}
-	return fakeResult{}, nil
+	if t.db.rowsErrOn[idx] {
+		return fakeResult{errRows: true}, nil
+	}
+	rows := int64(1)
+	if r, ok := t.db.rowsOn[idx]; ok {
+		rows = r
+	}
+	return fakeResult{rows: rows}, nil
 }
 func (t *fakeTx) Commit() error {
 	if t.db.failCommit {
@@ -534,4 +555,109 @@ func TestLastTxIDLastSQLBounds(t *testing.T) {
 	assert.Equal(t, "SQL 1", lastSQL(plan, 0))
 	assert.Equal(t, "", lastSQL(plan, -1))
 	assert.Equal(t, "", lastSQL(plan, 5))
+}
+
+func TestExecutor_Run_AccumulatesRowsAffected(t *testing.T) {
+	db := &fakeDB{rowsOn: map[int]int64{0: 2, 1: 3, 2: 0}}
+	store := NewInMemoryCheckpointStore()
+	ex := NewExecutor(newFakeFactory(db), store)
+
+	plan := Plan{
+		OperationID: "op-rows",
+		Statements: []reverse.Statement{
+			makeStmt("S1", 0), makeStmt("S2", 1), makeStmt("S3", 2),
+		},
+		BatchSize: 2,
+	}
+
+	report, err := ex.Run(context.Background(), plan, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 3, report.Done)
+	assert.Equal(t, int64(5), report.RowsAffected, "2+3+0 成功语句行数累计")
+
+	cp, err := store.Load("op-rows")
+	require.NoError(t, err)
+	assert.Equal(t, int64(5), cp.RowsAffected, "检查点携带累计行数")
+}
+
+func TestExecutor_Run_RowsAffectedErrorCountsZero(t *testing.T) {
+	// driver 不支持 RowsAffected（返回 error）：该语句按 0 计，不影响执行。
+	db := &fakeDB{rowsErrOn: map[int]bool{0: true}}
+	store := NewInMemoryCheckpointStore()
+	ex := NewExecutor(newFakeFactory(db), store)
+
+	plan := Plan{
+		OperationID: "op-rows-err",
+		Statements: []reverse.Statement{
+			makeStmt("S1", 0), makeStmt("S2", 1),
+		},
+		BatchSize: 10,
+	}
+
+	report, err := ex.Run(context.Background(), plan, nil)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), report.RowsAffected, "语句 0 行数错误按 0 计，语句 1 计 1")
+}
+
+func TestExecutor_Resume_AccumulatesRowsAcrossCheckpoint(t *testing.T) {
+	// 检查点携带 RowsAffected=4（断点前 2 条语句）；Resume 续跑 2 条 → 累计 6。
+	db := &fakeDB{}
+	store := NewInMemoryCheckpointStore()
+	require.NoError(t, store.Save(Checkpoint{
+		OperationID: "op-resume", LastCompletedStatement: 2, Total: 4, RowsAffected: 4,
+	}))
+	ex := NewExecutor(newFakeFactory(db), store)
+
+	plan := Plan{
+		OperationID: "op-resume",
+		Statements: []reverse.Statement{
+			makeStmt("S1", 0), makeStmt("S2", 1), makeStmt("S3", 2), makeStmt("S4", 3),
+		},
+		BatchSize: 10,
+	}
+
+	report, err := ex.Resume(context.Background(), plan, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 4, report.Done)
+	assert.Equal(t, int64(6), report.RowsAffected, "4（检查点携带）+ 2（续跑语句）")
+}
+
+func TestExecutor_Run_PausedReportCarriesRows(t *testing.T) {
+	// BatchSize=2、4 条语句；第 3 条（idx 2，第二批内）阻塞。第一批提交后
+	// （rows=2）取消 ctx → 当前批次回滚（其行数不计），paused 报告携带 2。
+	db := &fakeDB{blockExec: make(chan struct{}), blockFromIdx: 2}
+	store := NewInMemoryCheckpointStore()
+	ex := NewExecutor(newFakeFactory(db), store)
+
+	plan := Plan{
+		OperationID: "op-pause-rows",
+		Statements: []reverse.Statement{
+			makeStmt("SQL 1", 0), makeStmt("SQL 2", 1), makeStmt("SQL 3", 2), makeStmt("SQL 4", 3),
+		},
+		BatchSize: 2,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var report FinalReport
+	var runErr error
+	runDone := make(chan struct{})
+	go func() {
+		report, runErr = ex.Run(ctx, plan, nil)
+		close(runDone)
+	}()
+
+	require.Eventually(t, func() bool {
+		db.mu.Lock()
+		defer db.mu.Unlock()
+		return len(db.executed) == 3
+	}, time.Second, time.Millisecond)
+
+	cancel()
+	close(db.blockExec)
+	<-runDone
+
+	require.NoError(t, runErr)
+	assert.True(t, report.Paused)
+	assert.Equal(t, 2, report.Done)
+	assert.Equal(t, int64(2), report.RowsAffected, "已提交批次的行数；回滚批次不计")
 }
