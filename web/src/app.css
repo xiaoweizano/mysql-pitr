@@ -281,13 +281,13 @@
   display: inline-flex;
   align-items: center;
   padding: 0.0625rem 0.4375rem;
-  border: 1px solid color-mix(in oklch, var(--border) 80%, transparent);
+  border: 1px solid color-mix(in oklch, var(--border) 50%, transparent);
   border-radius: 0.375rem;
-  background-color: color-mix(in oklch, var(--muted) 55%, transparent);
+  background-color: color-mix(in oklch, var(--muted) 35%, transparent);
   font-family: var(--font-mono, ui-monospace, monospace);
   font-size: 0.6875rem;
   line-height: 1.125rem;
-  color: var(--foreground);
+  color: var(--muted-foreground);
   white-space: nowrap;
 }
 
