@@ -365,7 +365,7 @@
 								<TableCell>{e.operator || '—'}</TableCell>
 								<TableCell>{formatDateTime(e.timestamp)}</TableCell>
 								<TableCell class="font-mono text-xs">{e.targetTable || '—'}</TableCell>
-								<TableCell class="text-right tabular-nums">{e.rowsAffected}</TableCell>
+								<TableCell class="text-right tabular-nums">{e.rowsAffected > 0 ? e.rowsAffected : '—'}</TableCell>
 								<TableCell>
 									<span class="status-badge border border-border/50 {badgeText(e.status)}">
 										<span class={badgeDot(e.status)}></span>
