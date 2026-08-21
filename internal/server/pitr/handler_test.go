@@ -1153,6 +1153,118 @@ func TestStreamEvent_OpDone_Done(t *testing.T) {
 	assert.Equal(t, "done", entries[0].Status)
 }
 
+func TestStreamEvent_OpDone_AuditRichFields(t *testing.T) {
+	// done 审计条目带上操作过滤器的目标表（多表逗号连接）与恢复时间
+	// （Filter.TimeRange.End），以及 op_done 报告的累计影响行数。
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+
+	recovery := time.Date(2026, 8, 21, 9, 0, 0, 0, time.UTC)
+	op := &Operation{
+		ID: "op_rich", OrgID: orgID, AgentID: agentID,
+		Type: "pitr", Mode: "sql", Status: StateExecuting,
+		Filter: binlog.Filter{
+			Tables: []binlog.TableRef{
+				{Schema: "shop", Table: "orders"}, {Schema: "shop", Table: "items"},
+			},
+			TimeRange: &binlog.TimeRange{Start: recovery.Add(-time.Hour), End: recovery},
+		},
+	}
+	require.NoError(t, f.opStore.Create(op))
+
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvOpDone,
+		map[string]interface{}{"done": 2, "total": 2, "rowsAffected": 7, "paused": false})
+
+	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "done", entries[0].Status)
+	assert.Equal(t, "shop.orders, shop.items", entries[0].TargetTable)
+	assert.Equal(t, recovery, entries[0].RecoveryTime)
+	assert.Equal(t, int64(7), entries[0].RowsAffected)
+}
+
+func TestStreamEvent_OpDone_Paused_AuditCarriesRows(t *testing.T) {
+	// paused 确认（op_done paused=true）的审计条目带上暂停时的累计行数。
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+
+	op := &Operation{
+		ID: "op_pause_rows", OrgID: orgID, AgentID: agentID,
+		Type: "pitr", Mode: "sql", Status: StateExecuting,
+		Filter: binlog.Filter{Tables: []binlog.TableRef{{Schema: "shop", Table: "orders"}}},
+	}
+	require.NoError(t, f.opStore.Create(op))
+
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvOpDone,
+		map[string]interface{}{"done": 1, "total": 2, "rowsAffected": 3, "paused": true})
+
+	got, err := f.opStore.Get(op.ID)
+	require.NoError(t, err)
+	assert.Equal(t, StatePaused, got.Status)
+
+	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "paused", entries[0].Status)
+	assert.Equal(t, "shop.orders", entries[0].TargetTable)
+	assert.Equal(t, int64(3), entries[0].RowsAffected)
+}
+
+func TestStreamEvent_ScanDone_AuditTableAndTimeWithoutRows(t *testing.T) {
+	// ready 条目（scan_done）：目标表/恢复时间已知，行数尚不可知 → 0。
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+
+	recovery := time.Date(2026, 8, 20, 18, 30, 0, 0, time.UTC)
+	op := &Operation{
+		ID: "op_ready", OrgID: orgID, AgentID: agentID,
+		Type: "pitr", Mode: "sql", Status: StateScanning,
+		Filter: binlog.Filter{
+			Tables:    []binlog.TableRef{{Schema: "shop", Table: "orders"}},
+			TimeRange: &binlog.TimeRange{End: recovery},
+		},
+	}
+	require.NoError(t, f.opStore.Create(op))
+
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvScanDone, map[string]interface{}{"txCount": 0})
+
+	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "ready", entries[0].Status)
+	assert.Equal(t, "shop.orders", entries[0].TargetTable)
+	assert.Equal(t, recovery, entries[0].RecoveryTime)
+	assert.Equal(t, int64(0), entries[0].RowsAffected)
+}
+
+func TestStreamEvent_OpDone_NoFilterFieldsEmpty(t *testing.T) {
+	// 无表过滤、无时间区间的操作（如纯 GTID 定位）：目标表空串、恢复时间
+	// 零值；op_done 不带 rowsAffected 键 → 行数 0。
+	f := setupTest(t)
+	userID := f.createUser(t)
+	orgID := f.createOrg(t, userID)
+	agentID := f.createAgent(t, orgID)
+	op := f.createOp(t, "op_nofilter", orgID, agentID, StateExecuting)
+
+	f.injectStreamEvent(t, agentID, op.ID, ws.EvOpDone,
+		map[string]interface{}{"done": 1, "total": 1, "paused": false})
+
+	entries, err := f.auditStore.Query(audit.AuditFilter{OrgID: orgID})
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "done", entries[0].Status)
+	assert.Empty(t, entries[0].TargetTable)
+	assert.True(t, entries[0].RecoveryTime.IsZero())
+	assert.Equal(t, int64(0), entries[0].RowsAffected)
+}
+
 func TestStreamEvent_OpError_Failed(t *testing.T) {
 	f := setupTest(t)
 	userID := f.createUser(t)

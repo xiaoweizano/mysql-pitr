@@ -413,16 +413,39 @@ func (h *Handler) transitionTo(op *Operation, to OperationState) (bool, error) {
 
 // appendAudit records an audit entry for an operation state change. Stream
 // events record the agent as the operator; HTTP actions record the user.
-func (h *Handler) appendAudit(op *Operation, state OperationState, operator, errorDetails string) {
+// TargetTable / RecoveryTime derive from the operation's filter (static
+// properties known since creation); rows is the execution result where the
+// triggering event carries it (done / paused), 0 otherwise.
+func (h *Handler) appendAudit(op *Operation, state OperationState, operator, errorDetails string, rows int64) {
+	var recovery time.Time
+	if op.Filter.TimeRange != nil {
+		recovery = op.Filter.TimeRange.End
+	}
 	_ = h.auditStore.Append(&audit.AuditEntry{
 		OperationID:  op.ID,
 		Operator:     operator,
 		Timestamp:    time.Now(),
 		OrgID:        op.OrgID,
 		AgentID:      op.AgentID,
+		TargetTable:  joinTableRefs(op.Filter.Tables),
+		RecoveryTime: recovery,
+		RowsAffected: rows,
 		Status:       string(state),
 		ErrorDetails: errorDetails,
 	})
+}
+
+// joinTableRefs renders the filter's table list as "schema.table" entries
+// joined with ", " (e.g. "shop.orders, shop.items"); an empty filter yields "".
+func joinTableRefs(tables []binlog.TableRef) string {
+	if len(tables) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(tables))
+	for _, t := range tables {
+		parts = append(parts, t.Schema+"."+t.Table)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // failOperation marks an operation failed after a command transport or agent
@@ -442,7 +465,7 @@ func (h *Handler) failOperation(op *Operation, details string) {
 		h.forgetPreview(op.ID)
 		return
 	}
-	h.appendAudit(op, StateFailed, "agent", details)
+	h.appendAudit(op, StateFailed, "agent", details, 0)
 	h.forgetPreview(op.ID)
 }
 
@@ -463,7 +486,7 @@ func (h *Handler) blockOperation(op *Operation, details string) {
 		log.Printf("pitr: op %s: block lost to a concurrent transition — no blocked audit (state %q)", op.ID, op.Status)
 		return
 	}
-	h.appendAudit(op, StateBlocked, "system", details)
+	h.appendAudit(op, StateBlocked, "system", details, 0)
 	h.forgetPreview(op.ID)
 }
 
@@ -745,7 +768,7 @@ func (h *Handler) HandleStreamEvent(agentID string, cmd ws.Command) {
 			log.Printf("pitr: op %s: scan_done ignored — operation advanced concurrently", opID)
 			return
 		}
-		h.appendAudit(op, StateReady, "agent", "")
+		h.appendAudit(op, StateReady, "agent", "", 0)
 		// Selected-mode completion: the directed second scan just staged the
 		// SQL for the selected transactions; persist the statements so Execute
 		// can load them. (sql-mode operations persist at Select time and have
@@ -820,7 +843,7 @@ func (h *Handler) HandleStreamEvent(agentID string, cmd ws.Command) {
 			log.Printf("pitr: op %s: op_done ignored — operation advanced concurrently", opID)
 			return
 		}
-		h.appendAudit(op, StateDone, "agent", errorSummary(report.Errors))
+		h.appendAudit(op, StateDone, "agent", errorSummary(report.Errors), report.RowsAffected)
 		h.forgetPreview(opID)
 		h.bus.Publish(opID, ev)
 
@@ -838,7 +861,7 @@ func (h *Handler) HandleStreamEvent(agentID string, cmd ws.Command) {
 			log.Printf("pitr: op %s: op_error ignored — operation advanced concurrently", opID)
 			return
 		}
-		h.appendAudit(op, StateFailed, "agent", errorDetailsFromEvent(raw))
+		h.appendAudit(op, StateFailed, "agent", errorDetailsFromEvent(raw), 0)
 		h.forgetPreview(opID)
 		h.bus.Publish(opID, ev)
 
@@ -853,10 +876,11 @@ func (h *Handler) HandleStreamEvent(agentID string, cmd ws.Command) {
 // per-statement failures recorded during execution (surfaced in the audit
 // detail and passed through to SSE subscribers for front-end display).
 type opDonePayload struct {
-	Done   int                  `json:"done"`
-	Total  int                  `json:"total"`
-	Paused bool                 `json:"paused"`
-	Errors []executor.ExecError `json:"errors,omitempty"`
+	Done         int                  `json:"done"`
+	Total        int                  `json:"total"`
+	RowsAffected int64                `json:"rowsAffected"`
+	Paused       bool                 `json:"paused"`
+	Errors       []executor.ExecError `json:"errors,omitempty"`
 }
 
 // errorSummary renders the executor's statement errors as a bounded audit
@@ -911,7 +935,7 @@ func (h *Handler) confirmPause(op *Operation, opID string, report opDonePayload)
 		log.Printf("pitr: op %s: pause confirmation for op in state %q — ignoring", opID, op.Status)
 		return
 	}
-	h.appendAudit(op, StatePaused, "agent", "")
+	h.appendAudit(op, StatePaused, "agent", "", report.RowsAffected)
 	data, _ := json.Marshal(map[string]interface{}{
 		"status": string(op.Status),
 		"done":   report.Done,
@@ -1664,7 +1688,7 @@ func (h *Handler) Cancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.forgetPreview(op.ID)
-	h.appendAudit(op, StateCancelled, emailFromRequest(r), "")
+	h.appendAudit(op, StateCancelled, emailFromRequest(r), "", 0)
 
 	writeJSON(w, http.StatusOK, cancelResponse{
 		OperationID: op.ID,
