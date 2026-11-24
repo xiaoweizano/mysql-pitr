@@ -10,7 +10,7 @@ A point-in-time recovery (PITR) platform for MySQL built on [go-mysql](https://g
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![MySQL](https://img.shields.io/badge/MySQL-8.0-4479A1?logo=mysql&logoColor=white)](https://www.mysql.com)
 [![SvelteKit](https://img.shields.io/badge/SvelteKit-2-FF3E00?logo=svelte&logoColor=white)](https://kit.svelte.dev)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/xiaoweizano/mysql-pitr?include_prereleases&logo=github&logoColor=white)](https://github.com/xiaoweizano/mysql-pitr/releases)
 [![Stars](https://img.shields.io/github/stars/xiaoweizano/mysql-pitr?logo=github&logoColor=white)](https://github.com/xiaoweizano/mysql-pitr/stargazers)
 
@@ -280,4 +280,4 @@ docs/diagrams      architecture diagram sources (.mmd / .svg / .png / .excalidra
 
 ## License
 
-[MIT](LICENSE) © 2026 xiaoweizano
+[GPL-3.0](LICENSE) © 2026 xiaoweizano
