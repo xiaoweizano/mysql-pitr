@@ -6,13 +6,13 @@
 
 A point-in-time recovery (PITR) platform for MySQL built on [go-mysql](https://github.com/go-mysql-org/go-mysql). It continuously archives binary logs, lets you browse transactions from any point in time, and generates reverse SQL to undo accidental changes — with a web console, a multi-agent architecture, and a single-binary server.
 
-[![CI](https://img.shields.io/github/actions/workflow/status/xiaoweizano/mysql-pitr/ci.yml?branch=main&logo=github&logoColor=white&label=CI)](https://github.com/xiaoweizano/mysql-pitr/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/xiaoweizano/mysql-pitr/ci.yml?branch=main&logo=github&logoColor=white&label=CI&cacheSeconds=86400)](https://github.com/xiaoweizano/mysql-pitr/actions/workflows/ci.yml)
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![MySQL](https://img.shields.io/badge/MySQL-8.0-4479A1?logo=mysql&logoColor=white)](https://www.mysql.com)
 [![SvelteKit](https://img.shields.io/badge/SvelteKit-2-FF3E00?logo=svelte&logoColor=white)](https://kit.svelte.dev)
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
-[![Release](https://img.shields.io/github/v/release/xiaoweizano/mysql-pitr?include_prereleases&logo=github&logoColor=white)](https://github.com/xiaoweizano/mysql-pitr/releases)
-[![Stars](https://img.shields.io/github/stars/xiaoweizano/mysql-pitr?logo=github&logoColor=white)](https://github.com/xiaoweizano/mysql-pitr/stargazers)
+[![Release](https://img.shields.io/github/v/release/xiaoweizano/mysql-pitr?include_prereleases&logo=github&logoColor=white&cacheSeconds=86400)](https://github.com/xiaoweizano/mysql-pitr/releases)
+[![Stars](https://img.shields.io/github/stars/xiaoweizano/mysql-pitr?logo=github&logoColor=white&cacheSeconds=86400)](https://github.com/xiaoweizano/mysql-pitr/stargazers)
 
 English | [简体中文](README.zh-CN.md)
 
